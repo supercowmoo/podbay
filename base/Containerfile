@@ -1,0 +1,28 @@
+FROM debian:trixie-slim
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates git curl unzip tar zsh build-essential gosu gpg \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN install -m 0755 -d /etc/apt/keyrings \
+  && curl -fsSL https://mise.jdx.dev/deb/mise.asc -o /etc/apt/keyrings/mise.asc \
+  && echo "deb [signed-by=/etc/apt/keyrings/mise.asc] https://mise.jdx.dev/deb * *" \
+    > /etc/apt/sources.list.d/mise.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends mise=2026.8.14 \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -U -s /usr/bin/zsh dev \
+  && mkdir -p /workspace /home/dev/.config/mise
+
+RUN printf '\neval "$(mise activate zsh)"\n' >> /etc/zsh/zshrc
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["zsh", "-l"]
