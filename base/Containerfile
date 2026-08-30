@@ -1,19 +1,17 @@
 FROM debian:trixie-slim
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    ca-certificates git curl unzip tar zsh build-essential gosu gpg \
+    ca-certificates git curl unzip tar zsh build-essential gosu gnupg \
   && rm -rf /var/lib/apt/lists/*
 
-RUN install -m 0755 -d /etc/apt/keyrings \
-  && curl -fsSL https://mise.jdx.dev/deb/mise.asc -o /etc/apt/keyrings/mise.asc \
-  && echo "deb [signed-by=/etc/apt/keyrings/mise.asc] https://mise.jdx.dev/deb * *" \
-    > /etc/apt/sources.list.d/mise.list \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends mise=2026.8.14 \
-  && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/24853EC9F655CE80B48E6C3A8B81C9D17413A06D -o /tmp/mise.asc \
+  && gpg --batch --import /tmp/mise.asc \
+  && gpg --batch --fingerprint 24853EC9F655CE80B48E6C3A8B81C9D17413A06D >/dev/null \
+  && curl -fsSL https://mise.jdx.dev/install.sh.sig -o /tmp/mise-install.sig \
+  && gpg --batch --decrypt /tmp/mise-install.sig > /tmp/mise-install.sh \
+  && MISE_VERSION=v2026.8.14 MISE_INSTALL_PATH=/usr/local/bin/mise sh /tmp/mise-install.sh \
+  && rm -f /tmp/mise.asc /tmp/mise-install.sig /tmp/mise-install.sh
 
 RUN useradd -m -u 1000 -U -s /usr/bin/zsh dev \
   && mkdir -p /workspace /home/dev/.config/mise

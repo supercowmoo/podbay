@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/../lib/repo-key.sh"
+
+usage() {
+  cat <<'EOF'
+usage: podbay --project <path> [--help]
+
+  --project <path>   repo to mount at /workspace (required)
+  -h, --help         show this help
+EOF
+}
+
+project=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project)
+      if [ $# -lt 2 ]; then
+        printf 'podbay: --project requires a value\n' >&2
+        exit 2
+      fi
+      project=$2
+      shift 2
+      ;;
+    --project=*)
+      project=${1#--project=}
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'podbay: unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$project" ]; then
+  printf 'podbay: --project is required\n' >&2
+  usage >&2
+  exit 2
+fi
+
+if [ ! -d "$project" ]; then
+  printf 'podbay: not a directory: %s\n' "$project" >&2
+  exit 1
+fi
+
+project=$(realpath -m "$project")
+repo_key=$(repo_key_for "$project")
+printf 'podbay: repo-key %s\n' "$repo_key"
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/podbay"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/podbay"
+
+mkdir -p "$config_dir/profiles" "$config_dir/overlays" "$cache_dir"
+
+if ! podman volume exists podbay-mise-cache >/dev/null 2>&1; then
+  podman volume create podbay-mise-cache >/dev/null
+fi
+
+mounts=(
+  "$project:/workspace:rw"
+  "podbay-mise-cache:/home/dev/.local/share/mise:rw"
+)
+
+exec podman run --rm -it --userns=keep-id "${mounts[@]/#/-v}" podbay-base:latest
