@@ -3,17 +3,22 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/../lib/repo-key.sh"
+source "$script_dir/../lib/mounts.sh"
 
 usage() {
   cat <<'EOF'
-usage: podbay --project <path> [--help]
+usage: podbay --project <path> [--profile <name>] [--list-profiles] [--help]
 
-  --project <path>   repo to mount at /workspace (required)
-  -h, --help         show this help
+  --project <path>     repo to mount at /workspace (required)
+  --profile <name>     select ~/.config/podbay/profiles/<name> (default: common only)
+  --list-profiles      list available profiles and exit
+  -h, --help           show this help
 EOF
 }
 
 project=""
+profile=""
+list_profiles=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -29,6 +34,22 @@ while [ $# -gt 0 ]; do
       project=${1#--project=}
       shift
       ;;
+    --profile)
+      if [ $# -lt 2 ]; then
+        printf 'podbay: --profile requires a value\n' >&2
+        exit 2
+      fi
+      profile=$2
+      shift 2
+      ;;
+    --profile=*)
+      profile=${1#--profile=}
+      shift
+      ;;
+    --list-profiles)
+      list_profiles=1
+      shift
+      ;;
     -h | --help)
       usage
       exit 0
@@ -41,6 +62,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/podbay"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/podbay"
+
+if [ "$list_profiles" -eq 1 ]; then
+  for dir in "$config_dir/profiles"/*/; do
+    [ -d "$dir" ] || continue
+    name=$(basename "$dir")
+    [ "$name" = "common" ] && continue
+    printf '%s\n' "$name"
+  done
+  exit 0
+fi
+
 if [ -z "$project" ]; then
   printf 'podbay: --project is required\n' >&2
   usage >&2
@@ -52,12 +86,20 @@ if [ ! -d "$project" ]; then
   exit 1
 fi
 
+if [ -n "$profile" ]; then
+  profile_dir="$config_dir/profiles/$profile"
+  if [ ! -d "$profile_dir" ]; then
+    printf 'podbay: profile not found: %s\n' "$profile" >&2
+    if [ -d "$config_dir/profiles" ]; then
+      printf 'podbay: (available: %s)\n' "$(cd "$config_dir/profiles" && printf '%s ' */ | sed 's#/##g; s#common##; s/  */ /g')" >&2
+    fi
+    exit 2
+  fi
+fi
+
 project=$(realpath -m "$project")
 repo_key=$(repo_key_for "$project")
 printf 'podbay: repo-key %s\n' "$repo_key"
-
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/podbay"
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/podbay"
 
 mkdir -p "$config_dir/profiles" "$config_dir/overlays" "$cache_dir"
 
@@ -69,5 +111,14 @@ mounts=(
   "$project:/workspace:rw"
   "podbay-mise-cache:/home/dev/.local/share/mise:rw"
 )
+
+load_mounts "$config_dir/profiles/common/mounts.toml"
+
+if [ -n "$profile" ]; then
+  load_mounts "$profile_dir/mounts.toml"
+  if [ -f "$profile_dir/mise-global.toml" ]; then
+    mounts+=("$profile_dir/mise-global.toml:/home/dev/.config/mise/config.toml:ro")
+  fi
+fi
 
 exec podman run --rm -it --userns=keep-id "${mounts[@]/#/-v}" podbay-base:latest

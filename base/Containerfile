@@ -14,7 +14,11 @@ RUN curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/24853EC9F655CE80B4
   && rm -f /tmp/mise.asc /tmp/mise-install.sig /tmp/mise-install.sh
 
 RUN useradd -m -u 1000 -U -s /usr/bin/zsh dev \
-  && mkdir -p /workspace /home/dev/.config/mise
+  && mkdir -p /workspace \
+    /home/dev/.config/mise \
+    /home/dev/.local/share/mise \
+    /home/dev/.local/state/mise \
+  && chown -R dev:dev /home/dev
 
 RUN printf '\neval "$(mise activate zsh)"\n' >> /etc/zsh/zshrc
 
