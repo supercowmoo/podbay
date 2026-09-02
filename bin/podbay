@@ -7,18 +7,20 @@ source "$script_dir/../lib/mounts.sh"
 
 usage() {
   cat <<'EOF'
-usage: podbay --project <path> [--profile <name>] [--list-profiles] [--help]
+usage: podbay --project <path> [--profile <name>] [--list-profiles] [--init-profile <name>] [--help]
 
-  --project <path>     repo to mount at /workspace (required)
-  --profile <name>     select ~/.config/podbay/profiles/<name> (default: common only)
-  --list-profiles      list available profiles and exit
-  -h, --help           show this help
+  --project <path>        repo to mount at /workspace (required)
+  --profile <name>        select ~/.config/podbay/profiles/<name> (default: common only)
+  --list-profiles         list available profiles and exit
+  --init-profile <name>   scaffold a new profile directory with templates, then exit
+  -h, --help              show this help
 EOF
 }
 
 project=""
 profile=""
 list_profiles=0
+init_profile=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,6 +52,18 @@ while [ $# -gt 0 ]; do
       list_profiles=1
       shift
       ;;
+    --init-profile)
+      if [ $# -lt 2 ]; then
+        printf 'podbay: --init-profile requires a value\n' >&2
+        exit 2
+      fi
+      init_profile=$2
+      shift 2
+      ;;
+    --init-profile=*)
+      init_profile=${1#--init-profile=}
+      shift
+      ;;
     -h | --help)
       usage
       exit 0
@@ -64,6 +78,57 @@ done
 
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/podbay"
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/podbay"
+
+if [ -n "$init_profile" ]; then
+  mkdir -p "$config_dir/profiles/$init_profile"
+  mounts_toml="$config_dir/profiles/$init_profile/mounts.toml"
+  mise_toml="$config_dir/profiles/$init_profile/mise-global.toml"
+  if [ -f "$mounts_toml" ] || [ -f "$mise_toml" ]; then
+    printf 'podbay: profile "%s" already exists, refusing to overwrite\n' "$init_profile" >&2
+    exit 1
+  fi
+  cat > "$mounts_toml" <<'EOF'
+# Podbay profile mounts. Each [[mount]] entry is a generic bind mount:
+#
+#   [[mount]]
+#   host = "~/.gitconfig"                 # path on YOUR machine (~ is allowed)
+#   container = "/home/dev/.gitconfig"    # path inside the container
+#   mode = "ro"                           # "ro" (default) or "rw"
+#
+# mode defaults to "ro". Reach for "rw" only when live-editing that file from
+# inside a session is genuinely wanted; normally you edit on the host.
+#
+# A host path that doesn't exist is skipped with a warning, not an error.
+#
+# ~/.config/podbay/profiles/common/mounts.toml is always merged in first,
+# regardless of --profile, for things that belong to "you" generally
+# (e.g. .gitconfig). Put workflow-specific mounts here instead.
+
+# [[mount]]
+# host = "~/.zshrc"
+# container = "/home/dev/.zshrc"
+# mode = "ro"
+
+# [[mount]]
+# host = "~/.config/opencode/skills"
+# container = "/home/dev/.config/opencode/skills"
+# mode = "ro"
+EOF
+  cat > "$mise_toml" <<'EOF'
+# Podbay profile: personal tools, installed by mise into every session.
+# Declared tools are ADDITIVE with whatever the mounted repo asks for
+# (mise unions global + project config), so these are always available
+# without touching the repo's own config.
+#
+# [tools]
+# opencode = "latest"
+# node = "22"
+EOF
+  printf 'podbay: created profile "%s" at %s\n' "$init_profile" "$config_dir/profiles/$init_profile"
+  printf 'podbay:   edit mounts.toml and mise-global.toml, then:\n'
+  printf 'podbay:   ./bin/podbay --project <repo> --profile %s\n' "$init_profile"
+  exit 0
+fi
 
 if [ "$list_profiles" -eq 1 ]; then
   for dir in "$config_dir/profiles"/*/; do
