@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/../lib/repo-key.sh"
 source "$script_dir/../lib/mounts.sh"
+source "$script_dir/../lib/volumes.sh"
 
 usage() {
   cat <<'EOF'
@@ -82,13 +83,15 @@ cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/podbay"
 if [ -n "$init_profile" ]; then
   mkdir -p "$config_dir/profiles/$init_profile"
   mounts_toml="$config_dir/profiles/$init_profile/mounts.toml"
+  volumes_toml="$config_dir/profiles/$init_profile/volumes.toml"
   mise_toml="$config_dir/profiles/$init_profile/mise-global.toml"
-  if [ -f "$mounts_toml" ] || [ -f "$mise_toml" ]; then
+  if [ -f "$mounts_toml" ] || [ -f "$volumes_toml" ] || [ -f "$mise_toml" ]; then
     printf 'podbay: profile "%s" already exists, refusing to overwrite\n' "$init_profile" >&2
     exit 1
   fi
   cat > "$mounts_toml" <<'EOF'
-# Podbay profile mounts. Each [[mount]] entry is a generic bind mount:
+# Podbay profile mounts: bind mounts from your host into the container.
+# These are best for read-only host files you edit on the host.
 #
 #   [[mount]]
 #   host = "~/.gitconfig"                 # path on YOUR machine (~ is allowed)
@@ -103,16 +106,37 @@ if [ -n "$init_profile" ]; then
 # ~/.config/podbay/profiles/common/mounts.toml is always merged in first,
 # regardless of --profile, for things that belong to "you" generally
 # (e.g. .gitconfig). Put workflow-specific mounts here instead.
+#
+# WARNING: if you mount a path whose parent directory does not already exist
+# in the image with the right ownership, Podman may create that parent as
+# root, and the container user will not be able to write there. For any
+# directory the container needs to create or write into, use volumes.toml
+# instead.
 
 # [[mount]]
 # host = "~/.zshrc"
 # container = "/home/dev/.zshrc"
 # mode = "ro"
+EOF
+  cat > "$volumes_toml" <<'EOF'
+# Podbay profile volumes: named Podman volumes that persist across sessions.
+# These are the right choice for tool-owned state: anything the container
+# creates, updates, or writes (config dirs, caches, auth files, etc.).
+#
+#   [[volume]]
+#   name = "opencode-config"              # short name for this volume
+#   container = "/home/dev/.config/opencode"  # mount point inside the container
+#
+# The actual volume name will be namespaced as podbay-vol-<profile>-<name>.
+# Volumes are created automatically on first use and survive --rm.
 
-# [[mount]]
-# host = "~/.config/opencode/skills"
-# container = "/home/dev/.config/opencode/skills"
-# mode = "ro"
+# [[volume]]
+# name = "opencode-config"
+# container = "/home/dev/.config/opencode"
+
+# [[volume]]
+# name = "opencode-data"
+# container = "/home/dev/.local/share/opencode"
 EOF
   cat > "$mise_toml" <<'EOF'
 # Podbay profile: personal tools, installed by mise into every session.
@@ -125,7 +149,7 @@ EOF
 # node = "22"
 EOF
   printf 'podbay: created profile "%s" at %s\n' "$init_profile" "$config_dir/profiles/$init_profile"
-  printf 'podbay:   edit mounts.toml and mise-global.toml, then:\n'
+  printf 'podbay:   edit mounts.toml, volumes.toml, and mise-global.toml, then:\n'
   printf 'podbay:   ./bin/podbay --project <repo> --profile %s\n' "$init_profile"
   exit 0
 fi
@@ -176,14 +200,25 @@ mounts=(
   "$project:/workspace:rw"
   "podbay-mise-cache:/home/dev/.local/share/mise:rw"
 )
+podbay_volume_paths=()
 
 load_mounts "$config_dir/profiles/common/mounts.toml"
+load_volumes "$config_dir/profiles/common/volumes.toml" "common"
 
 if [ -n "$profile" ]; then
   load_mounts "$profile_dir/mounts.toml"
+  load_volumes "$profile_dir/volumes.toml" "$profile"
   if [ -f "$profile_dir/mise-global.toml" ]; then
     mounts+=("$profile_dir/mise-global.toml:/home/dev/.config/mise/config.toml:ro")
   fi
 fi
 
-exec podman run --rm -it --userns=keep-id "${mounts[@]/#/-v}" podbay-base:latest
+podman_env=()
+if [ ${#podbay_volume_paths[@]} -gt 0 ]; then
+  # Colon-separated list of volume mount points; the entrypoint uses this to
+  # ensure each path exists and is owned by the container user before handing
+  # control to the user command.
+  podman_env+=("-e" "PODBAY_VOLUME_PATHS=$(IFS=:; printf '%s' "${podbay_volume_paths[*]}")")
+fi
+
+exec podman run --rm -it --userns=keep-id "${podman_env[@]}" "${mounts[@]/#/-v}" podbay-base:latest
