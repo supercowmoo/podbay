@@ -14,7 +14,7 @@ RUN curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/24853EC9F655CE80B4
   && rm -f /tmp/mise.asc /tmp/mise-install.sig /tmp/mise-install.sh
 
 RUN useradd -m -u 1000 -U -s /usr/bin/zsh dev \
-  && mkdir -p /workspace \
+  && mkdir -p /home/dev/workspace \
     /home/dev/.config/mise \
     /home/dev/.local/share/mise \
     /home/dev/.local/state/mise \
@@ -22,9 +22,11 @@ RUN useradd -m -u 1000 -U -s /usr/bin/zsh dev \
 
 RUN printf '\neval "$(mise activate zsh)"\n' >> /etc/zsh/zshrc
 
+ENV PATH="/home/dev/.local/share/mise/shims:${PATH}"
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-WORKDIR /workspace
+WORKDIR /home/dev/workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["zsh", "-l"]

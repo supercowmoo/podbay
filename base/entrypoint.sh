@@ -24,5 +24,5 @@ if [ "$(id -u)" -eq 0 ]; then
   exec gosu dev "$0" "$@"
 fi
 
-cd /workspace
+cd "${PODBAY_WORKSPACE:-/home/dev/workspace/repomount}"
 exec "$@"

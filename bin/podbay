@@ -10,7 +10,7 @@ usage() {
   cat <<'EOF'
 usage: podbay --project <path> [--profile <name>] [--local-cache] [--list-profiles] [--init-profile <name>] [--help]
 
-  --project <path>        repo to mount at /workspace (required)
+  --project <path>        repo to mount at /home/dev/workspace/repomount (required)
   --profile <name>        select ~/.config/podbay/profiles/<name> (default: common only)
   --local-cache           use per-repo mise cache at ~/.cache/podbay/mise-caches/<repo-key>/
   --list-profiles         list available profiles and exit
@@ -198,8 +198,9 @@ printf 'podbay: repo-key %s\n' "$repo_key"
 
 mkdir -p "$config_dir/profiles" "$config_dir/overlays" "$cache_dir"
 
+workspace_dir="/home/dev/workspace/repomount"
 mounts=(
-  "$project:/workspace:rw"
+  "$project:$workspace_dir:rw"
 )
 podbay_volume_paths=()
 
@@ -226,7 +227,9 @@ if [ -n "$profile" ]; then
   fi
 fi
 
-podman_env=()
+podman_env=(
+  "-e" "PODBAY_WORKSPACE=$workspace_dir"
+)
 if [ ${#podbay_volume_paths[@]} -gt 0 ]; then
   # Colon-separated list of volume mount points; the entrypoint uses this to
   # ensure each path exists and is owned by the container user before handing

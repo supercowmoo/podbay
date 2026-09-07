@@ -2,7 +2,7 @@
 
 A generic podman runtime that I use. It launches a disposable container around a codebase you choose to work in.
 
-The base image (`podbay-base`) is small and adaptable. It is Debian slim with apt essentials, mise, and non-root user (`dev`). Everything specific to you and your codebase arrives at runtime: the codebase is mounted at `/workspace`, personal dotfiles are mounted read-only, mutable tool state lives in named volumes, and mise installs what the codebase and your profile asks for.
+The base image (`podbay-base`) is small and adaptable. It is Debian slim with apt essentials, mise, and non-root user (`dev`). Everything specific to you and your codebase arrives at runtime: the codebase is mounted at `/home/dev/workspace/repomount`, personal dotfiles are mounted read-only, mutable tool state lives in named volumes, and mise installs what the codebase and your profile asks for.
 
 Anything that grants elevated privilege, such as additions to the image, can only be requested from user-owned space, never from within the container. This means that absent a kernel exploit, the only thing that can be modified from inside the container is the codebase and the optional repo cache (which has added layers of verification).
 
@@ -19,7 +19,7 @@ podman build -t podbay-base:latest base/
 
 Inside, mise automatically installs whatever the repo's own config
 (`.mise.toml`, `.nvmrc`, ...) asks for.
-Your shell starts in `/workspace` as `dev`.
+Your shell starts in `/home/dev/workspace/repomount` as `dev`.
 
 ### A note on trust
 
