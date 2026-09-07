@@ -8,10 +8,11 @@ source "$script_dir/../lib/volumes.sh"
 
 usage() {
   cat <<'EOF'
-usage: podbay --project <path> [--profile <name>] [--list-profiles] [--init-profile <name>] [--help]
+usage: podbay --project <path> [--profile <name>] [--local-cache] [--list-profiles] [--init-profile <name>] [--help]
 
   --project <path>        repo to mount at /workspace (required)
   --profile <name>        select ~/.config/podbay/profiles/<name> (default: common only)
+  --local-cache           use per-repo mise cache at ~/.cache/podbay/mise-caches/<repo-key>/
   --list-profiles         list available profiles and exit
   --init-profile <name>   scaffold a new profile directory with templates, then exit
   -h, --help              show this help
@@ -20,6 +21,7 @@ EOF
 
 project=""
 profile=""
+local_cache=0
 list_profiles=0
 init_profile=""
 
@@ -47,6 +49,10 @@ while [ $# -gt 0 ]; do
       ;;
     --profile=*)
       profile=${1#--profile=}
+      shift
+      ;;
+    --local-cache)
+      local_cache=1
       shift
       ;;
     --list-profiles)
@@ -192,15 +198,22 @@ printf 'podbay: repo-key %s\n' "$repo_key"
 
 mkdir -p "$config_dir/profiles" "$config_dir/overlays" "$cache_dir"
 
-if ! podman volume exists podbay-mise-cache >/dev/null 2>&1; then
-  podman volume create podbay-mise-cache >/dev/null
-fi
-
 mounts=(
   "$project:/workspace:rw"
-  "podbay-mise-cache:/home/dev/.local/share/mise:rw"
 )
 podbay_volume_paths=()
+
+if [ "$local_cache" -eq 1 ]; then
+  local_cache_dir="$cache_dir/mise-caches/$repo_key"
+  mkdir -p "$local_cache_dir"
+  mounts+=("$local_cache_dir:/home/dev/.local/share/mise:rw")
+  printf 'podbay: using local cache %s\n' "$local_cache_dir"
+else
+  if ! podman volume exists podbay-mise-cache >/dev/null 2>&1; then
+    podman volume create podbay-mise-cache >/dev/null
+  fi
+  mounts+=("podbay-mise-cache:/home/dev/.local/share/mise:rw")
+fi
 
 load_mounts "$config_dir/profiles/common/mounts.toml"
 load_volumes "$config_dir/profiles/common/volumes.toml" "common"
