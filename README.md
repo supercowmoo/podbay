@@ -21,6 +21,18 @@ Inside, mise automatically installs whatever the repo's own config
 (`.mise.toml`, `.nvmrc`, ...) asks for.
 Your shell starts in `/workspace` as `dev`.
 
+### A note on trust
+
+mise can install tools from many sources including random repositories. A
+malicious repo could declare a custom tool that installs malware. By default
+the shared mise cache (`podbay-mise-cache`) means that install would persist
+and be visible to other repos using the same cache. If you are working with
+code you do not trust, use `--local-cache` to keep that repo's installs
+isolated to `~/.cache/podbay/mise-caches/<repo-key>/`. You should also be
+careful with mise.toml. I personally only use it unless I'm declaring
+something more custom. Simply auditing mise.toml yourself before running
+intalls will solve this.
+
 ## Profiles
 
 A codebase will only declare what it needs. For the tools and files you always
