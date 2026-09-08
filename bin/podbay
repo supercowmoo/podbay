@@ -5,6 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/../lib/repo-key.sh"
 source "$script_dir/../lib/mounts.sh"
 source "$script_dir/../lib/volumes.sh"
+source "$script_dir/../lib/profile-image.sh"
 
 usage() {
   cat <<'EOF'
@@ -91,7 +92,8 @@ if [ -n "$init_profile" ]; then
   mounts_toml="$config_dir/profiles/$init_profile/mounts.toml"
   volumes_toml="$config_dir/profiles/$init_profile/volumes.toml"
   mise_toml="$config_dir/profiles/$init_profile/mise-global.toml"
-  if [ -f "$mounts_toml" ] || [ -f "$volumes_toml" ] || [ -f "$mise_toml" ]; then
+  extension_sh="$config_dir/profiles/$init_profile/extension.sh"
+  if [ -f "$mounts_toml" ] || [ -f "$volumes_toml" ] || [ -f "$mise_toml" ] || [ -f "$extension_sh" ]; then
     printf 'podbay: profile "%s" already exists, refusing to overwrite\n' "$init_profile" >&2
     exit 1
   fi
@@ -154,8 +156,27 @@ EOF
 # opencode = "latest"
 # node = "22"
 EOF
+  cat > "$extension_sh" <<'EOF'
+#!/bin/sh
+# Podbay profile extension: runs as root while building the per-profile image.
+# This is the place for root-level setup that should persist across disposable
+# container runs (e.g. installing system libraries that mise cannot provide).
+#
+# The script is copied to /usr/local/share/podbay/extension.sh in the derived
+# image and executed during the build. It is NOT read from the mounted repo.
+#
+# Example (Chromium / Playwright headless dependencies on Debian trixie):
+#
+#   apt-get update \
+#     && apt-get install -y --no-install-recommends \
+#       libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+#       libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 libatspi2.0-0t64 \
+#       libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libxcb1 \
+#       libxkbcommon0 fonts-liberation \
+#     && rm -rf /var/lib/apt/lists/*
+EOF
   printf 'podbay: created profile "%s" at %s\n' "$init_profile" "$config_dir/profiles/$init_profile"
-  printf 'podbay:   edit mounts.toml, volumes.toml, and mise-global.toml, then:\n'
+  printf 'podbay:   edit mounts.toml, volumes.toml, mise-global.toml, and extension.sh, then:\n'
   printf 'podbay:   ./bin/podbay --project <repo> --profile %s\n' "$init_profile"
   exit 0
 fi
@@ -198,6 +219,10 @@ printf 'podbay: repo-key %s\n' "$repo_key"
 
 mkdir -p "$config_dir/profiles" "$config_dir/overlays" "$cache_dir"
 
+common_dir="$config_dir/profiles/common"
+container_image=$(resolve_profile_image podbay-base:latest "${profile_dir:-}" "$common_dir")
+printf 'podbay: using image %s\n' "$container_image"
+
 workspace_dir="/home/dev/workspace/repomount"
 mounts=(
   "$project:$workspace_dir:rw"
@@ -237,4 +262,4 @@ if [ ${#podbay_volume_paths[@]} -gt 0 ]; then
   podman_env+=("-e" "PODBAY_VOLUME_PATHS=$(IFS=:; printf '%s' "${podbay_volume_paths[*]}")")
 fi
 
-exec podman run --rm -it --userns=keep-id "${podman_env[@]}" "${mounts[@]/#/-v}" podbay-base:latest
+exec podman run --rm -it --userns=keep-id "${podman_env[@]}" "${mounts[@]/#/-v}" "$container_image"

@@ -42,7 +42,7 @@ want, make a profile:
 ./bin/podbay --init-profile example0
 ```
 
-That creates `~/.config/podbay/profiles/example0/` with three editable files:
+That creates `~/.config/podbay/profiles/example0/` with four editable files:
 
 - **`mounts.toml`** - generic bind mounts of your files into the container.
   Each entry maps a host path to a container path (`~` is allowed), mounted
@@ -56,6 +56,10 @@ That creates `~/.config/podbay/profiles/example0/` with three editable files:
 - **`mise-global.toml`** - personal tools, installed by mise into every
   session. These are additive with whatever the codebase asks for, so they're
   always available without touching the codebase config.
+- **`extension.sh`** - optional build-time extension script. If present, it is
+  baked into a derived image and executed as root during the build. Use this
+  for system-level dependencies that mise cannot install, such as the shared
+  libraries needed by Chromium/Playwright.
 
 Then run with the profile:
 
@@ -63,10 +67,11 @@ Then run with the profile:
 ./bin/podbay --project /some/repo --profile example0
 ```
 
-`~/.config/podbay/profiles/common/mounts.toml` and `common/volumes.toml`
-are always merged in first, regardless of `--profile` - put things that
-belong to "you" generally (like `.gitconfig`) in `common/`, and
-workflow-specific mounts and volumes in the named profile.
+`~/.config/podbay/profiles/common/mounts.toml`, `common/volumes.toml`, and
+optionally `common/extension.sh` are always merged in first, regardless of
+`--profile` - put things that belong to "you" generally (like `.gitconfig`)
+in `common/`, and workflow-specific mounts, volumes, and image extensions in
+the named profile.
 `./bin/podbay --list-profiles` shows what you have.
 
 ## Setting up a good profile
