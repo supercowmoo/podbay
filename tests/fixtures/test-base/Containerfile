@@ -1,0 +1,12 @@
+# Minimal stand-in for the bundled base image: the same dev user layout and
+# entrypoint, without the network-heavy toolchain. Used by the end-to-end
+# tests via the `base_image` config setting.
+FROM debian:trixie-slim
+RUN useradd -m -u 1000 -U -s /bin/bash dev \
+  && mkdir -p /home/dev/workspace /home/dev/.config/mise /home/dev/.local/share/mise \
+  && chown -R dev:dev /home/dev
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+WORKDIR /home/dev/workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash", "-l"]

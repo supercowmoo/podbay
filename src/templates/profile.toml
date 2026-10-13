@@ -1,0 +1,36 @@
+# Podbay profile "{name}".
+#
+# Run with:  podbay run --profile {name} <project>
+# Inspect:   podbay profile show {name}
+
+# Profiles to build on. Their mounts, volumes, tools and extensions are
+# applied first; entries here win when they target the same container path
+# or tool.
+{extends}
+
+# Optional root build script, relative to this directory. It is baked into a
+# derived image and run as root at build time, for system packages mise
+# cannot install. It is never read from the project you mount.
+# extension = "{name}.sh"
+
+# Bind mounts from the host. Best for files you edit on the host, such as
+# dotfiles. mode is "ro" (default) or "rw". A missing host path is skipped
+# with a warning.
+#
+# [[mount]]
+# host = "~/.gitconfig"
+# container = "/home/dev/.gitconfig"
+# mode = "ro"
+
+# Named volumes that persist across runs, for state the container writes:
+# tool config, auth, caches. Stored as podbay-{name}-<name>.
+#
+# [[volume]]
+# name = "opencode-config"
+# container = "/home/dev/.config/opencode"
+
+# Tools mise installs in every session, on top of what the project asks for.
+#
+# [tools]
+# opencode = "latest"
+# node = "22"

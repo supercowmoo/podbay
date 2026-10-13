@@ -1,0 +1,17 @@
+[package]
+name = "podbay"
+version = "0.1.0"
+edition = "2024"
+description = "Disposable, isolated containers around a codebase"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+rustix = { version = "1.1.5", features = ["process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+toml = "1.1.8"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
