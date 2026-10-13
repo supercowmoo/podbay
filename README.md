@@ -1,101 +1,106 @@
 # Podbay
 
-A generic podman runtime that I use. It launches a disposable container around a codebase you choose to work in.
+Disposable containers for working in a codebase, including running AI coding
+agents and code you don't fully trust, without handing them your machine.
 
-The base image (`podbay-base`) is small and adaptable. It is Debian slim with apt essentials, mise, and non-root user (`dev`). Everything specific to you and your codebase arrives at runtime: the codebase is mounted at `/home/dev/workspace/repomount`, personal dotfiles are mounted read-only, mutable tool state lives in named volumes, and mise installs what the codebase and your profile asks for.
+`podbay run` starts a throwaway container around a project directory. The
+project is mounted read-write at `/home/dev/workspace/repomount`, and
+everything else is something you declared:
 
-Anything that grants elevated privilege, such as additions to the image, can only be requested from user-owned space, never from within the container. This means that absent a kernel exploit, the only thing that can be modified from inside the container is the codebase and the optional repo cache (which has added layers of verification).
+- dotfiles mounted read-only
+- named volumes for state that should outlive the container
+- tools that mise installs on top of what the project asks for
+- optional root build scripts baked into a derived image
+
+Anything that needs root, such as changes to the image, can only come from
+your own config directory, never from the mounted project.
 
 ## Status
 
-Rebuilding from a local prototype. Usable core: base image, run script, profiles.
+Being rebuilt in Rust, in stages:
+
+1. **Rust port** with real config parsing, Podman and Docker backends, tests
+   and CI. *(done)*
+2. Threat model, plus a session report that flags changes to git hooks and
+   config.
+3. Container hardening: dropped capabilities, `no-new-privileges`, read-only
+   root filesystem, resource limits.
+4. Network policy: no network by default, with an allowlist enforced by a
+   filtering proxy. Tool installs move to a separate provisioning step.
+5. Landlock and seccomp around processes inside the container.
+6. A native rootless runtime, with Podman and Docker kept as fallbacks.
+
+Until stage 2 lands, the container is a convenience boundary, not a security
+guarantee. In particular, the project is mounted read-write, so code inside
+can modify `.git/hooks`, and those hooks run on your host the next time you
+use git there.
+
+## Install
+
+```
+cargo install --path .
+```
+
+You need Podman or Docker. Podman is preferred when both are installed
+because it is rootless by default. With rootful Docker, a container escape is
+root on the host, and podbay says so on every run.
 
 ## Quick start
 
 ```
-podman build -t podbay-base:latest base/
-./bin/podbay --project /some/repo
+podbay run ~/src/some-project
 ```
 
-Inside, mise automatically installs whatever the repo's own config
-(`.mise.toml`, `.nvmrc`, ...) asks for.
-Your shell starts in `/home/dev/workspace/repomount` as `dev`.
+The first run builds the bundled base image: Debian slim, a non-root `dev`
+user and mise, verified against its signing key. Inside, mise installs
+whatever the project's own config (`.mise.toml`, `.nvmrc`, ...) asks for.
 
-### A note on trust
+```
+podbay run . -- make test     # run a command instead of a shell
+podbay run --dry-run .        # print the exact podman/docker command
+podbay build                  # build or refresh the images ahead of time
+```
 
-mise can install tools from many sources including random repositories. A
-malicious repo could declare a custom tool that installs malware. By default
-the shared mise cache (`podbay-mise-cache`) means that install would persist
-and be visible to other repos using the same cache. If you are working with
-code you do not trust, use `--local-cache` to keep that repo's installs
-isolated to `~/.cache/podbay/mise-caches/<repo-key>/`. You should also be
-careful with mise.toml. I personally only use it unless I'm declaring
-something more custom. Simply auditing mise.toml yourself before running
-intalls will solve this.
+Files the container creates in your project are owned by you on the host. On
+rootless Podman, `dev` is mapped onto your user with `keep-id`. On rootful
+Docker, the entrypoint gives `dev` your uid and gid before dropping root.
 
 ## Profiles
 
-A codebase will only declare what it needs. For the tools and files you always
-want, make a profile:
+A profile is a single TOML file in `~/.config/podbay/profiles/`:
 
 ```
-./bin/podbay --init-profile example0
+podbay profile init base
+podbay profile init ai --extends base
+podbay profile show ai        # everything ai resolves to, inheritance merged
+podbay run -p ai .
 ```
 
-That creates `~/.config/podbay/profiles/example0/` with four editable files:
-
-- **`mounts.toml`** - generic bind mounts of your files into the container.
-  Each entry maps a host path to a container path (`~` is allowed), mounted
-  read-only by default. A host path that doesn't exist is skipped with a
-  warning, not an error. Best for host dotfiles you edit outside the container
-  (e.g. `.gitconfig`, `.zshrc`).
-- **`volumes.toml`** - named Podman volumes for state that should persist
-  across disposable container runs. Use these for directories the container
-  needs to create or write into, such as tool config, auth files, caches, and
-  themes. Volumes are namespaced per profile and survive `--rm`.
-- **`mise-global.toml`** - personal tools, installed by mise into every
-  session. These are additive with whatever the codebase asks for, so they're
-  always available without touching the codebase config.
-- **`extension.sh`** - optional build-time extension script. If present, it is
-  baked into a derived image and executed as root during the build. Use this
-  for system-level dependencies that mise cannot install, such as the shared
-  libraries needed by Chromium/Playwright.
-
-Then run with the profile:
-
-```
-./bin/podbay --project /some/repo --profile example0
-```
-
-`~/.config/podbay/profiles/common/mounts.toml`, `common/volumes.toml`, and
-optionally `common/extension.sh` are always merged in first, regardless of
-`--profile` - put things that belong to "you" generally (like `.gitconfig`)
-in `common/`, and workflow-specific mounts, volumes, and image extensions in
-the named profile.
-`./bin/podbay --list-profiles` shows what you have.
-
-## Setting up a good profile
-
-Put host dotfiles you edit on the host in `common/mounts.toml`:
+If you don't pass `-p`, podbay uses `default_profile` from `config.toml`,
+otherwise a profile named `default` if one exists.
 
 ```toml
-# ~/.config/podbay/profiles/common/mounts.toml
+# ~/.config/podbay/profiles/base.toml
+
+# Bind mounts from the host, read-only unless mode = "rw".
 [[mount]]
 host = "~/.gitconfig"
 container = "/home/dev/.gitconfig"
-mode = "ro"
 
 [[mount]]
 host = "~/.zshrc"
 container = "/home/dev/.zshrc"
-mode = "ro"
 ```
 
-Put workflow-specific tools and their persistent state in a named profile.
-For example, an `ai` profile for opencode:
-
 ```toml
-# ~/.config/podbay/profiles/ai/volumes.toml
+# ~/.config/podbay/profiles/ai.toml
+extends = ["base"]
+
+# Optional: a root build script for system packages mise can't install.
+# Relative to the profiles directory; must start with a shebang.
+extension = "ai.sh"
+
+# Named volumes keep tool state across runs. Stored as podbay-ai-<name>.
 [[volume]]
 name = "opencode-config"
 container = "/home/dev/.config/opencode"
@@ -103,30 +108,57 @@ container = "/home/dev/.config/opencode"
 [[volume]]
 name = "opencode-data"
 container = "/home/dev/.local/share/opencode"
-```
 
-```toml
-# ~/.config/podbay/profiles/ai/mise-global.toml
+# Tools mise installs in every session, on top of the project's own.
 [tools]
 opencode = "latest"
 ```
 
-Run with:
+With `extends`, ancestors are applied first. A later profile's mount or
+volume replaces an inherited one at the same container path, and its tools
+override inherited versions. Volumes keep the name of the profile that
+declared them, so every profile extending `base` shares `base`'s volumes.
+
+**Mounts or volumes?** Use mounts for files you own and edit on the host. Use
+volumes for directories the container creates or writes into. The engine
+creates a missing mount point's parent directories as root. The entrypoint
+fixes their ownership for volumes, but not for bind mounts.
+
+**Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
+Each tag is a hash of the script and its parent image, so editing a script,
+or any script below it in the chain, rebuilds exactly what changed.
+
+## Configuration
+
+`~/.config/podbay/config.toml` (all keys optional):
+
+```toml
+backend = "podman"           # or "docker"; default: podman if installed
+default_profile = "base"
+base_image = "my/image:tag"  # use your own image instead of the bundled one
+```
+
+A custom base image must provide a `dev` user and podbay's entrypoint (see
+`base/`).
+
+## A note on mise and trust
+
+mise can install tools from many sources, and some of its backends run
+arbitrary code at install time. By default, installed tools live in one
+shared volume (`podbay-mise-data`), so a malicious project could leave
+something behind that other projects then pick up. For code you don't trust,
+`--local-cache` keeps that project's installs in
+`~/.cache/podbay/mise/<repo-key>/`. Review a project's mise config before
+letting it install anything.
+
+## Development
 
 ```
-./bin/podbay --project /some/repo --profile ai
+cargo test                          # unit, CLI and end-to-end tests
+PODBAY_TEST_BACKEND=podman cargo test
 ```
 
-`mise` installs opencode, and its auth, skills, agents, and themes persist
-in the named volumes across sessions even though the container is launched
-with `--rm`.
-
-### Mounts vs volumes
-
-Use **`mounts.toml`** for files you own and edit on the host (read-only
-dotfiles). Use **`volumes.toml`** for directories the container needs to
-create or write into. If a bind mount points at a parent directory that does
-not already exist in the image, Podman may create it as root, and the
-container user will not be able to write there — that is exactly the case
-volumes solve.
-
+The end-to-end test runs a real container on Docker (or the engine named by
+`PODBAY_TEST_BACKEND`) and is skipped when that engine isn't available. It
+uses a small stand-in for the base image (`tests/fixtures/test-base`) with the
+same entrypoint, so it doesn't need to build the full toolchain.
