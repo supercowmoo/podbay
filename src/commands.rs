@@ -1,8 +1,8 @@
 use std::fs;
-use std::io::IsTerminal;
-use std::os::unix::process::CommandExt;
+use std::io::{self, IsTerminal, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitCode, ExitStatus};
 
 use anyhow::{Context, Result, bail};
 
@@ -15,6 +15,7 @@ use crate::paths::Paths;
 use crate::plan::{self, MiseData, RunPlan};
 use crate::profile::{self, ResolvedProfile};
 use crate::repo_key::repo_key;
+use crate::report;
 
 struct Setup {
     paths: Paths,
@@ -67,7 +68,7 @@ impl Setup {
     }
 }
 
-pub fn run(args: RunArgs) -> Result<()> {
+pub fn run(args: RunArgs) -> Result<ExitCode> {
     let ctx = Setup::load()?;
     let backend = ctx.backend(&args.engine)?;
 
@@ -102,7 +103,7 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     let plan = RunPlan::build(plan::Inputs {
         image,
-        project,
+        project: project.clone(),
         repo_key: &key,
         profile: &profile,
         identity: &identity,
@@ -123,7 +124,7 @@ pub fn run(args: RunArgs) -> Result<()> {
             .map(|a| plan::shell_quote(&a))
             .collect();
         println!("{}", words.join(" "));
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     let chain = match profile.chain.is_empty() {
@@ -131,8 +132,61 @@ pub fn run(args: RunArgs) -> Result<()> {
         false => format!("profile {}", profile.chain.join(" > ")),
     };
     eprintln!("podbay: {key} with {chain} on {program}");
-    let err = Command::new(program).args(&argv).exec();
-    Err(err).with_context(|| format!("running {program}"))
+
+    let rw_mounts: Vec<PathBuf> = profile
+        .mounts
+        .iter()
+        .filter(|m| !m.readonly)
+        .map(|m| m.host.clone())
+        .collect();
+    let watch = report::Watch::begin(&project, &rw_mounts);
+    let child = Command::new(program)
+        .args(&argv)
+        .spawn()
+        .with_context(|| format!("running {program}"))?;
+    let status =
+        wait_ignoring_interrupts(child).with_context(|| format!("waiting for {program}"))?;
+
+    let report = watch.finish().render(&project);
+    let mut stderr = io::stderr().lock();
+    if stderr.is_terminal() {
+        // The container controlled the terminal until now. Undo text styling
+        // and character set switches so the report can't be hidden by them.
+        let _ = stderr.write_all(b"\x1b[0m\x1b(B");
+    }
+    let _ = stderr.write_all(report.as_bytes());
+    Ok(exit_code(status))
+}
+
+/// Waits for the engine with terminal interrupts ignored, as `system(3)`
+/// does: Ctrl-C still reaches the engine, which passes it to the container,
+/// and podbay stays alive to print the session report.
+fn wait_ignoring_interrupts(mut child: Child) -> io::Result<ExitStatus> {
+    // SAFETY: setting SIG_IGN installs no handler code. The child was
+    // spawned before this, so it keeps the default dispositions.
+    let previous = unsafe {
+        [
+            libc::signal(libc::SIGINT, libc::SIG_IGN),
+            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
+        ]
+    };
+    let status = child.wait();
+    // SAFETY: restores the dispositions returned above.
+    unsafe {
+        libc::signal(libc::SIGINT, previous[0]);
+        libc::signal(libc::SIGQUIT, previous[1]);
+    }
+    status
+}
+
+/// The container's exit status as podbay's own, shell style: 128 + the
+/// signal number if the engine was killed.
+fn exit_code(status: ExitStatus) -> ExitCode {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => ExitCode::from(code as u8),
+        (None, Some(signal)) => ExitCode::from(128u8.wrapping_add(signal as u8)),
+        (None, None) => ExitCode::FAILURE,
+    }
 }
 
 /// Writes the profile's tools as a mise config file, named by its content so

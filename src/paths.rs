@@ -8,9 +8,9 @@ use anyhow::{Context, Result, bail};
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub home: PathBuf,
-    /// `$XDG_CONFIG_HOME/podbay`
+    /// `$PODBAY_CONFIG_DIR`, else `$XDG_CONFIG_HOME/podbay`
     pub config_dir: PathBuf,
-    /// `$XDG_CACHE_HOME/podbay`
+    /// `$PODBAY_CACHE_DIR`, else `$XDG_CACHE_HOME/podbay`
     pub cache_dir: PathBuf,
 }
 
@@ -23,15 +23,23 @@ impl Paths {
         if !home.is_absolute() {
             bail!("HOME must be an absolute path, got {}", home.display());
         }
-        let xdg = |var: &str, fallback: &str| {
+        let absolute = |var: &str| {
             env::var_os(var)
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| home.join(fallback))
+        };
+        // The PODBAY_ variables move podbay's own files without changing
+        // HOME or XDG_*, which rootless podman reads to find its storage.
+        let dir = |own: &str, xdg: &str, fallback: &str| {
+            absolute(own).unwrap_or_else(|| {
+                absolute(xdg)
+                    .unwrap_or_else(|| home.join(fallback))
+                    .join("podbay")
+            })
         };
         Ok(Self {
-            config_dir: xdg("XDG_CONFIG_HOME", ".config").join("podbay"),
-            cache_dir: xdg("XDG_CACHE_HOME", ".cache").join("podbay"),
+            config_dir: dir("PODBAY_CONFIG_DIR", "XDG_CONFIG_HOME", ".config"),
+            cache_dir: dir("PODBAY_CACHE_DIR", "XDG_CACHE_HOME", ".cache"),
             home,
         })
     }

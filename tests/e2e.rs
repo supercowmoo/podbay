@@ -49,6 +49,15 @@ fn build_test_base(engine: &str) {
     assert!(status.success(), "building the test base image failed");
 }
 
+/// podbay with its config and cache under `root`. HOME and XDG_* are left
+/// alone: rootless podman finds its image store through them.
+fn podbay(root: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("podbay").unwrap();
+    cmd.env("PODBAY_CONFIG_DIR", root.join("config"))
+        .env("PODBAY_CACHE_DIR", root.join("cache"));
+    cmd
+}
+
 /// Removes an engine object (`volume` or `image`) when dropped.
 struct Cleanup<'a> {
     engine: &'a str,
@@ -72,7 +81,7 @@ fn session_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let home = root.join("home");
-    let config = root.join("config/podbay");
+    let config = root.join("config");
     let profiles = config.join("profiles");
     let project: PathBuf = root.join("project");
     for d in [&home, &profiles, &project] {
@@ -105,7 +114,7 @@ fn session_round_trip() {
 extension = "{id}.sh"
 
 [[mount]]
-host = "~/.gitconfig"
+host = {gitconfig:?}
 container = "/home/dev/.gitconfig"
 
 [[volume]]
@@ -114,7 +123,8 @@ container = "/home/dev/.config/tool/state"
 
 [tools]
 node = "22"
-"#
+"#,
+            gitconfig = home.join(".gitconfig"),
         ),
     )
     .unwrap();
@@ -131,13 +141,7 @@ grep -q 'node = "22"' ~/.config/mise/config.toml && echo tools=present
 touch created-in-container
 "#;
 
-    let podbay = || {
-        let mut cmd = Command::cargo_bin("podbay").unwrap();
-        cmd.env("HOME", &home)
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"));
-        cmd
-    };
+    let podbay = || podbay(root);
 
     let built = podbay()
         .args(["build", "--backend", &engine, "-p", &id])
@@ -186,6 +190,57 @@ touch created-in-container
     assert_eq!(created.uid(), rustix::process::getuid().as_raw());
 
     // --local-cache keeps mise data in a per-project host directory.
-    let cache = root.join("cache/podbay/mise");
+    let cache = root.join("cache/mise");
     assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+}
+
+#[test]
+fn session_report_flags_git_changes() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git/hooks")).unwrap();
+    fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(project.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+
+    // What a hostile project or agent might leave behind for the host.
+    let script = r#"
+set -e
+printf '#!/bin/sh\necho pwned\n' > .git/hooks/post-checkout
+chmod +x .git/hooks/post-checkout
+printf '\tfsmonitor = "sh -c pwned"\n' >> .git/config
+mkdir -p vendor/lib/.git
+printf '[core]\n\tpager = pwned\n' > vendor/lib/.git/config
+exit 7
+"#;
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "--local-cache"])
+        .arg(&project)
+        .args(["--", "sh", "-c", script])
+        .assert()
+        .code(7)
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&output.stderr);
+
+    for expected in [
+        "session report: 3 warnings",
+        ".git/hooks/post-checkout: added, an executable file",
+        "+ core.fsmonitor = sh -c pwned   [can run commands]",
+        "vendor/lib/.git: nested repository changed",
+    ] {
+        assert!(
+            err.contains(expected),
+            "missing {expected:?}\nstderr:\n{err}"
+        );
+    }
 }

@@ -2,12 +2,14 @@ mod backend;
 mod cli;
 mod commands;
 mod config;
+mod gitconfig;
 mod hash;
 mod image;
 mod paths;
 mod plan;
 mod profile;
 mod repo_key;
+mod report;
 
 use std::process::ExitCode;
 
@@ -19,11 +21,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run(args) => commands::run(args),
-        Command::Build(args) => commands::build(args),
-        Command::Profile(cmd) => commands::profile(cmd),
+        Command::Build(args) => commands::build(args).map(|()| ExitCode::SUCCESS),
+        Command::Profile(cmd) => commands::profile(cmd).map(|()| ExitCode::SUCCESS),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("podbay: error: {err:#}");
             ExitCode::FAILURE
