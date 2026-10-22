@@ -17,7 +17,7 @@ fi
   # shellcheck disable=SC2012 # interface names are plain
   echo "network=$(ls /sys/class/net | tr '\n' ' ')"
   echo "project=$project"
-  echo "tools=$(cat ~/.config/mise/config.toml 2>/dev/null | tr '\n' ' ')"
+  echo "tools=$(tr '\n' ' ' 2>/dev/null < ~/.config/mise/config.toml)"
   echo "versions=$(cat .tool-versions 2>/dev/null)"
 } > "$data/provisioned"
 echo x >> "$data/installs"
