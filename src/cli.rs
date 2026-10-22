@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::backend::BackendKind;
-use crate::config::Network;
+use crate::config::NetworkMode;
 
 /// Disposable, isolated containers around a project.
 #[derive(Debug, Parser)]
@@ -45,10 +45,10 @@ pub struct RunArgs {
     /// shared volume. Use for code you do not trust.
     #[arg(long)]
     pub local_cache: bool,
-    /// Network access for the session [default: profile or config
-    /// `network`, else none]
+    /// Network access for the session, overriding any allowlist
+    /// [default: profile or config `network`, else none]
     #[arg(long, value_enum)]
-    pub network: Option<Network>,
+    pub network: Option<NetworkMode>,
     /// Print the engine command instead of running it. Builds nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -127,7 +127,7 @@ mod tests {
         let Command::Run(run) = cli.command else {
             panic!()
         };
-        assert_eq!(run.network, Some(Network::Full));
+        assert_eq!(run.network, Some(NetworkMode::Full));
         assert!(Cli::try_parse_from(["podbay", "run", "--network", "lan"]).is_err());
     }
 }

@@ -1,0 +1,11 @@
+# The relay image: one static binary on an empty filesystem. podbay builds
+# it the first time a session uses a network allowlist.
+FROM rust:1.90.0-alpine3.22 AS build
+COPY main.rs /src/main.rs
+RUN rustc --edition 2024 -C opt-level=s -C panic=abort \
+    -C target-feature=+crt-static -C strip=symbols -o /podbay-relay /src/main.rs
+
+FROM scratch
+COPY --from=build /podbay-relay /podbay-relay
+USER 65534:65534
+ENTRYPOINT ["/podbay-relay"]

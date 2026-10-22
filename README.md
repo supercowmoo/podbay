@@ -11,7 +11,7 @@ everything else is something you declared:
 - named volumes for state that should outlive the container
 - tools that mise installs on top of what the project asks for
 - optional root build scripts baked into a derived image
-- network access, which is off unless a profile turns it on
+- network access: none, HTTPS to the hosts you list, or everything
 
 Anything that needs root, such as changes to the image, can only come from
 your own config directory, never from the mounted project.
@@ -28,18 +28,15 @@ Being rebuilt in Rust, in stages:
    read-only root filesystem, resource limits. *(done)*
 4. Network policy: no network by default, with an allowlist enforced by a
    filtering proxy. Tool installs move to a separate provisioning step.
-   *(no network by default and provisioning done; the allowlist proxy, a
-   small Rust proxy shipped with podbay, is next)*
+   *(done)*
 5. Landlock and seccomp around processes inside the container.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
 [THREAT_MODEL.md](THREAT_MODEL.md) covers what is and isn't protected
-today, and which stage closes each gap. The two biggest: a session that
-needs the network (an AI agent calling its API) has to be given all of it
-until the allowlist lands, and the project is mounted read-write, so code
-inside can plant git hooks or config that run on your host the next time you
-use git there. The [session report](#session-report) tells you when that has
-happened.
+today, and which stage closes each gap. The biggest: the project is mounted
+read-write, so code inside can plant git hooks or config that run on your
+host the next time you use git there. The [session report](#session-report)
+tells you when that has happened.
 
 ## Install
 
@@ -91,13 +88,58 @@ and gid.
   mount ownership, then drops all of it before your command runs. A profile
   can keep specific capabilities with `cap_add` (see below).
 - **Network**: none. The session has only a loopback interface, so it
-  can't reach the internet, your LAN or the host. A profile can turn on full
-  network access with `network = "full"`, and podbay warns on every run that
-  has it. Tool installs don't need it; see [Provisioning](#provisioning).
+  can't reach the internet, your LAN or the host. A profile can allow HTTPS
+  to specific hosts (see [Network allowlist](#network-allowlist)), or turn
+  on full access with `network = "full"`, which podbay warns about on every
+  run. Tool installs need neither; see [Provisioning](#provisioning).
 - **Resources**: at most 4096 processes and threads by default. Memory and
   CPU limits are opt-in. Rootless engines can apply a limit only when
   systemd delegates that cgroup controller to your user. When it doesn't,
   podbay warns and runs without that limit.
+
+## Network allowlist
+
+A profile can let the session reach a few hosts over HTTPS and nothing else:
+
+```toml
+network = ["api.anthropic.com", "*.githubusercontent.com", "registry.example.com:8443"]
+```
+
+`*.example.com` covers every name below `example.com` (not `example.com`
+itself), and the port is 443 unless you give one. A list in a profile adds to
+the lists of the profiles it extends; `"none"` or `"full"` replaces them.
+`--network none` or `--network full` overrides everything for one run.
+
+The session still has no network interface besides loopback. podbay starts a
+tiny relay container next to it, with no network either, and the session
+shares the relay's network namespace. The relay listens on `127.0.0.1:3128`
+and passes every connection to podbay on the host, which:
+
+- accepts only HTTPS proxy requests (`CONNECT host:port`), for names on the
+  list. IP addresses are refused, and names not on the list are never
+  looked up, so a session can't leak data through DNS.
+- refuses names that resolve to loopback, private, link-local (including
+  cloud metadata at 169.254.169.254) or other non-public addresses. A
+  registry on your LAN can't be allowed this way.
+- connects from the host and copies bytes both ways. TLS is end to end
+  between the session and the server; podbay sees only the host name.
+
+The session gets `HTTPS_PROXY` and `HTTP_PROXY` (and the lowercase forms)
+pointing at the relay, and `NODE_USE_ENV_PROXY=1` for Node. Most tools,
+including curl, git over HTTPS, npm, pip, cargo and Node, pick these up.
+Anything that ignores them, or uses another protocol such as SSH, gets no
+connection at all. Plain `http://` URLs are refused.
+
+After the session, podbay lists every destination it asked for:
+
+```
+podbay: network:
+  api.anthropic.com:443: allowed (14 times)
+  pastebin.com:443: denied, not on the allowlist
+```
+
+The relay image is built from source the first time it's needed, from a
+pinned Rust image, and is under 1 MB.
 
 ## Provisioning
 
@@ -188,9 +230,8 @@ extends = ["base"]
 # Relative to the profiles directory; must start with a shebang.
 extension = "ai.sh"
 
-# The agent calls its API, so this profile needs the network. podbay warns
-# on every run that has it.
-network = "full"
+# The agent calls its API, and nothing else.
+network = ["api.anthropic.com"]
 
 # Named volumes keep tool state across runs. Stored as podbay-ai-<name>.
 [[volume]]
@@ -222,7 +263,8 @@ memory = "16g"
 With `extends`, ancestors are applied first. A later profile's mount or
 volume replaces an inherited one at the same container path, and its tools
 override inherited versions. `cap_add` lists are combined, `[limits]` keys
-override one at a time, and the last profile that sets `network` wins. Volumes keep the name of the profile that
+override one at a time, and `network` host lists add up while `"none"` or
+`"full"` replaces what came before. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
 **Mounts or volumes?** Use mounts for files you own and edit on the host. Use
@@ -245,7 +287,7 @@ automatically.
 backend = "podman"           # or "docker"; default: podman if installed
 default_profile = "base"
 base_image = "my/image:tag"  # use your own image instead of the bundled one
-network = "none"             # or "full"; profiles and --network override it
+network = "none"             # "full", or a host list; see Network allowlist
 
 [limits]                     # profiles can override each key
 pids = 4096                  # processes and threads; 0 for no limit
@@ -284,5 +326,10 @@ The end-to-end tests run real containers on Docker (or the engine named by
 `PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available. They
 use a small stand-in for the base image (`tests/fixtures/test-base`) with the
 same entrypoint and a fake `mise` that records what provisioning saw, so
-they don't need to build the full toolchain. One of them plays a hostile
-session and checks that the session report catches it.
+they don't need to build the full toolchain. Two of them play a hostile
+session: one checks that the session report catches it, the other that the
+network allowlist holds. Set `PODBAY_TEST_INTERNET=1` to also check that an
+allowed host is reachable, as CI does.
+
+The relay is its own crate in `relay/`, standard library only; run
+`cargo test --workspace` and `cargo clippy --workspace` to include it.

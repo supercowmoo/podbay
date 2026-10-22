@@ -447,3 +447,152 @@ echo "installs=$(wc -l < ~/.local/share/mise/installs)"
     assert_ne!(session_network.trim(), "lo", "{out}");
     assert!(out.contains("offline=unset"), "{out}");
 }
+
+#[test]
+fn allowlisted_session_reaches_only_listed_hosts() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2eallow{}", std::process::id());
+    // .test names never resolve (RFC 6761), and localhost is allowed by
+    // name but must still be refused for being local.
+    fs::write(
+        profiles.join(format!("{id}.toml")),
+        "network = [\"allowed.podbay.test\", \"localhost\"]\n",
+    )
+    .unwrap();
+
+    // Talks to the proxy by hand: the test image has no curl.
+    let script = r#"
+# /proc/net/dev shows the namespace the process is really in; some
+# runtimes show the host's /sys to a container that joined another's.
+echo "interfaces=$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | tr '\n' ' ')"
+echo "proxy=$HTTPS_PROXY"
+probe() {
+  exec 3<>/dev/tcp/127.0.0.1/3128 || { echo "$1 => no proxy"; return; }
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >&3
+  read -r status <&3
+  echo "$1 => ${status%$'\r'}"
+  exec 3>&-
+}
+probe evil.example:443
+probe localhost:443
+probe 169.254.169.254:80
+probe allowed.podbay.test:443
+if timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then
+  echo direct=open
+else
+  echo direct=blocked
+fi
+"#;
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
+        .arg(&project)
+        .args(["--", "bash", "-c", script])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+
+    for expected in [
+        "interfaces=lo \n",
+        "proxy=http://127.0.0.1:3128",
+        "evil.example:443 => HTTP/1.1 403 Forbidden",
+        "localhost:443 => HTTP/1.1 403 Forbidden",
+        "169.254.169.254:80 => HTTP/1.1 403 Forbidden",
+        "allowed.podbay.test:443 => HTTP/1.1 502 Bad Gateway",
+        "direct=blocked",
+    ] {
+        assert!(
+            out.contains(expected),
+            "missing {expected:?}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+    }
+    for expected in [
+        "network: HTTPS to allowed.podbay.test, localhost only",
+        "evil.example:443: denied, not on the allowlist",
+        "localhost:443: denied, it resolves only to private or local addresses",
+        "169.254.169.254:80: denied, IP addresses are not allowed",
+        "allowed.podbay.test:443: failed, the name did not resolve",
+    ] {
+        assert!(
+            err.contains(expected),
+            "missing {expected:?}\nstderr:\n{err}"
+        );
+    }
+
+    // The relay is gone with the session.
+    let left = StdCommand::new(&engine)
+        .args(["ps", "--all", "--quiet", "--filter", "name=podbay-relay-"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&left.stdout).trim().is_empty(),
+        "relay containers left behind"
+    );
+}
+
+/// Needs the internet, so it runs only with PODBAY_TEST_INTERNET=1 (as CI
+/// sets it).
+#[test]
+fn allowlisted_session_reaches_a_real_host() {
+    if std::env::var_os("PODBAY_TEST_INTERNET").is_none() {
+        eprintln!("skipping: set PODBAY_TEST_INTERNET=1 to run");
+        return;
+    }
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2ereal{}", std::process::id());
+    fs::write(
+        profiles.join(format!("{id}.toml")),
+        "network = [\"example.com\"]\n",
+    )
+    .unwrap();
+
+    let script = r#"
+exec 3<>/dev/tcp/127.0.0.1/3128
+printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' >&3
+read -r status <&3
+echo "status=${status%$'\r'}"
+"#;
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
+        .arg(&project)
+        .args(["--", "bash", "-c", script])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        out.contains("status=HTTP/1.1 200 Connection established"),
+        "stdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(err.contains("example.com:443: allowed"), "{err}");
+}

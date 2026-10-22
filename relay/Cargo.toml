@@ -1,0 +1,9 @@
+[package]
+name = "podbay-relay"
+version = "0.1.0"
+edition = "2024"
+description = "Forwards a podbay session's proxy connections to podbay on the host"
+publish = false
+
+# Standard library only: the relay image builds this file with plain rustc.
+[dependencies]

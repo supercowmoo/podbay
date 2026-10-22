@@ -17,7 +17,7 @@
 //! [tools]
 //! opencode = "latest"
 //!
-//! network = "full"      # default "none"
+//! network = ["api.example.com"]   # or "full"; default "none"
 //! ```
 
 use std::collections::HashSet;
@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::config::{Limits, Network};
+use crate::config::{Limits, NetworkSetting};
 use crate::paths::Paths;
 
 #[derive(Debug, Default, Deserialize)]
@@ -48,7 +48,7 @@ struct ProfileFile {
     cap_add: Vec<String>,
     #[serde(default)]
     limits: Limits,
-    network: Option<Network>,
+    network: Option<NetworkSetting>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,8 +113,9 @@ pub struct ResolvedProfile {
     pub caps: Vec<Capability>,
     /// Limits set by the chain; unset fields fall back to config.toml.
     pub limits: Limits,
-    /// Network access set by the chain, and the profile that set it last.
-    pub network: Option<(Network, String)>,
+    /// `network` settings down the chain, ancestors first, each with the
+    /// profile that set it.
+    pub network: Vec<(NetworkSetting, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
 }
@@ -376,7 +377,7 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProf
     out.limits.merge(&profile.limits);
 
     if let Some(network) = profile.network {
-        out.network = Some((network, name.to_owned()));
+        out.network.push((network, name.to_owned()));
     }
     Ok(())
 }
@@ -655,17 +656,35 @@ mod tests {
     }
 
     #[test]
-    fn network_is_set_by_the_last_profile() {
+    fn network_settings_are_kept_in_chain_order() {
+        use crate::config::{Network, NetworkMode};
         let f = Fixture::new();
-        f.profile("base", "network = \"full\"\n")
-            .profile("child", "extends = [\"base\"]\n")
-            .profile("strict", "extends = [\"base\"]\nnetwork = \"none\"\n");
-        let r = resolve(&f.paths, "child").unwrap();
-        assert_eq!(r.network, Some((Network::Full, "base".into())));
-        let r = resolve(&f.paths, "strict").unwrap();
-        assert_eq!(r.network, Some((Network::None, "strict".into())));
+        f.profile("base", "network = [\"a.example.com\"]\n")
+            .profile(
+                "ai",
+                "extends = [\"base\"]\nnetwork = [\"b.example.com:8443\"]\n",
+            )
+            .profile("open", "extends = [\"ai\"]\nnetwork = \"full\"\n");
+        let r = resolve(&f.paths, "ai").unwrap();
+        let names: Vec<&str> = r.network.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["base", "ai"]);
+        let mut net = Network::default();
+        for (setting, _) in &r.network {
+            net.apply(setting);
+        }
+        assert_eq!(net.describe(), "allow a.example.com, b.example.com:8443");
+
+        let r = resolve(&f.paths, "open").unwrap();
+        assert_eq!(
+            r.network.last(),
+            Some(&(NetworkSetting::Mode(NetworkMode::Full), "open".into()))
+        );
+
         f.profile("bad", "network = \"lan\"\n");
         assert!(resolve(&f.paths, "bad").is_err());
+        f.profile("ip", "network = [\"169.254.169.254\"]\n");
+        let err = format!("{:#}", resolve(&f.paths, "ip").unwrap_err());
+        assert!(err.contains("IP addresses"), "{err}");
     }
 
     #[test]

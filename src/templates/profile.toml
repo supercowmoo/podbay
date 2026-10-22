@@ -13,9 +13,13 @@
 # cannot install. It is never read from the project you mount.
 # extension = "{name}.sh"
 
-# Network access for the session: "none" (default, loopback only) or "full".
-# Tool installs don't need it. podbay warns on every run with "full".
+# Network access for the session. "none" (default) is loopback only. A list
+# of hosts allows HTTPS to just those, through podbay's proxy; "*.x.com"
+# covers every name below x.com, and ":port" changes the port from 443.
+# Lists add to the ones in profiles this extends. "full" is everything, and
+# podbay warns on every run with it. Tool installs need none of this.
 #
+# network = ["api.anthropic.com", "*.githubusercontent.com"]
 # network = "full"
 
 # Capabilities the session keeps. None by default; each one weakens the

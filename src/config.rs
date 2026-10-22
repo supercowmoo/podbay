@@ -9,6 +9,7 @@ use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::backend::BackendKind;
+use crate::egress::HostPattern;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,30 +23,95 @@ pub struct Config {
     pub base_image: Option<String>,
     /// Network access for every session; profiles and `--network` can
     /// override it.
-    pub network: Option<Network>,
+    pub network: Option<NetworkSetting>,
     /// Resource limits for every session; profiles can override them.
     #[serde(default)]
     pub limits: Limits,
 }
 
-/// What a session can reach over the network. Tool installs happen in a
-/// separate provisioning step, so sessions need no network by default.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+/// A `network` setting from config.toml or a profile: `"none"`, `"full"`,
+/// or a list of hosts the session may connect to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawNetwork")]
+pub enum NetworkSetting {
+    Mode(NetworkMode),
+    Allow(Vec<HostPattern>),
+}
+
+#[derive(Deserialize)]
+#[serde(
+    untagged,
+    expecting = "\"none\", \"full\", or a list of hosts such as [\"api.example.com\"]"
+)]
+enum RawNetwork {
+    Mode(NetworkMode),
+    Allow(Vec<String>),
+}
+
+impl TryFrom<RawNetwork> for NetworkSetting {
+    type Error = anyhow::Error;
+    fn try_from(raw: RawNetwork) -> Result<Self> {
+        Ok(match raw {
+            RawNetwork::Mode(mode) => Self::Mode(mode),
+            RawNetwork::Allow(hosts) => Self::Allow(
+                hosts
+                    .iter()
+                    .map(|h| HostPattern::parse(h))
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
-pub enum Network {
+pub enum NetworkMode {
     /// Loopback only.
-    #[default]
     None,
     /// The engine's default network: the internet, the LAN, and depending
     /// on the engine, the host.
     Full,
 }
 
+/// What a session can reach, once config.toml, the profile chain and
+/// `--network` are combined. Tool installs happen in a separate
+/// provisioning step, so sessions need no network by default.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum Network {
+    #[default]
+    None,
+    Full,
+    /// HTTPS to these hosts only, through podbay's proxy.
+    Allow(Vec<HostPattern>),
+}
+
 impl Network {
-    pub fn as_str(self) -> &'static str {
+    /// Applies the next setting in order. A mode replaces what came before;
+    /// a list of hosts adds to an earlier list, or replaces a mode.
+    pub fn apply(&mut self, setting: &NetworkSetting) {
+        match (setting, &mut *self) {
+            (NetworkSetting::Mode(NetworkMode::None), _) => *self = Self::None,
+            (NetworkSetting::Mode(NetworkMode::Full), _) => *self = Self::Full,
+            (NetworkSetting::Allow(hosts), Self::Allow(have)) => {
+                for host in hosts {
+                    if !have.contains(host) {
+                        have.push(host.clone());
+                    }
+                }
+            }
+            (NetworkSetting::Allow(hosts), _) => *self = Self::Allow(hosts.clone()),
+        }
+    }
+
+    /// `none`, `full`, or the allowed hosts.
+    pub fn describe(&self) -> String {
         match self {
-            Self::None => "none",
-            Self::Full => "full",
+            Self::None => "none".into(),
+            Self::Full => "full".into(),
+            Self::Allow(hosts) => {
+                let hosts: Vec<String> = hosts.iter().map(ToString::to_string).collect();
+                format!("allow {}", hosts.join(", "))
+            }
         }
     }
 }
@@ -140,8 +206,39 @@ mod tests {
     #[test]
     fn parses_network() {
         let cfg: Config = toml::from_str("network = \"full\"\n").unwrap();
-        assert_eq!(cfg.network, Some(Network::Full));
+        assert_eq!(cfg.network, Some(NetworkSetting::Mode(NetworkMode::Full)));
+        let cfg: Config = toml::from_str("network = [\"a.example.com\"]\n").unwrap();
+        assert_eq!(
+            cfg.network,
+            Some(NetworkSetting::Allow(vec![
+                HostPattern::parse("a.example.com").unwrap()
+            ]))
+        );
         assert!(toml::from_str::<Config>("network = \"some\"\n").is_err());
+        let err = toml::from_str::<Config>("network = [\"10.0.0.1\"]\n").unwrap_err();
+        assert!(err.to_string().contains("IP addresses"), "{err}");
+    }
+
+    #[test]
+    fn network_settings_combine() {
+        let allow = |hosts: &[&str]| {
+            NetworkSetting::Allow(
+                hosts
+                    .iter()
+                    .map(|h| HostPattern::parse(h).unwrap())
+                    .collect(),
+            )
+        };
+        let mut net = Network::default();
+        net.apply(&allow(&["a.com"]));
+        net.apply(&allow(&["b.com", "a.com"]));
+        assert_eq!(net.describe(), "allow a.com, b.com");
+        net.apply(&NetworkSetting::Mode(NetworkMode::Full));
+        assert_eq!(net, Network::Full);
+        net.apply(&allow(&["c.com:8443"]));
+        assert_eq!(net.describe(), "allow c.com:8443");
+        net.apply(&NetworkSetting::Mode(NetworkMode::None));
+        assert_eq!(net, Network::None);
     }
 
     #[test]

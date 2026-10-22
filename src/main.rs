@@ -2,6 +2,7 @@ mod backend;
 mod cli;
 mod commands;
 mod config;
+mod egress;
 mod gitconfig;
 mod hash;
 mod image;

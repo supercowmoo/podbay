@@ -2,17 +2,19 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Backend, BackendKind, Identity};
 use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
-use crate::config::{Config, DEFAULT_PIDS, Limits, Network};
+use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
+use crate::egress;
 use crate::hash::sha256_hex;
 use crate::image::{self, Action, BaseImage, LayerSource};
 use crate::paths::Paths;
-use crate::plan::{self, MiseData, RunPlan};
+use crate::plan::{self, MiseData, Net, RunPlan};
 use crate::profile::{self, ResolvedProfile};
 use crate::provision;
 use crate::repo_key::repo_key;
@@ -72,19 +74,41 @@ impl Setup {
         limits
     }
 
-    /// `--network`, then the profile chain, then config.toml, then none;
-    /// with where the setting came from, for messages.
-    fn network(&self, profile: &ResolvedProfile, flag: Option<Network>) -> (Network, String) {
-        if let Some(network) = flag {
-            return (network, "--network".into());
+    /// config.toml, then the profile chain, then `--network`, each applied
+    /// on top of the last; with where the result came from, for messages.
+    fn network(&self, profile: &ResolvedProfile, flag: Option<NetworkMode>) -> (Network, String) {
+        let mut network = Network::default();
+        let mut sources: Vec<String> = Vec::new();
+        let mut apply = |setting: &NetworkSetting, source: String| {
+            // Host lists add up; anything else starts over.
+            if !matches!(
+                (setting, &network),
+                (NetworkSetting::Allow(_), Network::Allow(_))
+            ) {
+                sources.clear();
+            }
+            network.apply(setting);
+            sources.push(source);
+        };
+        if let Some(setting) = &self.config.network {
+            apply(setting, "config.toml".into());
         }
-        if let Some((network, name)) = &profile.network {
-            return (*network, format!("profile {name}"));
+        for (setting, name) in &profile.network {
+            apply(setting, format!("profile {name}"));
         }
-        match self.config.network {
-            Some(network) => (network, "config.toml".into()),
-            None => (Network::None, "default".into()),
+        if let Some(mode) = flag {
+            apply(&NetworkSetting::Mode(mode), "--network".into());
         }
+        let profiles: Vec<&str> = sources
+            .iter()
+            .filter_map(|s| s.strip_prefix("profile "))
+            .collect();
+        let source = match sources.len() {
+            0 => "default".to_owned(),
+            n if n > 1 && profiles.len() == n => format!("profiles {}", profiles.join(", ")),
+            _ => sources.join(", "),
+        };
+        (network, source)
     }
 
     fn base_image(&self) -> BaseImage {
@@ -199,7 +223,7 @@ impl Prepared {
             tty: is_tty(),
             caps: &[],
             limits: &self.limits,
-            network: Network::Full,
+            network: Net::Full,
         })
     }
 
@@ -270,6 +294,29 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     }
     let caps: Vec<String> = profile.caps.iter().map(|c| c.name.clone()).collect();
 
+    let relay_name = format!("podbay-relay-{}-{}", prep.key, std::process::id());
+    let relay_image = match &network {
+        Network::Allow(_) => {
+            let layer = image::relay_layer();
+            let actions = image::ensure(
+                &prep.backend,
+                std::slice::from_ref(&layer),
+                false,
+                args.dry_run,
+            )?;
+            if args.dry_run && actions.contains(&Action::Build) {
+                eprintln!("podbay: the network relay image would be built first");
+            }
+            Some(layer.tag)
+        }
+        _ => None,
+    };
+    let net = match network {
+        Network::None => Net::None,
+        Network::Full => Net::Full,
+        Network::Allow(_) => Net::Relay(relay_name.clone()),
+    };
+
     let plan = RunPlan::build(plan::Inputs {
         image: prep.image.clone(),
         project: prep.project.clone(),
@@ -283,7 +330,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         tty: is_tty(),
         caps: &caps,
         limits: &prep.limits,
-        network,
+        network: net,
     })?;
     let program = prep.program();
     let argv = plan.args();
@@ -298,6 +345,13 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         }
         if due.is_some() {
             eprintln!("podbay: tools would be provisioned first; see `podbay provision --dry-run`");
+        }
+        if let Network::Allow(_) = &network {
+            eprintln!(
+                "podbay: the session would share the network of relay container {relay_name}, \
+                 with podbay's proxy on {}",
+                egress::PROXY_ADDR
+            );
         }
         print_command(program, argv);
         return Ok(ExitCode::SUCCESS);
@@ -318,12 +372,23 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
 
     let project = &prep.project;
     let key = &prep.key;
-    if network == Network::Full {
-        eprintln!(
-            "podbay: warning: the session has full network access (network = \"full\" from \
-             {network_source})"
-        );
-    }
+    let relay = match (&network, relay_image) {
+        (Network::Full, _) => {
+            eprintln!(
+                "podbay: warning: the session has full network access (network = \"full\" \
+                 from {network_source})"
+            );
+            None
+        }
+        (Network::Allow(hosts), Some(image)) => {
+            eprintln!(
+                "podbay: network: HTTPS to {} only (from {network_source})",
+                network.describe().trim_start_matches("allow ")
+            );
+            Some(Relay::start(&prep, hosts.clone(), &image, relay_name)?)
+        }
+        _ => None,
+    };
     let chain = match profile.chain.is_empty() {
         true => "no profile".to_owned(),
         false => format!("profile {}", profile.chain.join(" > ")),
@@ -344,6 +409,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     let status =
         wait_ignoring_interrupts(child).with_context(|| format!("waiting for {program}"))?;
 
+    let network_summary = relay.map(Relay::stop);
     let report = watch.finish().render(project);
     let mut stderr = io::stderr().lock();
     if stderr.is_terminal() {
@@ -352,7 +418,72 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         let _ = stderr.write_all(b"\x1b[0m\x1b(B");
     }
     let _ = stderr.write_all(report.as_bytes());
+    if let Some(summary) = network_summary {
+        let _ = stderr.write_all(summary.as_bytes());
+    }
     Ok(exit_code(status))
+}
+
+/// The relay container an allowlisted session shares its network namespace
+/// with, and the policy server behind it. The container is removed when
+/// this is dropped, however the session ended.
+struct Relay {
+    program: &'static str,
+    name: String,
+    server: egress::Server,
+}
+
+impl Relay {
+    fn start(
+        prep: &Prepared,
+        allow: Vec<egress::HostPattern>,
+        image: &str,
+        name: String,
+    ) -> Result<Self> {
+        let server = egress::Server::start(allow)?;
+        let relay = Self {
+            program: prep.program(),
+            name,
+            server,
+        };
+        let args = plan::relay_args(&plan::RelayInputs {
+            image,
+            name: &relay.name,
+            socket_dir: relay.server.dir(),
+            identity: &prep.identity,
+            repo_key: &prep.key,
+            limits: &prep.limits,
+        })?;
+        let status = Command::new(relay.program)
+            .args(&args)
+            .stdout(Stdio::null())
+            .status()
+            .with_context(|| format!("running {}", relay.program))?;
+        if !status.success() {
+            bail!("starting the network relay container failed ({status})");
+        }
+        if !relay.server.wait_ready(Duration::from_secs(20)) {
+            bail!("the network relay container did not start within 20 seconds");
+        }
+        Ok(relay)
+    }
+
+    /// Removes the container and returns what the session connected to.
+    fn stop(self) -> String {
+        let summary = self.server.summary();
+        drop(self);
+        summary
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = Command::new(self.program)
+            .args(["rm", "--force", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// Waits for the engine with terminal interrupts ignored, as `system(3)`
@@ -530,6 +661,7 @@ fn describe(
     for layer in stack {
         let source = match &layer.source {
             LayerSource::Bundled => "bundled base".to_owned(),
+            LayerSource::Relay => "network relay".to_owned(),
             LayerSource::Custom => "custom base".to_owned(),
             LayerSource::Extension { profile, .. } => format!("extension from {profile}"),
             LayerSource::Identity { uid, gid, .. } => format!("dev as {uid}:{gid}"),
@@ -568,7 +700,7 @@ fn describe(
 
     out.push_str(&format!(
         "\nnetwork: {}  (from {source})\n",
-        network.as_str()
+        network.describe()
     ));
 
     out.push_str("\nlimits:\n");

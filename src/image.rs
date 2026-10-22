@@ -14,6 +14,8 @@ use crate::profile::Extension;
 
 const BASE_CONTAINERFILE: &str = include_str!("../base/Containerfile");
 const BASE_ENTRYPOINT: &str = include_str!("../base/entrypoint.sh");
+const RELAY_CONTAINERFILE: &str = include_str!("../relay/Containerfile");
+const RELAY_SOURCE: &str = include_str!("../relay/src/main.rs");
 
 /// Where the bottom layer comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,8 @@ pub struct Layer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerSource {
     Bundled,
+    /// The network relay for allowlisted sessions, built from `relay/`.
+    Relay,
     Custom,
     Extension {
         parent: String,
@@ -110,6 +114,16 @@ pub fn add_identity(stack: &mut Vec<Layer>, uid: u32, gid: u32) {
     });
 }
 
+/// The relay image that allowlisted sessions share a network namespace with.
+/// It stands alone: nothing from the profile goes into it.
+pub fn relay_layer() -> Layer {
+    let hash = sha256_hex_fields(&[RELAY_CONTAINERFILE.as_bytes(), RELAY_SOURCE.as_bytes()]);
+    Layer {
+        tag: format!("podbay-relay:{}", &hash[..16]),
+        source: LayerSource::Relay,
+    }
+}
+
 /// What [`ensure`] did or would do with a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -156,6 +170,10 @@ fn build(backend: &dyn Backend, layer: &Layer) -> Result<()> {
         LayerSource::Bundled => {
             fs::write(ctx.path().join("Containerfile"), BASE_CONTAINERFILE)?;
             fs::write(ctx.path().join("entrypoint.sh"), BASE_ENTRYPOINT)?;
+        }
+        LayerSource::Relay => {
+            fs::write(ctx.path().join("Containerfile"), RELAY_CONTAINERFILE)?;
+            fs::write(ctx.path().join("main.rs"), RELAY_SOURCE)?;
         }
         LayerSource::Extension {
             parent,
@@ -323,6 +341,16 @@ mod tests {
         assert_eq!(built.len(), 2);
         assert!(built[0].1.starts_with(&format!("FROM {}\n", stack[0].tag)));
         assert!(built[1].1.starts_with(&format!("FROM {}\n", stack[1].tag)));
+    }
+
+    #[test]
+    fn relay_image_builds_from_its_source() {
+        let layer = relay_layer();
+        assert!(layer.tag.starts_with("podbay-relay:"), "{}", layer.tag);
+        let backend = FakeBackend::default();
+        ensure(&backend, &[layer], false, false).unwrap();
+        let built = backend.built.borrow();
+        assert!(built[0].1.contains("FROM scratch"), "{}", built[0].1);
     }
 
     #[test]

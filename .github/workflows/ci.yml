@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,9 +22,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      # Includes the end-to-end test against the runner's docker.
-      - run: cargo test
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Includes the end-to-end tests against the runner's docker, and one
+      # that reaches a real host through a network allowlist.
+      - run: cargo test --workspace
+        env:
+          PODBAY_TEST_INTERNET: "1"
 
   shellcheck:
     runs-on: ubuntu-latest

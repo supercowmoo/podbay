@@ -3,12 +3,13 @@
 //! command line can be checked in tests and shown with `--dry-run`.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
 use crate::backend::Identity;
-use crate::config::{Limits, Network};
+use crate::config::Limits;
+use crate::egress;
 use crate::profile::{ResolvedProfile, validate_container_path};
 
 pub const HOME: &str = "/home/dev";
@@ -77,6 +78,18 @@ impl Mount {
     }
 }
 
+/// How the session reaches the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Net {
+    /// Loopback only.
+    None,
+    /// The engine's default network.
+    Full,
+    /// Share the network namespace of this relay container, which has
+    /// only loopback and podbay's proxy on it.
+    Relay(String),
+}
+
 /// Where mise keeps installed tools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MiseData {
@@ -103,7 +116,7 @@ pub struct Inputs<'a> {
     pub caps: &'a [String],
     /// Limits the engine can apply; see [`Limits`].
     pub limits: &'a Limits,
-    pub network: Network,
+    pub network: Net,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,10 +215,21 @@ impl RunPlan {
             ),
             ("PODBAY_PROFILE".into(), inputs.profile.chain.join(",")),
         ];
-        if inputs.network == Network::None {
+        if inputs.network != Net::Full {
             // Use the tools provisioning installed instead of trying, and
             // failing slowly, to download missing ones.
             env.push(("MISE_OFFLINE".into(), "1".into()));
+        }
+        if let Net::Relay(_) = inputs.network {
+            let proxy = format!("http://{}", egress::PROXY_ADDR);
+            for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
+                env.push((var.into(), proxy.clone()));
+            }
+            for var in ["NO_PROXY", "no_proxy"] {
+                env.push((var.into(), "localhost,127.0.0.1,::1".into()));
+            }
+            // Node's built-in fetch ignores the variables above without it.
+            env.push(("NODE_USE_ENV_PROXY".into(), "1".into()));
         }
 
         let mut flags = vec!["--rm".into(), "--interactive".into()];
@@ -213,7 +237,17 @@ impl RunPlan {
             flags.push("--tty".into());
         }
         flags.push(format!("--label=io.podbay.repo-key={}", inputs.repo_key));
-        flags.extend(inputs.identity.flags.iter().cloned());
+        for flag in &inputs.identity.flags {
+            match &inputs.network {
+                // A container may only set up a network namespace its own
+                // user namespace owns, so share the relay's (created with
+                // the same mapping) instead of getting a new one.
+                Net::Relay(relay) if flag.starts_with("--userns=") => {
+                    flags.push(format!("--userns=container:{relay}"));
+                }
+                _ => flags.push(flag.clone()),
+            }
+        }
 
         let mut caps: Vec<&str> = ENTRYPOINT_CAPS.to_vec();
         caps.extend(inputs.caps.iter().map(String::as_str));
@@ -229,8 +263,10 @@ impl RunPlan {
         for (target, options) in TMPFS {
             flags.push(format!("--tmpfs={target}:{options}"));
         }
-        if inputs.network == Network::None {
-            flags.push("--network=none".into());
+        match &inputs.network {
+            Net::None => flags.push("--network=none".into()),
+            Net::Full => {}
+            Net::Relay(container) => flags.push(format!("--network=container:{container}")),
         }
 
         match inputs.limits.pids {
@@ -264,6 +300,67 @@ impl RunPlan {
         args.extend(self.command.iter().cloned());
         args
     }
+}
+
+/// Where the relay sees the directory holding podbay's socket.
+const RELAY_SOCKET_DIR: &str = "/run/podbay";
+
+pub struct RelayInputs<'a> {
+    pub image: &'a str,
+    pub name: &'a str,
+    /// Host directory holding podbay's policy socket.
+    pub socket_dir: &'a Path,
+    pub identity: &'a Identity,
+    pub repo_key: &'a str,
+    pub limits: &'a Limits,
+}
+
+/// `run` arguments for the relay container of an allowlisted session. It
+/// has no network, no capabilities and nothing writable, and runs as the
+/// user that owns podbay's socket so it can connect to it.
+pub fn relay_args(inputs: &RelayInputs<'_>) -> Result<Vec<String>> {
+    let dir = inputs.socket_dir.to_string_lossy();
+    if dir.contains([',', '\n']) {
+        bail!("socket directory {dir} must not contain ',' or newlines");
+    }
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--detach".into(),
+        "--rm".into(),
+        format!("--name={}", inputs.name),
+        format!("--label=io.podbay.repo-key={}", inputs.repo_key),
+        "--network=none".into(),
+        "--read-only".into(),
+        "--cap-drop=ALL".into(),
+        "--security-opt=no-new-privileges".into(),
+        // It holds no state, and as PID 1 without handlers it would ignore
+        // SIGTERM, making engines wait before removing it.
+        "--stop-signal=SIGKILL".into(),
+    ];
+    // The session's user namespace setup, but never root inside it unless
+    // root already is the host user.
+    args.extend(
+        inputs
+            .identity
+            .flags
+            .iter()
+            .filter(|f| !f.starts_with("--user="))
+            .cloned(),
+    );
+    args.push(format!(
+        "--user={}:{}",
+        inputs.identity.uid, inputs.identity.gid
+    ));
+    if inputs.limits.pids.is_some_and(|n| n > 0) {
+        args.push("--pids-limit=512".into());
+    }
+    args.push(format!(
+        "--mount=type=bind,source={dir},target={RELAY_SOCKET_DIR},readonly"
+    ));
+    args.push(inputs.image.into());
+    args.push(egress::PROXY_ADDR.into());
+    args.push(format!("{RELAY_SOCKET_DIR}/{}", egress::SOCKET_NAME));
+    Ok(args)
 }
 
 /// Quotes `arg` for display as a POSIX shell word.
@@ -307,7 +404,7 @@ mod tests {
             tty: false,
             caps: &[],
             limits: &NO_LIMITS,
-            network: Network::None,
+            network: Net::None,
         }
     }
 
@@ -443,7 +540,7 @@ mod tests {
         let profile = ResolvedProfile::default();
         let id = identity();
         let mut i = inputs(&profile, &id);
-        i.network = Network::Full;
+        i.network = Net::Full;
         i.project_readonly = true;
         let args = RunPlan::build(i).unwrap().args();
         assert!(
@@ -457,6 +554,102 @@ mod tests {
                 &"--mount=type=bind,source=/src/app,target=/home/dev/workspace/repomount,readonly"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn relay_network_sets_the_proxy() {
+        let profile = ResolvedProfile::default();
+        let id = identity();
+        let mut i = inputs(&profile, &id);
+        i.network = Net::Relay("podbay-relay-app-1".into());
+        let args = RunPlan::build(i).unwrap().args();
+        for expected in [
+            "--network=container:podbay-relay-app-1",
+            "--env=HTTPS_PROXY=http://127.0.0.1:3128",
+            "--env=http_proxy=http://127.0.0.1:3128",
+            "--env=NO_PROXY=localhost,127.0.0.1,::1",
+            "--env=MISE_OFFLINE=1",
+        ] {
+            assert!(
+                args.contains(&expected.to_owned()),
+                "missing {expected}: {args:?}"
+            );
+        }
+        assert!(!args.contains(&"--network=none".to_owned()));
+    }
+
+    #[test]
+    fn relay_sessions_share_its_user_namespace() {
+        let profile = ResolvedProfile::default();
+        let id = Identity {
+            flags: vec![
+                "--userns=keep-id:uid=1000,gid=1000".into(),
+                "--user=0:0".into(),
+            ],
+            uid: 1000,
+            gid: 1000,
+            notes: vec![],
+        };
+        let mut i = inputs(&profile, &id);
+        i.network = Net::Relay("relay-1".into());
+        let args = RunPlan::build(i).unwrap().args();
+        assert!(
+            args.contains(&"--userns=container:relay-1".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--userns=keep-id")),
+            "{args:?}"
+        );
+        assert!(args.contains(&"--user=0:0".to_owned()), "{args:?}");
+    }
+
+    #[test]
+    fn relay_container() {
+        let podman = Identity {
+            flags: vec![
+                "--userns=keep-id:uid=1000,gid=1000".into(),
+                "--user=0:0".into(),
+            ],
+            uid: 1000,
+            gid: 1000,
+            notes: vec![],
+        };
+        let limits = Limits {
+            pids: Some(4096),
+            ..NO_LIMITS.clone()
+        };
+        let args = relay_args(&RelayInputs {
+            image: "podbay-relay:1",
+            name: "podbay-relay-app-1",
+            socket_dir: Path::new("/run/user/1000/podbay-x"),
+            identity: &podman,
+            repo_key: "app-1",
+            limits: &limits,
+        })
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--detach",
+                "--rm",
+                "--name=podbay-relay-app-1",
+                "--label=io.podbay.repo-key=app-1",
+                "--network=none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--stop-signal=SIGKILL",
+                "--userns=keep-id:uid=1000,gid=1000",
+                "--user=1000:1000",
+                "--pids-limit=512",
+                "--mount=type=bind,source=/run/user/1000/podbay-x,target=/run/podbay,readonly",
+                "podbay-relay:1",
+                "127.0.0.1:3128",
+                "/run/podbay/egress.sock",
+            ]
         );
     }
 

@@ -1,9 +1,8 @@
 # Threat model
 
 This document covers what podbay protects, from whom, and where the
-boundary currently has holes. It describes the code as it is now, partway
-through stage 4: sessions have no network by default, and the allowlist is
-still to come. Later stages close specific gaps, and each gap below names the
+boundary currently has holes. It describes the code as it is now, at the end
+of stage 4. Later stages close specific gaps, and each gap below names the
 stage that addresses it.
 
 ## What podbay is for
@@ -47,7 +46,7 @@ sources.
 | --- | --- | --- |
 | Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, kernel | See "Privilege inside the container" |
 | Container to host files | Only declared mounts are visible | The project is read-write |
-| Container to network | `--network=none` unless a profile opts in | All or nothing until the stage 4 allowlist |
+| Container to network | `--network=none`, or a relay and podbay's allowlist | A profile can still opt into full access |
 | Provisioning to network | **Not enforced** | Runs project-chosen installers; see "Provisioning" |
 | Project to image build | Extensions are read only from your config dir | A project can never add root build steps |
 | Session to session | `--rm`, per-profile volumes | Some state is shared, see below |
@@ -143,13 +142,38 @@ run git; it does not stop anything.
 
 - **Network (reduced in stage 4).** A session has only a loopback
   interface by default, with its own network namespace, so it can reach
-  neither the internet, the LAN nor the host's loopback. Two gaps remain:
-  - A profile (or `config.toml`, or `--network full`) can turn on full
-    access, and an AI agent that calls a hosted API needs it today. Such a
-    session can send anything it can read (the project, mounted files,
-    volumes) anywhere, and reach your LAN and, depending on the engine, the
-    host's loopback. podbay warns on every run that has it. The allowlist
-    proxy, the rest of stage 4, narrows this to named hosts.
+  neither the internet, the LAN nor the host's loopback.
+  - **Allowlisted sessions** share the network namespace of a relay
+    container that has no network either, so they too see only loopback.
+    The only way out is the relay's proxy port, which forwards to podbay on
+    the host over a Unix socket. podbay allows HTTPS (`CONNECT`) to listed
+    names only, never resolves anything else, refuses IP literals, and
+    refuses any name that resolves to a non-public address, so an
+    allowlisted name pointed at 127.0.0.1, the LAN or 169.254.169.254 gets
+    nowhere. What remains:
+    - Anything the session can read can be sent to an allowed host. Allow
+      hosts that only accept data you'd be fine with ending up there: an
+      API the agent authenticates to with your key is reachable by anything
+      in the session that can read that key.
+    - A wildcard such as `*.example.com` lets the session look up any name
+      below it, which reaches example.com's DNS servers, and connect to any
+      of its hosts. Prefer exact names.
+    - Requests are filtered by name only. A server behind an allowed name
+      that fronts other sites (some CDNs) could be asked for them inside
+      the TLS stream, which podbay doesn't see.
+    - The policy runs inside podbay, so the session has no network access
+      once podbay exits; if podbay is killed, the relay container is left
+      behind but has nothing to forward to.
+    - On rootless Podman, the session also shares the relay's user
+      namespace, which it needs to join its network namespace; both use the
+      same mapping. With the runc runtime, such a session sees the host's
+      `/sys` read-only instead of its own, which exposes interface names and
+      hardware details but no network access.
+  - **Full access** (`network = "full"` in a profile or `config.toml`, or
+    `--network full`) gives the session the engine's network. It can send
+    anything it can read (the project, mounted files, volumes) anywhere, and
+    reach your LAN and, depending on the engine, the host's loopback.
+    podbay warns on every run that has it.
   - Provisioning, below.
 - **Provisioning (stage 4).** Tools are installed before the session, in a
   container with full network access that runs `mise install`. It gets the
