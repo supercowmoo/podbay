@@ -2,7 +2,7 @@
 
 This document covers what podbay protects, from whom, and where the
 boundary currently has holes. It describes the code as it is now, at the end
-of stage 2. Later stages close specific gaps, and each gap below names the
+of stage 3. Later stages close specific gaps, and each gap below names the
 stage that addresses it.
 
 ## What podbay is for
@@ -44,7 +44,7 @@ sources.
 
 | Boundary | Enforced by | Notes |
 | --- | --- | --- |
-| Container to host processes | Engine namespaces, kernel | Default engine settings until stage 3 |
+| Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, kernel | See "Privilege inside the container" |
 | Container to host files | Only declared mounts are visible | The project is read-write |
 | Container to host network | **Not enforced** | Unrestricted until stage 4 |
 | Project to image build | Extensions are read only from your config dir | A project can never add root build steps |
@@ -143,16 +143,29 @@ run git; it does not stop anything.
   can read (the project, mounted files, volumes) can be exfiltrated, and it
   can reach services on your LAN and, depending on the engine, on the
   host's loopback.
-- **Privilege inside the container (stage 3).** Default capabilities, no
-  `no-new-privileges` and a writable root filesystem make escalation to root
-  inside the container easier, and container root is closer to the kernel.
-  On rootless engines that root is still your unprivileged user. On rootful
-  Docker a container escape is real root, which podbay warns about on every
-  run. Prefer rootless Podman.
-- **Resource exhaustion (stage 3).** There are no CPU, memory or process
-  limits, so a fork bomb or a memory hog affects the host.
-- **Kernel attack surface (stages 3 and 5).** No custom seccomp or Landlock
-  policy yet beyond the engine's defaults.
+- **Privilege inside the container (reduced in stage 3).** The session
+  runs as `dev` with an empty capability set, including the bounding set,
+  and `no-new-privileges`. setuid binaries and file capabilities in the
+  image give nothing. The root filesystem is read-only; only `/home/dev`,
+  `/tmp` and `/var/tmp` (tmpfs, fresh each session) and the declared
+  mounts are writable. The entrypoint runs as (namespaced) root with
+  CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETPCAP and SETUID, for under a
+  second, before your command runs. Two gaps remain:
+  - A profile's `cap_add` hands capabilities back on purpose. podbay
+    prints them on every run, but some (`SYS_ADMIN`, `SYS_MODULE`,
+    `SYS_RAWIO`, `NET_ADMIN`, `DAC_READ_SEARCH`, ...) amount to giving up
+    most of the boundary.
+  - On rootful Docker a container escape is real root, which podbay warns
+    about on every run. Prefer rootless Podman.
+- **Resource exhaustion (reduced in stage 3).** Processes and threads are
+  capped at 4096 by default; memory and CPU caps are opt-in. On rootless
+  engines a limit only applies when systemd delegates that cgroup
+  controller to your user. podbay checks this on Podman and warns when it
+  has to run without a limit. tmpfs space counts against memory, so a
+  session can still fill RAM through `/tmp` unless a memory limit is set.
+  Disk usage in the project and volumes is not limited.
+- **Kernel attack surface (stage 5).** No custom seccomp or Landlock policy
+  yet beyond the engine's defaults.
 - **The terminal.** With `--tty`, the container writes directly to your
   terminal. Escape sequences can change the window title, write to the
   clipboard (OSC 52) on terminals that allow it, or hit bugs in the

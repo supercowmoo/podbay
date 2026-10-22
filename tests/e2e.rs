@@ -151,7 +151,11 @@ touch created-in-container
         .stdout
         .clone();
     let tag = String::from_utf8(built).unwrap().trim().to_owned();
-    assert!(tag.starts_with(&format!("podbay-{id}:")), "{tag}");
+    // On rootful docker the last layer gives dev the host user's ids.
+    assert!(
+        tag.starts_with(&format!("podbay-{id}:")) || tag.starts_with("podbay-uid"),
+        "{tag}"
+    );
     let _image = Cleanup {
         engine: &engine,
         kind: "image",
@@ -243,4 +247,95 @@ exit 7
             "missing {expected:?}\nstderr:\n{err}"
         );
     }
+}
+
+#[test]
+fn session_is_hardened() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2ecaps{}", std::process::id());
+    fs::write(
+        profiles.join(format!("{id}.toml")),
+        "cap_add = [\"NET_RAW\"]\n",
+    )
+    .unwrap();
+
+    let run = |profile: Option<&str>, script: &str| {
+        let mut cmd = podbay(root);
+        cmd.args(["run", "--backend", &engine, "--local-cache"]);
+        if let Some(p) = profile {
+            cmd.args(["-p", p]);
+        }
+        let output = cmd
+            .arg(&project)
+            .args(["--", "sh", "-c", script])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    let (out, err) = run(
+        None,
+        r#"
+grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status && echo nnp=on
+grep '^CapEff' /proc/self/status | tr -d '\t'
+grep '^CapBnd' /proc/self/status | tr -d '\t'
+if touch /usr/podbay-probe 2>/dev/null; then echo rootfs=writable; else echo rootfs=readonly; fi
+test -f ~/.bashrc && test -d ~/.config/mise && echo home=seeded
+touch ~/left-behind && echo home=writable
+printf '#!/bin/sh\necho tmp=exec\n' > /tmp/probe && chmod +x /tmp/probe && /tmp/probe
+echo "pids=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)"
+"#,
+    );
+    for expected in [
+        "nnp=on",
+        "CapEff:0000000000000000",
+        "CapBnd:0000000000000000",
+        "rootfs=readonly",
+        "home=seeded",
+        "home=writable",
+        "tmp=exec",
+    ] {
+        assert!(
+            out.contains(expected),
+            "missing {expected:?}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+    }
+    // Either the engine applied the default limit, or podbay said it can't.
+    assert!(
+        out.contains("pids=4096") || err.contains("cannot apply the process limit"),
+        "stdout:\n{out}\nstderr:\n{err}"
+    );
+
+    // A profile can add a capability back, and the home directory starts
+    // fresh every session.
+    let (out, err) = run(
+        Some(&id),
+        r#"
+grep '^CapEff' /proc/self/status | tr -d '\t'
+test -e ~/left-behind && echo home=persisted || echo home=fresh
+"#,
+    );
+    assert!(
+        out.contains("CapEff:0000000000002000") && out.contains("home=fresh"),
+        "stdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(err.contains("keeps capabilities NET_RAW"), "{err}");
 }

@@ -8,12 +8,34 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use crate::backend::Identity;
+use crate::config::Limits;
 use crate::profile::{ResolvedProfile, validate_container_path};
 
+pub const HOME: &str = "/home/dev";
 pub const WORKSPACE: &str = "/home/dev/workspace/repomount";
 pub const MISE_DATA: &str = "/home/dev/.local/share/mise";
 pub const MISE_CONFIG: &str = "/home/dev/.config/mise/config.toml";
 pub const SHARED_MISE_VOLUME: &str = "podbay-mise-data";
+
+/// What the entrypoint needs as root: set up the home directory, fix
+/// ownership of mount points, then drop to dev and shed its capabilities
+/// (SETPCAP, for the bounding set). The session itself gets none of these.
+pub const ENTRYPOINT_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+];
+
+/// Writable scratch space on the otherwise read-only root filesystem. The
+/// home directory is seeded from the image by the entrypoint.
+const TMPFS: &[(&str, &str)] = &[
+    (HOME, "rw,exec,nosuid,nodev,mode=0755"),
+    ("/tmp", "rw,exec,nosuid,nodev,mode=1777"),
+    ("/var/tmp", "rw,exec,nosuid,nodev,mode=1777"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mount {
@@ -75,6 +97,10 @@ pub struct Inputs<'a> {
     pub mise_config: Option<PathBuf>,
     pub command: Vec<String>,
     pub tty: bool,
+    /// Capabilities the session keeps, such as `SYS_PTRACE`.
+    pub caps: &'a [String],
+    /// Limits the engine can apply; see [`Limits`].
+    pub limits: &'a Limits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +151,7 @@ impl RunPlan {
             });
         }
 
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<&str> = TMPFS.iter().map(|(target, _)| *target).collect();
         for m in &mounts {
             validate_container_path(m.target())?;
             if let Mount::Bind { source, .. } = m
@@ -154,6 +180,23 @@ impl RunPlan {
             ("PODBAY_GID".into(), inputs.identity.gid.to_string()),
             ("PODBAY_WORKSPACE".into(), WORKSPACE.into()),
             ("PODBAY_VOLUME_PATHS".into(), writable.join(":")),
+            (
+                "PODBAY_MOUNT_PATHS".into(),
+                mounts
+                    .iter()
+                    .map(Mount::target)
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+            (
+                "PODBAY_CAPS".into(),
+                inputs
+                    .caps
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
             ("PODBAY_PROFILE".into(), inputs.profile.chain.join(",")),
         ];
 
@@ -163,6 +206,33 @@ impl RunPlan {
         }
         flags.push(format!("--label=io.podbay.repo-key={}", inputs.repo_key));
         flags.extend(inputs.identity.flags.iter().cloned());
+
+        let mut caps: Vec<&str> = ENTRYPOINT_CAPS.to_vec();
+        caps.extend(inputs.caps.iter().map(String::as_str));
+        caps.sort_unstable();
+        caps.dedup();
+        // One flag per capability: docker reads a comma list as one name.
+        flags.push("--cap-drop=ALL".into());
+        flags.extend(caps.iter().map(|c| format!("--cap-add={c}")));
+        flags.extend([
+            "--security-opt=no-new-privileges".into(),
+            "--read-only".into(),
+        ]);
+        for (target, options) in TMPFS {
+            flags.push(format!("--tmpfs={target}:{options}"));
+        }
+
+        match inputs.limits.pids {
+            Some(0) => flags.push("--pids-limit=-1".into()),
+            Some(n) => flags.push(format!("--pids-limit={n}")),
+            None => {}
+        }
+        if let Some(memory) = &inputs.limits.memory {
+            flags.push(format!("--memory={memory}"));
+        }
+        if let Some(cpus) = inputs.limits.cpus {
+            flags.push(format!("--cpus={cpus}"));
+        }
 
         Ok(Self {
             image: inputs.image,
@@ -223,8 +293,16 @@ mod tests {
             mise_config: None,
             command: vec![],
             tty: false,
+            caps: &[],
+            limits: &NO_LIMITS,
         }
     }
+
+    static NO_LIMITS: Limits = Limits {
+        pids: None,
+        memory: None,
+        cpus: None,
+    };
 
     #[test]
     fn minimal_plan() {
@@ -239,12 +317,26 @@ mod tests {
                 "--interactive",
                 "--label=io.podbay.repo-key=app-0123",
                 "--user=0:0",
+                "--cap-drop=ALL",
+                "--cap-add=CHOWN",
+                "--cap-add=DAC_OVERRIDE",
+                "--cap-add=FOWNER",
+                "--cap-add=SETGID",
+                "--cap-add=SETPCAP",
+                "--cap-add=SETUID",
+                "--security-opt=no-new-privileges",
+                "--read-only",
+                "--tmpfs=/home/dev:rw,exec,nosuid,nodev,mode=0755",
+                "--tmpfs=/tmp:rw,exec,nosuid,nodev,mode=1777",
+                "--tmpfs=/var/tmp:rw,exec,nosuid,nodev,mode=1777",
                 "--mount=type=bind,source=/src/app,target=/home/dev/workspace/repomount",
                 "--mount=type=volume,source=podbay-mise-data,target=/home/dev/.local/share/mise",
                 "--env=PODBAY_UID=1234",
                 "--env=PODBAY_GID=1234",
                 "--env=PODBAY_WORKSPACE=/home/dev/workspace/repomount",
                 "--env=PODBAY_VOLUME_PATHS=/home/dev/.local/share/mise",
+                "--env=PODBAY_MOUNT_PATHS=/home/dev/workspace/repomount:/home/dev/.local/share/mise",
+                "--env=PODBAY_CAPS=",
                 "--env=PODBAY_PROFILE=",
                 "img:1",
             ]
@@ -299,6 +391,50 @@ mod tests {
         );
         assert!(args.contains(&"--env=PODBAY_PROFILE=base,ai".to_owned()));
         assert_eq!(&args[args.len() - 4..], ["img:1", "sh", "-c", "id"]);
+    }
+
+    #[test]
+    fn caps_and_limits() {
+        let profile = ResolvedProfile::default();
+        let id = identity();
+        let caps = vec!["SYS_PTRACE".to_owned(), "CHOWN".to_owned()];
+        let limits = Limits {
+            pids: Some(0),
+            memory: Some("8g".into()),
+            cpus: Some(1.5),
+        };
+        let mut i = inputs(&profile, &id);
+        i.caps = &caps;
+        i.limits = &limits;
+        let args = RunPlan::build(i).unwrap().args();
+        let chown = args.iter().filter(|a| *a == "--cap-add=CHOWN").count();
+        assert_eq!(chown, 1, "{args:?}");
+        for expected in [
+            "--cap-add=SYS_PTRACE",
+            "--env=PODBAY_CAPS=sys_ptrace,chown",
+            "--pids-limit=-1",
+            "--memory=8g",
+            "--cpus=1.5",
+        ] {
+            assert!(
+                args.contains(&expected.to_owned()),
+                "missing {expected}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mounts_over_tmpfs() {
+        let profile = ResolvedProfile {
+            volumes: vec![Volume {
+                name: "podbay-x-tmp".into(),
+                container: "/tmp".into(),
+                profile: "x".into(),
+            }],
+            ..Default::default()
+        };
+        let id = identity();
+        assert!(RunPlan::build(inputs(&profile, &id)).is_err());
     }
 
     #[test]

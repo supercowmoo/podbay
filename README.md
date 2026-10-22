@@ -23,18 +23,19 @@ Being rebuilt in Rust, in stages:
    and CI. *(done)*
 2. **Threat model**, plus a session report that flags changes to git hooks and
    config. *(done)*
-3. Container hardening: dropped capabilities, `no-new-privileges`, read-only
-   root filesystem, resource limits.
+3. **Container hardening**: dropped capabilities, `no-new-privileges`,
+   read-only root filesystem, resource limits. *(done)*
 4. Network policy: no network by default, with an allowlist enforced by a
    filtering proxy. Tool installs move to a separate provisioning step.
 5. Landlock and seccomp around processes inside the container.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
-The container is not yet a hardened boundary. [THREAT_MODEL.md](THREAT_MODEL.md)
-covers what is and isn't protected today, and which stage closes each gap.
-The biggest one: the project is mounted read-write, so code inside can plant
-git hooks or config that run on your host the next time you use git there.
-The [session report](#session-report) tells you when that has happened.
+[THREAT_MODEL.md](THREAT_MODEL.md) covers what is and isn't protected
+today, and which stage closes each gap. The two biggest: the container has
+full network access until stage 4, and the project is mounted read-write, so
+code inside can plant git hooks or config that run on your host the next
+time you use git there. The [session report](#session-report) tells you when
+that has happened.
 
 ## Install
 
@@ -66,7 +67,25 @@ podbay's exit code is the command's (or the shell's) exit code.
 
 Files the container creates in your project are owned by you on the host. On
 rootless Podman, `dev` is mapped onto your user with `keep-id`. On rootful
-Docker, the entrypoint gives `dev` your uid and gid before dropping root.
+Docker, podbay builds one more small image layer that gives `dev` your uid
+and gid.
+
+## What a session can do
+
+- **Write**: the project, volumes, read-write mounts, and three scratch
+  areas: `/home/dev`, `/tmp` and `/var/tmp`. The rest of the filesystem is
+  read-only. The home directory is a fresh tmpfs every session, copied from
+  the image at start. Anything worth keeping belongs in the project or a
+  volume.
+- **Privileges**: none. The session runs as `dev` with no capabilities and
+  `no-new-privileges`, so setuid binaries and `sudo` don't work. The
+  entrypoint starts with just enough to set up the home directory and fix
+  mount ownership, then drops all of it before your command runs. A profile
+  can keep specific capabilities with `cap_add` (see below).
+- **Resources**: at most 4096 processes and threads by default. Memory and
+  CPU limits are opt-in. Rootless engines can apply a limit only when
+  systemd delegates that cgroup controller to your user. When it doesn't,
+  podbay warns and runs without that limit.
 
 ## Session report
 
@@ -143,19 +162,36 @@ container = "/home/dev/.local/share/opencode"
 opencode = "latest"
 ```
 
+```toml
+# ~/.config/podbay/profiles/debug.toml
+extends = ["base"]
+
+# Capabilities the session keeps (none by default). podbay prints them on
+# every run that uses this profile.
+cap_add = ["SYS_PTRACE"]   # gdb, strace
+
+# Override the limits from config.toml.
+[limits]
+memory = "16g"
+```
+
 With `extends`, ancestors are applied first. A later profile's mount or
 volume replaces an inherited one at the same container path, and its tools
-override inherited versions. Volumes keep the name of the profile that
+override inherited versions. `cap_add` lists are combined, and `[limits]`
+keys override one at a time. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
 **Mounts or volumes?** Use mounts for files you own and edit on the host. Use
-volumes for directories the container creates or writes into. The engine
-creates a missing mount point's parent directories as root. The entrypoint
-fixes their ownership for volumes, but not for bind mounts.
+volumes for directories the container creates or writes into, since the home
+directory is wiped after every session. The engine creates a missing mount
+point's parent directories as root, and the entrypoint gives them to `dev`.
 
 **Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
 Each tag is a hash of the script and its parent image, so editing a script,
 or any script below it in the chain, rebuilds exactly what changed.
+Extensions run as root at build time, the only time the root filesystem is
+writable. Anything they put in `/home/dev` is copied into the home skeleton
+automatically.
 
 ## Configuration
 
@@ -165,10 +201,16 @@ or any script below it in the chain, rebuilds exactly what changed.
 backend = "podman"           # or "docker"; default: podman if installed
 default_profile = "base"
 base_image = "my/image:tag"  # use your own image instead of the bundled one
+
+[limits]                     # profiles can override each key
+pids = 4096                  # processes and threads; 0 for no limit
+memory = "8g"                # default: no limit
+cpus = 4                     # default: no limit
 ```
 
-A custom base image must provide a `dev` user and podbay's entrypoint (see
-`base/`).
+A custom base image must provide a `dev` user, `setpriv`, podbay's
+entrypoint, and a copy of `/home/dev` at `/usr/local/share/podbay/home` to
+seed the home directory from (see `base/Containerfile`).
 
 `PODBAY_CONFIG_DIR` and `PODBAY_CACHE_DIR` move podbay's config and cache
 directories without touching `HOME` or `XDG_*`. Rootless Podman uses those to

@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# Starts as (possibly namespaced) root, makes the dev user match the host
-# user, fixes ownership of volume mount points, then drops privileges.
+# Starts as (possibly namespaced) root with a handful of capabilities, sets up
+# the dev user's home on its tmpfs, fixes ownership of mount points, then
+# drops to dev with no capabilities beyond those the profile asked for.
 #
 # Inputs from podbay:
-#   PODBAY_UID / PODBAY_GID   ids dev should have; 0 means stay root (the
+#   PODBAY_UID / PODBAY_GID   ids dev runs as; 0 means stay root (the
 #                             engine is rootless and root is the host user)
+#   PODBAY_MOUNT_PATHS        colon-separated mount points; their parent
+#                             directories must belong to dev
 #   PODBAY_VOLUME_PATHS       colon-separated mount points dev must own
+#   PODBAY_CAPS               comma-separated capabilities to keep, such as
+#                             sys_ptrace (empty: none)
 #   PODBAY_WORKSPACE          directory to start in
 set -euo pipefail
 
 workspace=${PODBAY_WORKSPACE:-/home/dev/workspace/repomount}
+skeleton=/usr/local/share/podbay/home
 
 if [ "$(id -u)" -ne 0 ]; then
   cd "$workspace"
@@ -20,39 +26,50 @@ uid=${PODBAY_UID:-1000}
 gid=${PODBAY_GID:-1000}
 export HOME=/home/dev USER=dev LOGNAME=dev
 
-if [ "$uid" -eq 0 ]; then
-  cd "$workspace"
-  exec "$@"
-fi
+# setpriv capability lists: "-all" plus "+cap" for each kept capability.
+caps="-all"
+IFS=',' read -ra keep <<< "${PODBAY_CAPS:-}"
+for cap in "${keep[@]}"; do
+  [ -n "$cap" ] && caps+=",+$cap"
+done
 
-remap_dev() {
-  local old_uid old_gid
-  old_uid=$(id -u dev)
-  old_gid=$(id -g dev)
-  if [ "$uid" = "$old_uid" ] && [ "$gid" = "$old_gid" ]; then
-    return 0
+check_dev() {
+  local have
+  have="$(id -u dev):$(id -g dev)"
+  if [ "$have" != "$uid:$gid" ]; then
+    echo "podbay: the image's dev user is $have, expected $uid:$gid;" \
+      "rebuild with podbay build" >&2
+    exit 1
   fi
-  # Edit the databases directly: usermod -u would also chown everything
-  # under the home directory, including the mounted project.
-  sed -i "s/^dev:x:${old_uid}:${old_gid}:/dev:x:${uid}:${gid}:/" /etc/passwd
-  sed -i "s/^dev:x:${old_gid}:/dev:x:${gid}:/" /etc/group
-  # Re-own what the image put in the home directory. -xdev keeps find out
-  # of bind mounts and volumes.
-  find /home/dev -xdev \( -uid "$old_uid" -o -gid "$old_gid" \) \
-    -exec chown -h "$uid:$gid" {} +
 }
 
-own_volume_paths() {
+# /home/dev is a fresh tmpfs, so copy in what the image put there. Files the
+# engine already placed (bind-mounted dotfiles) are left alone.
+seed_home() {
+  if [ -d "$skeleton" ]; then
+    cp -a --update=none "$skeleton/." /home/dev/
+  fi
+  chown "$uid:$gid" /home/dev
+}
+
+own_mount_parents() {
   local IFS=':' path dir
-  for path in ${PODBAY_VOLUME_PATHS:-}; do
+  for path in ${PODBAY_MOUNT_PATHS:-}; do
     [ -n "$path" ] || continue
-    mkdir -p "$path"
     # Engines create missing parents of a mount point as root.
     dir=$(dirname "$path")
     while [ "$dir" != /home/dev ] && [ "$dir" != / ]; do
       [ "$(stat -c %u "$dir")" = "$uid" ] || chown "$uid:$gid" "$dir"
       dir=$(dirname "$dir")
     done
+  done
+}
+
+own_volume_paths() {
+  local IFS=':' path
+  for path in ${PODBAY_VOLUME_PATHS:-}; do
+    [ -n "$path" ] || continue
+    mkdir -p "$path"
     # Recurse only when the volume is new or the host user changed.
     if [ "$(stat -c %u "$path")" != "$uid" ]; then
       chown -R "$uid:$gid" "$path"
@@ -60,8 +77,19 @@ own_volume_paths() {
   done
 }
 
-remap_dev
+if [ "$uid" -ne 0 ]; then
+  check_dev
+fi
+seed_home
+own_mount_parents
 own_volume_paths
 
 cd "$workspace"
-exec setpriv --reuid="$uid" --regid="$gid" --init-groups -- "$@"
+if [ "$uid" -eq 0 ]; then
+  # Root inside a rootless engine: keep the uid, lose the capabilities.
+  exec setpriv --inh-caps="$caps" --bounding-set="$caps" -- "$@"
+fi
+# Dropping from root to dev clears every capability; kept ones come back
+# through the ambient set. The bounding set stops anything else returning.
+exec setpriv --reuid="$uid" --regid="$gid" --init-groups \
+  --inh-caps="$caps" --ambient-caps="$caps" --bounding-set="$caps" -- "$@"

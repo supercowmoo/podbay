@@ -22,6 +22,8 @@
 # container = "/home/dev/.gitconfig"
 # mode = "ro"
 
+# The home directory is a fresh tmpfs every session.
+#
 # Named volumes that persist across runs, for state the container writes:
 # tool config, auth, caches. Stored as podbay-{name}-<name>.
 #
@@ -34,3 +36,15 @@
 # [tools]
 # opencode = "latest"
 # node = "22"
+
+# Capabilities the session keeps. None by default; each one weakens the
+# boundary, and podbay prints them on every run.
+#
+# cap_add = ["SYS_PTRACE"]
+
+# Resource limits, overriding config.toml. pids = 0 means no limit.
+#
+# [limits]
+# pids = 4096
+# memory = "8g"
+# cpus = 4

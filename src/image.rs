@@ -1,5 +1,6 @@
-//! Image layering: the bundled base image plus one derived image per profile
-//! extension script. Every tag is a hash of everything that went into the
+//! Image layering: the bundled base image, one derived image per profile
+//! extension script, and on rootful Docker a final layer that gives `dev` the
+//! host user's ids. Every tag is a hash of everything that went into the
 //! image, so changing any input produces a new tag and stale images are never
 //! reused.
 
@@ -7,7 +8,7 @@ use std::fs;
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, IMAGE_DEV_UID};
 use crate::hash::sha256_hex_fields;
 use crate::profile::Extension;
 
@@ -38,7 +39,18 @@ pub enum LayerSource {
         profile: String,
         script: Vec<u8>,
     },
+    /// Renumbers `dev`, which the read-only root filesystem rules out at run
+    /// time.
+    Identity {
+        parent: String,
+        uid: u32,
+        gid: u32,
+    },
 }
+
+/// Where the base image keeps a copy of `/home/dev`, which is a tmpfs at run
+/// time; the entrypoint seeds the home directory from it.
+const HOME_SKELETON: &str = "/usr/local/share/podbay/home";
 
 /// Computes the layer stack for a profile, bottom first. The last layer is
 /// the image to run.
@@ -68,7 +80,8 @@ pub fn layers(base: &BaseImage, extensions: &[Extension]) -> Result<Vec<Layer>> 
             );
         }
         let parent = stack.last().expect("stack starts non-empty").tag.clone();
-        let hash = sha256_hex_fields(&[parent.as_bytes(), ext.profile.as_bytes(), &script]);
+        let containerfile = extension_containerfile(&parent, &ext.profile);
+        let hash = sha256_hex_fields(&[containerfile.as_bytes(), &script]);
         stack.push(Layer {
             tag: format!("podbay-{}:{}", ext.profile, &hash[..16]),
             source: LayerSource::Extension {
@@ -79,6 +92,22 @@ pub fn layers(base: &BaseImage, extensions: &[Extension]) -> Result<Vec<Layer>> 
         });
     }
     Ok(stack)
+}
+
+/// Adds the layer that gives `dev` the ids `uid:gid`, when the session runs
+/// as someone other than the image's dev user (rootful Docker). 0 means the
+/// session stays root and needs no layer.
+pub fn add_identity(stack: &mut Vec<Layer>, uid: u32, gid: u32) {
+    if uid == 0 || (uid, gid) == (IMAGE_DEV_UID, IMAGE_DEV_UID) {
+        return;
+    }
+    let parent = stack.last().expect("stack starts non-empty").tag.clone();
+    let containerfile = identity_containerfile(&parent, uid, gid);
+    let hash = sha256_hex_fields(&[containerfile.as_bytes()]);
+    stack.push(Layer {
+        tag: format!("podbay-uid{uid}:{}", &hash[..16]),
+        source: LayerSource::Identity { parent, uid, gid },
+    });
 }
 
 /// What [`ensure`] did or would do with a layer.
@@ -139,6 +168,12 @@ fn build(backend: &dyn Backend, layer: &Layer) -> Result<()> {
             )?;
             fs::write(ctx.path().join("extension.sh"), script)?;
         }
+        LayerSource::Identity { parent, uid, gid } => {
+            fs::write(
+                ctx.path().join("Containerfile"),
+                identity_containerfile(parent, *uid, *gid),
+            )?;
+        }
         LayerSource::Custom => unreachable!("custom images are never built"),
     }
     eprintln!("podbay: building {}", layer.tag);
@@ -147,11 +182,29 @@ fn build(backend: &dyn Backend, layer: &Layer) -> Result<()> {
 
 fn extension_containerfile(parent: &str, profile: &str) -> String {
     let dest = format!("/usr/local/share/podbay/extensions/{profile}.sh");
+    // Whatever the script puts in /home/dev must reach the skeleton, or the
+    // tmpfs home would hide it.
     format!(
         "FROM {parent}\n\
          USER root\n\
          COPY extension.sh {dest}\n\
-         RUN chmod 0755 {dest} && {dest}\n"
+         RUN chmod 0755 {dest} && {dest} \\\n  \
+         && if [ -d {HOME_SKELETON} ]; then cp -a /home/dev/. {HOME_SKELETON}/; fi\n"
+    )
+}
+
+fn identity_containerfile(parent: &str, uid: u32, gid: u32) -> String {
+    format!(
+        "FROM {parent}\n\
+         USER root\n\
+         RUN old_uid=$(id -u dev) && old_gid=$(id -g dev) \\\n  \
+         && sed -i \"s/^dev:x:$old_uid:$old_gid:/dev:x:{uid}:{gid}:/\" /etc/passwd \\\n  \
+         && sed -i \"s/^dev:x:$old_gid:/dev:x:{gid}:/\" /etc/group \\\n  \
+         && for dir in /home/dev {HOME_SKELETON}; do \\\n    \
+         if [ -d \"$dir\" ]; then \\\n      \
+         find \"$dir\" \\( -uid \"$old_uid\" -o -gid \"$old_gid\" \\) -exec chown -h {uid}:{gid} {{}} +; \\\n    \
+         fi; \\\n  \
+         done\n"
     )
 }
 
@@ -186,6 +239,9 @@ mod tests {
         fn identity(&self) -> Result<Identity> {
             unreachable!()
         }
+        fn cgroup_controllers(&self) -> Result<Option<Vec<String>>> {
+            unreachable!()
+        }
     }
 
     fn ext(dir: &Path, profile: &str, body: &str) -> Extension {
@@ -215,6 +271,32 @@ mod tests {
         assert_eq!(stack[0].tag, changed[0].tag);
         assert_ne!(stack[1].tag, changed[1].tag);
         assert_ne!(stack[2].tag, changed[2].tag);
+    }
+
+    #[test]
+    fn identity_layer_only_when_ids_differ() {
+        let mut stack = layers(&BaseImage::Bundled, &[]).unwrap();
+        add_identity(&mut stack, 0, 0);
+        add_identity(&mut stack, IMAGE_DEV_UID, IMAGE_DEV_UID);
+        assert_eq!(stack.len(), 1);
+
+        add_identity(&mut stack, 1234, 5678);
+        assert_eq!(stack.len(), 2);
+        assert!(
+            stack[1].tag.starts_with("podbay-uid1234:"),
+            "{}",
+            stack[1].tag
+        );
+        let LayerSource::Identity { parent, .. } = &stack[1].source else {
+            panic!("{:?}", stack[1].source)
+        };
+        let file = identity_containerfile(parent, 1234, 5678);
+        assert!(
+            file.starts_with(&format!("FROM {}\n", stack[0].tag)),
+            "{file}"
+        );
+        assert!(file.contains("dev:x:1234:5678:"), "{file}");
+        assert!(file.contains("-exec chown -h 1234:5678 {} +"), "{file}");
     }
 
     #[test]

@@ -4,7 +4,9 @@
 FROM debian:trixie-slim
 RUN useradd -m -u 1000 -U -s /bin/bash dev \
   && mkdir -p /home/dev/workspace /home/dev/.config/mise /home/dev/.local/share/mise \
-  && chown -R dev:dev /home/dev
+  && chown -R dev:dev /home/dev \
+  && mkdir -p /usr/local/share/podbay \
+  && cp -a /home/dev /usr/local/share/podbay/home
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 WORKDIR /home/dev/workspace

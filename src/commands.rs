@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::backend::{Backend, BackendKind};
 use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, RunArgs};
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_PIDS, Limits};
 use crate::hash::sha256_hex;
 use crate::image::{self, Action, BaseImage, LayerSource};
 use crate::paths::Paths;
@@ -60,6 +60,17 @@ impl Setup {
         Ok(resolved)
     }
 
+    /// The default pids limit, then config.toml, then the profile chain.
+    fn limits(&self, profile: &ResolvedProfile) -> Limits {
+        let mut limits = Limits {
+            pids: Some(DEFAULT_PIDS),
+            ..Default::default()
+        };
+        limits.merge(&self.config.limits);
+        limits.merge(&profile.limits);
+        limits
+    }
+
     fn base_image(&self) -> BaseImage {
         match &self.config.base_image {
             Some(image) => BaseImage::Custom(image.clone()),
@@ -81,14 +92,28 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     let key = repo_key(&project);
 
     let profile = ctx.profile(&args.engine)?;
-    let stack = image::layers(&ctx.base_image(), &profile.extensions)?;
-    let actions = image::ensure(&backend, &stack, false, args.dry_run)?;
-    let image = stack.last().expect("at least the base layer").tag.clone();
-
     let identity = backend.identity()?;
     for note in &identity.notes {
         eprintln!("podbay: note: {note}");
     }
+    let mut stack = image::layers(&ctx.base_image(), &profile.extensions)?;
+    image::add_identity(&mut stack, identity.uid, identity.gid);
+    let actions = image::ensure(&backend, &stack, false, args.dry_run)?;
+    let image = stack.last().expect("at least the base layer").tag.clone();
+
+    let limits = applicable_limits(&backend, ctx.limits(&profile), &ctx.config.limits)?;
+    if !profile.caps.is_empty() {
+        let caps: Vec<String> = profile
+            .caps
+            .iter()
+            .map(|c| format!("{} (from {})", c.name, c.profile))
+            .collect();
+        eprintln!(
+            "podbay: note: the session keeps capabilities {}",
+            caps.join(", ")
+        );
+    }
+    let caps: Vec<String> = profile.caps.iter().map(|c| c.name.clone()).collect();
 
     let mise_data = if args.local_cache {
         let dir = ctx.paths.cache_dir.join("mise").join(&key);
@@ -111,6 +136,8 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         mise_config,
         command: args.command,
         tty: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        caps: &caps,
+        limits: &limits,
     })?;
     let program = backend.kind().program();
     let argv = plan.args();
@@ -189,6 +216,45 @@ fn exit_code(status: ExitStatus) -> ExitCode {
     }
 }
 
+/// Drops the limits the engine has no cgroup controller for, with a warning:
+/// rootless engines only get the controllers systemd delegates to the user.
+fn applicable_limits(
+    backend: &dyn Backend,
+    mut limits: Limits,
+    configured: &Limits,
+) -> Result<Limits> {
+    let Some(controllers) = backend.cgroup_controllers()? else {
+        return Ok(limits);
+    };
+    let has = |c: &str| controllers.iter().any(|have| have == c);
+    let program = backend.kind().program();
+    let skip = |what: &str, controller: &str| {
+        eprintln!(
+            "podbay: warning: {program} cannot apply the {what} limit for your user (no \
+             {controller} cgroup controller); running without it"
+        );
+    };
+    if limits.pids.is_some_and(|n| n > 0) && !has("pids") {
+        skip("process", "pids");
+        if configured.pids.is_none() {
+            eprintln!(
+                "podbay: hint: delegate the pids controller to your user, or set \
+                 `[limits] pids = 0` in config.toml to silence this"
+            );
+        }
+        limits.pids = None;
+    }
+    if limits.memory.is_some() && !has("memory") {
+        skip("memory", "memory");
+        limits.memory = None;
+    }
+    if limits.cpus.is_some() && !has("cpu") {
+        skip("cpu", "cpu");
+        limits.cpus = None;
+    }
+    Ok(limits)
+}
+
 /// Writes the profile's tools as a mise config file, named by its content so
 /// concurrent sessions with different profiles never overwrite each other.
 fn mise_config(paths: &Paths, tools: &toml::Table, dry_run: bool) -> Result<Option<PathBuf>> {
@@ -211,7 +277,9 @@ pub fn build(args: BuildArgs) -> Result<()> {
     let ctx = Setup::load()?;
     let backend = ctx.backend(&args.engine)?;
     let profile = ctx.profile(&args.engine)?;
-    let stack = image::layers(&ctx.base_image(), &profile.extensions)?;
+    let identity = backend.identity()?;
+    let mut stack = image::layers(&ctx.base_image(), &profile.extensions)?;
+    image::add_identity(&mut stack, identity.uid, identity.gid);
     let actions = image::ensure(&backend, &stack, args.force, false)?;
     for (layer, action) in stack.iter().zip(actions) {
         let state = match action {
@@ -240,13 +308,14 @@ pub fn profile(cmd: ProfileCommand) -> Result<()> {
         ProfileCommand::Show { name } => {
             let resolved = profile::resolve(&ctx.paths, &name)?;
             let stack = image::layers(&ctx.base_image(), &resolved.extensions)?;
-            print!("{}", describe(&ctx.paths, &resolved, &stack));
+            let limits = ctx.limits(&resolved);
+            print!("{}", describe(&ctx.paths, &resolved, &stack, &limits));
         }
     }
     Ok(())
 }
 
-fn describe(paths: &Paths, p: &ResolvedProfile, stack: &[image::Layer]) -> String {
+fn describe(paths: &Paths, p: &ResolvedProfile, stack: &[image::Layer], limits: &Limits) -> String {
     let home = |path: &Path| match path.strip_prefix(&paths.home) {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
@@ -259,6 +328,7 @@ fn describe(paths: &Paths, p: &ResolvedProfile, stack: &[image::Layer]) -> Strin
             LayerSource::Bundled => "bundled base".to_owned(),
             LayerSource::Custom => "custom base".to_owned(),
             LayerSource::Extension { profile, .. } => format!("extension from {profile}"),
+            LayerSource::Identity { uid, gid, .. } => format!("dev as {uid}:{gid}"),
         };
         out.push_str(&format!("  {}  ({source})\n", layer.tag));
     }
@@ -286,6 +356,28 @@ fn describe(paths: &Paths, p: &ResolvedProfile, stack: &[image::Layer]) -> Strin
     for (tool, version) in &p.tools {
         out.push_str(&format!("  {tool} = {version}\n"));
     }
+
+    out.push_str("\ncapabilities:\n");
+    for c in &p.caps {
+        out.push_str(&format!("  {}  (from {})\n", c.name, c.profile));
+    }
+
+    out.push_str("\nlimits:\n");
+    let pids = match limits.pids {
+        Some(0) | None => "unlimited".to_owned(),
+        Some(n) => n.to_string(),
+    };
+    out.push_str(&format!("  pids = {pids}\n"));
+    out.push_str(&format!(
+        "  memory = {}\n",
+        limits.memory.as_deref().unwrap_or("unlimited")
+    ));
+    out.push_str(&format!(
+        "  cpus = {}\n",
+        limits
+            .cpus
+            .map_or("unlimited".to_owned(), |c| c.to_string())
+    ));
 
     for w in &p.warnings {
         out.push_str(&format!("\nwarning: {w}\n"));

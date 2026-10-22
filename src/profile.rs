@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::config::Limits;
 use crate::paths::Paths;
 
 #[derive(Debug, Default, Deserialize)]
@@ -40,6 +41,11 @@ struct ProfileFile {
     volumes: Vec<VolumeEntry>,
     #[serde(default)]
     tools: toml::Table,
+    /// Capabilities the session keeps, such as "SYS_PTRACE".
+    #[serde(default)]
+    cap_add: Vec<String>,
+    #[serde(default)]
+    limits: Limits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,8 +106,73 @@ pub struct ResolvedProfile {
     pub volumes: Vec<Volume>,
     pub tools: toml::Table,
     pub extensions: Vec<Extension>,
+    /// Capabilities added back for the session, in the order declared.
+    pub caps: Vec<Capability>,
+    /// Limits set by the chain; unset fields fall back to config.toml.
+    pub limits: Limits,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
+}
+
+/// A Linux capability a profile adds back, by its name without `CAP_`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capability {
+    pub name: String,
+    pub profile: String,
+}
+
+const CAPABILITIES: &[&str] = &[
+    "AUDIT_CONTROL",
+    "AUDIT_READ",
+    "AUDIT_WRITE",
+    "BLOCK_SUSPEND",
+    "BPF",
+    "CHECKPOINT_RESTORE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "DAC_READ_SEARCH",
+    "FOWNER",
+    "FSETID",
+    "IPC_LOCK",
+    "IPC_OWNER",
+    "KILL",
+    "LEASE",
+    "LINUX_IMMUTABLE",
+    "MAC_ADMIN",
+    "MAC_OVERRIDE",
+    "MKNOD",
+    "NET_ADMIN",
+    "NET_BIND_SERVICE",
+    "NET_BROADCAST",
+    "NET_RAW",
+    "PERFMON",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_ADMIN",
+    "SYS_BOOT",
+    "SYS_CHROOT",
+    "SYS_MODULE",
+    "SYS_NICE",
+    "SYS_PACCT",
+    "SYS_PTRACE",
+    "SYS_RAWIO",
+    "SYS_RESOURCE",
+    "SYS_TIME",
+    "SYS_TTY_CONFIG",
+    "SYSLOG",
+    "WAKE_ALARM",
+];
+
+/// Normalizes `sys_ptrace` or `CAP_SYS_PTRACE` to `SYS_PTRACE`.
+fn capability_name(name: &str) -> Result<String> {
+    let upper = name.to_ascii_uppercase();
+    let bare = upper.strip_prefix("CAP_").unwrap_or(&upper);
+    if !CAPABILITIES.contains(&bare) {
+        bail!("unknown capability {name:?} in cap_add");
+    }
+    Ok(bare.to_owned())
 }
 
 /// Profile names end up in file names, image tags and volume names, so they
@@ -285,6 +356,19 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProf
     for (tool, version) in profile.tools {
         out.tools.insert(tool, version);
     }
+
+    for cap in &profile.cap_add {
+        let cap = capability_name(cap)?;
+        if !out.caps.iter().any(|c| c.name == cap) {
+            out.caps.push(Capability {
+                name: cap,
+                profile: name.to_owned(),
+            });
+        }
+    }
+
+    profile.limits.validate()?;
+    out.limits.merge(&profile.limits);
     Ok(())
 }
 
@@ -536,6 +620,39 @@ mod tests {
             "overwrote {}",
             file.display()
         );
+    }
+
+    #[test]
+    fn caps_and_limits_merge_down_the_chain() {
+        let f = Fixture::new();
+        f.profile(
+            "base",
+            "cap_add = [\"sys_ptrace\"]\n[limits]\npids = 100\nmemory = \"4g\"\n",
+        )
+        .profile(
+            "child",
+            "extends = [\"base\"]\ncap_add = [\"CAP_SYS_PTRACE\", \"NET_RAW\"]\n\
+             [limits]\nmemory = \"8g\"\n",
+        );
+        let r = resolve(&f.paths, "child").unwrap();
+        let caps: Vec<(&str, &str)> = r
+            .caps
+            .iter()
+            .map(|c| (c.name.as_str(), c.profile.as_str()))
+            .collect();
+        assert_eq!(caps, [("SYS_PTRACE", "base"), ("NET_RAW", "child")]);
+        assert_eq!(r.limits.pids, Some(100));
+        assert_eq!(r.limits.memory.as_deref(), Some("8g"));
+    }
+
+    #[test]
+    fn unknown_capability_and_bad_limits_are_errors() {
+        let f = Fixture::new();
+        f.profile("caps", "cap_add = [\"SYS_EVERYTHING\"]\n");
+        let err = format!("{:#}", resolve(&f.paths, "caps").unwrap_err());
+        assert!(err.contains("SYS_EVERYTHING"), "{err}");
+        f.profile("lim", "[limits]\ncpus = 0\n");
+        assert!(resolve(&f.paths, "lim").is_err());
     }
 
     #[test]

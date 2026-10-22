@@ -63,6 +63,10 @@ pub trait Backend {
     /// Builds `tag` from the `Containerfile` in `context`.
     fn build_image(&self, tag: &str, context: &Path) -> Result<()>;
     fn identity(&self) -> Result<Identity>;
+    /// cgroup controllers the engine can use for this user, such as
+    /// `memory` and `pids`. `None` when the engine can't say, in which case
+    /// limits are passed through and the engine reports any problem.
+    fn cgroup_controllers(&self) -> Result<Option<Vec<String>>>;
 }
 
 /// An engine driven through its command-line interface.
@@ -136,6 +140,42 @@ impl Backend for Cli {
             self.docker_is_rootless()
         })
     }
+
+    fn cgroup_controllers(&self) -> Result<Option<Vec<String>>> {
+        if self.kind != BackendKind::Podman {
+            return Ok(None);
+        }
+        let out = self
+            .command()
+            .args(["info", "--format", "{{json .Host.CgroupControllers}}"])
+            .stderr(Stdio::null())
+            .output()
+            .context("running `podman info`")?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        Ok(parse_json_strings(&String::from_utf8_lossy(&out.stdout)))
+    }
+}
+
+/// Parses a JSON array of plain strings, such as `["cpu","memory"]`. `null`
+/// (podman's answer on cgroup v1) is an empty list.
+fn parse_json_strings(text: &str) -> Option<Vec<String>> {
+    let text = text.trim();
+    if text == "null" {
+        return Some(Vec::new());
+    }
+    let inner = text.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| {
+            let item = item.trim().strip_prefix('"')?.strip_suffix('"')?;
+            (!item.contains(['"', '\\'])).then(|| item.to_owned())
+        })
+        .collect()
 }
 
 /// Decides how users map, separated from the engine queries for testing.
@@ -219,6 +259,18 @@ mod tests {
         let id = identity_for(BackendKind::Docker, 1234, 1234, || Ok(true)).unwrap();
         assert_eq!(id.uid, 0);
         assert!(id.notes.is_empty());
+    }
+
+    #[test]
+    fn controller_lists() {
+        assert_eq!(
+            parse_json_strings("[\"cpu\", \"memory\",\"pids\"]\n"),
+            Some(vec!["cpu".into(), "memory".into(), "pids".into()])
+        );
+        assert_eq!(parse_json_strings("null"), Some(vec![]));
+        assert_eq!(parse_json_strings("[]"), Some(vec![]));
+        assert_eq!(parse_json_strings("garbage"), None);
+        assert_eq!(parse_json_strings("[\"a\\\"b\"]"), None);
     }
 
     #[test]
