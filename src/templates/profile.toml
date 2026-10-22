@@ -13,6 +13,16 @@
 # cannot install. It is never read from the project you mount.
 # extension = "{name}.sh"
 
+# Network access for the session: "none" (default, loopback only) or "full".
+# Tool installs don't need it. podbay warns on every run with "full".
+#
+# network = "full"
+
+# Capabilities the session keeps. None by default; each one weakens the
+# boundary, and podbay prints them on every run.
+#
+# cap_add = ["SYS_PTRACE"]
+
 # Bind mounts from the host. Best for files you edit on the host, such as
 # dotfiles. mode is "ro" (default) or "rw". A missing host path is skipped
 # with a warning.
@@ -31,16 +41,12 @@
 # name = "opencode-config"
 # container = "/home/dev/.config/opencode"
 
-# Tools mise installs in every session, on top of what the project asks for.
+# Tools mise installs for every project, on top of what the project asks
+# for. They are installed in a provisioning step before the session starts.
 #
 # [tools]
 # opencode = "latest"
 # node = "22"
-
-# Capabilities the session keeps. None by default; each one weakens the
-# boundary, and podbay prints them on every run.
-#
-# cap_add = ["SYS_PTRACE"]
 
 # Resource limits, overriding config.toml. pids = 0 means no limit.
 #

@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::backend::BackendKind;
@@ -19,9 +20,34 @@ pub struct Config {
     pub default_profile: Option<String>,
     /// Use this image instead of building the bundled base image.
     pub base_image: Option<String>,
+    /// Network access for every session; profiles and `--network` can
+    /// override it.
+    pub network: Option<Network>,
     /// Resource limits for every session; profiles can override them.
     #[serde(default)]
     pub limits: Limits,
+}
+
+/// What a session can reach over the network. Tool installs happen in a
+/// separate provisioning step, so sessions need no network by default.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    /// Loopback only.
+    #[default]
+    None,
+    /// The engine's default network: the internet, the LAN, and depending
+    /// on the engine, the host.
+    Full,
+}
+
+impl Network {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Full => "full",
+        }
+    }
 }
 
 /// Default process (and thread) limit: enough for parallel builds, low
@@ -108,6 +134,14 @@ mod tests {
             toml::from_str("backend = \"docker\"\ndefault_profile = \"ai\"\n").unwrap();
         assert_eq!(cfg.backend, Some(BackendKind::Docker));
         assert_eq!(cfg.default_profile.as_deref(), Some("ai"));
+        assert_eq!(cfg.network, None);
+    }
+
+    #[test]
+    fn parses_network() {
+        let cfg: Config = toml::from_str("network = \"full\"\n").unwrap();
+        assert_eq!(cfg.network, Some(Network::Full));
+        assert!(toml::from_str::<Config>("network = \"some\"\n").is_err());
     }
 
     #[test]

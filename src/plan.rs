@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 use crate::backend::Identity;
-use crate::config::Limits;
+use crate::config::{Limits, Network};
 use crate::profile::{ResolvedProfile, validate_container_path};
 
 pub const HOME: &str = "/home/dev";
@@ -89,6 +89,8 @@ pub enum MiseData {
 pub struct Inputs<'a> {
     pub image: String,
     pub project: PathBuf,
+    /// Mount the project read-only, as provisioning does.
+    pub project_readonly: bool,
     pub repo_key: &'a str,
     pub profile: &'a ResolvedProfile,
     pub identity: &'a Identity,
@@ -101,6 +103,7 @@ pub struct Inputs<'a> {
     pub caps: &'a [String],
     /// Limits the engine can apply; see [`Limits`].
     pub limits: &'a Limits,
+    pub network: Network,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +120,7 @@ impl RunPlan {
         let mut mounts = vec![Mount::Bind {
             source: inputs.project,
             target: WORKSPACE.into(),
-            readonly: false,
+            readonly: inputs.project_readonly,
         }];
         mounts.push(match inputs.mise_data {
             MiseData::Shared => Mount::Volume {
@@ -175,7 +178,7 @@ impl RunPlan {
             .map(Mount::target)
             .collect();
 
-        let env = vec![
+        let mut env = vec![
             ("PODBAY_UID".into(), inputs.identity.uid.to_string()),
             ("PODBAY_GID".into(), inputs.identity.gid.to_string()),
             ("PODBAY_WORKSPACE".into(), WORKSPACE.into()),
@@ -199,6 +202,11 @@ impl RunPlan {
             ),
             ("PODBAY_PROFILE".into(), inputs.profile.chain.join(",")),
         ];
+        if inputs.network == Network::None {
+            // Use the tools provisioning installed instead of trying, and
+            // failing slowly, to download missing ones.
+            env.push(("MISE_OFFLINE".into(), "1".into()));
+        }
 
         let mut flags = vec!["--rm".into(), "--interactive".into()];
         if inputs.tty {
@@ -220,6 +228,9 @@ impl RunPlan {
         ]);
         for (target, options) in TMPFS {
             flags.push(format!("--tmpfs={target}:{options}"));
+        }
+        if inputs.network == Network::None {
+            flags.push("--network=none".into());
         }
 
         match inputs.limits.pids {
@@ -286,6 +297,7 @@ mod tests {
         Inputs {
             image: "img:1".into(),
             project: "/src/app".into(),
+            project_readonly: false,
             repo_key: "app-0123",
             profile,
             identity,
@@ -295,6 +307,7 @@ mod tests {
             tty: false,
             caps: &[],
             limits: &NO_LIMITS,
+            network: Network::None,
         }
     }
 
@@ -329,6 +342,7 @@ mod tests {
                 "--tmpfs=/home/dev:rw,exec,nosuid,nodev,mode=0755",
                 "--tmpfs=/tmp:rw,exec,nosuid,nodev,mode=1777",
                 "--tmpfs=/var/tmp:rw,exec,nosuid,nodev,mode=1777",
+                "--network=none",
                 "--mount=type=bind,source=/src/app,target=/home/dev/workspace/repomount",
                 "--mount=type=volume,source=podbay-mise-data,target=/home/dev/.local/share/mise",
                 "--env=PODBAY_UID=1234",
@@ -338,6 +352,7 @@ mod tests {
                 "--env=PODBAY_MOUNT_PATHS=/home/dev/workspace/repomount:/home/dev/.local/share/mise",
                 "--env=PODBAY_CAPS=",
                 "--env=PODBAY_PROFILE=",
+                "--env=MISE_OFFLINE=1",
                 "img:1",
             ]
         );
@@ -421,6 +436,28 @@ mod tests {
                 "missing {expected}: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn full_network_and_readonly_project() {
+        let profile = ResolvedProfile::default();
+        let id = identity();
+        let mut i = inputs(&profile, &id);
+        i.network = Network::Full;
+        i.project_readonly = true;
+        let args = RunPlan::build(i).unwrap().args();
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--network") || a.contains("MISE_OFFLINE")),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(
+                &"--mount=type=bind,source=/src/app,target=/home/dev/workspace/repomount,readonly"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

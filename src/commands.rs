@@ -6,14 +6,15 @@ use std::process::{Child, Command, ExitCode, ExitStatus};
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::{Backend, BackendKind};
-use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, RunArgs};
-use crate::config::{Config, DEFAULT_PIDS, Limits};
+use crate::backend::{Backend, BackendKind, Identity};
+use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
+use crate::config::{Config, DEFAULT_PIDS, Limits, Network};
 use crate::hash::sha256_hex;
 use crate::image::{self, Action, BaseImage, LayerSource};
 use crate::paths::Paths;
 use crate::plan::{self, MiseData, RunPlan};
 use crate::profile::{self, ResolvedProfile};
+use crate::provision;
 use crate::repo_key::repo_key;
 use crate::report;
 
@@ -71,6 +72,21 @@ impl Setup {
         limits
     }
 
+    /// `--network`, then the profile chain, then config.toml, then none;
+    /// with where the setting came from, for messages.
+    fn network(&self, profile: &ResolvedProfile, flag: Option<Network>) -> (Network, String) {
+        if let Some(network) = flag {
+            return (network, "--network".into());
+        }
+        if let Some((network, name)) = &profile.network {
+            return (*network, format!("profile {name}"));
+        }
+        match self.config.network {
+            Some(network) => (network, "config.toml".into()),
+            None => (Network::None, "default".into()),
+        }
+    }
+
     fn base_image(&self) -> BaseImage {
         match &self.config.base_image {
             Some(image) => BaseImage::Custom(image.clone()),
@@ -79,29 +95,168 @@ impl Setup {
     }
 }
 
+/// What both a session and provisioning need: the project, its profile,
+/// the image, and where mise keeps its tools.
+struct Prepared {
+    backend: crate::backend::Cli,
+    project: PathBuf,
+    key: String,
+    profile: ResolvedProfile,
+    identity: Identity,
+    image: String,
+    actions: Vec<Action>,
+    limits: Limits,
+    mise_data: MiseData,
+    /// The generated mise config with the profile's tools, and its text.
+    mise_config: Option<(PathBuf, String)>,
+}
+
+impl Prepared {
+    fn new(
+        ctx: &Setup,
+        engine: &EngineArgs,
+        project: Option<PathBuf>,
+        local_cache: bool,
+        dry_run: bool,
+    ) -> Result<Self> {
+        let backend = ctx.backend(engine)?;
+
+        let project = project.unwrap_or_else(|| PathBuf::from("."));
+        let project = fs::canonicalize(&project)
+            .with_context(|| format!("project {} not found", project.display()))?;
+        if !project.is_dir() {
+            bail!("project {} is not a directory", project.display());
+        }
+        let key = repo_key(&project);
+
+        let profile = ctx.profile(engine)?;
+        let identity = backend.identity()?;
+        for note in &identity.notes {
+            eprintln!("podbay: note: {note}");
+        }
+        let mut stack = image::layers(&ctx.base_image(), &profile.extensions)?;
+        image::add_identity(&mut stack, identity.uid, identity.gid);
+        let actions = image::ensure(&backend, &stack, false, dry_run)?;
+        let image = stack.last().expect("at least the base layer").tag.clone();
+
+        let limits = applicable_limits(&backend, ctx.limits(&profile), &ctx.config.limits)?;
+
+        let mise_data = if local_cache {
+            let dir = ctx.paths.cache_dir.join("mise").join(&key);
+            if !dry_run {
+                fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            }
+            MiseData::Local(dir)
+        } else {
+            MiseData::Shared
+        };
+        let mise_config = mise_config(&ctx.paths, &profile.tools, dry_run)?;
+
+        Ok(Self {
+            backend,
+            project,
+            key,
+            profile,
+            identity,
+            image,
+            actions,
+            limits,
+            mise_data,
+            mise_config,
+        })
+    }
+
+    fn program(&self) -> &'static str {
+        self.backend.kind().program()
+    }
+
+    /// The provisioning fingerprint, or `None` if there's nothing to install.
+    fn fingerprint(&self) -> Option<String> {
+        provision::fingerprint(
+            &self.project,
+            &provision::Inputs {
+                image: &self.image,
+                mise_data: &self.mise_data,
+                tools: self.mise_config.as_ref().map(|(_, text)| text.as_str()),
+            },
+        )
+    }
+
+    /// A container that installs the project's tools: network on, the
+    /// project read-only, and none of the profile's mounts, volumes or
+    /// capabilities.
+    fn provision_plan(&self) -> Result<RunPlan> {
+        RunPlan::build(plan::Inputs {
+            image: self.image.clone(),
+            project: self.project.clone(),
+            project_readonly: true,
+            repo_key: &self.key,
+            profile: &ResolvedProfile::default(),
+            identity: &self.identity,
+            mise_data: self.mise_data.clone(),
+            mise_config: self.mise_config.as_ref().map(|(path, _)| path.clone()),
+            command: vec!["sh".into(), "-c".into(), provision::COMMAND.into()],
+            tty: is_tty(),
+            caps: &[],
+            limits: &self.limits,
+            network: Network::Full,
+        })
+    }
+
+    /// Runs provisioning, and records it when it succeeds.
+    fn provision(&self, ctx: &Setup, fingerprint: Option<&str>) -> Result<ExitStatus> {
+        let argv = self.provision_plan()?.args();
+        let program = self.program();
+        eprintln!(
+            "podbay: provisioning tools for {} on {program} (network on, project read-only)",
+            self.key
+        );
+        let child = Command::new(program)
+            .args(&argv)
+            .spawn()
+            .with_context(|| format!("running {program}"))?;
+        let status =
+            wait_ignoring_interrupts(child).with_context(|| format!("waiting for {program}"))?;
+        if status.success()
+            && let Some(fingerprint) = fingerprint
+        {
+            provision::record(&ctx.paths, &self.key, &self.mise_data, fingerprint)?;
+        }
+        Ok(status)
+    }
+}
+
+fn is_tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// Prints `program argv...` as one shell command line.
+fn print_command(program: &str, argv: Vec<String>) {
+    let words: Vec<String> = std::iter::once(program.to_owned())
+        .chain(argv)
+        .map(|a| plan::shell_quote(&a))
+        .collect();
+    println!("{}", words.join(" "));
+}
+
+/// True if the engine was stopped by Ctrl-C (or Ctrl-\\).
+fn interrupted(status: ExitStatus) -> bool {
+    matches!(status.code(), Some(130 | 131))
+        || matches!(status.signal(), Some(libc::SIGINT | libc::SIGQUIT))
+}
+
 pub fn run(args: RunArgs) -> Result<ExitCode> {
     let ctx = Setup::load()?;
-    let backend = ctx.backend(&args.engine)?;
+    let prep = Prepared::new(
+        &ctx,
+        &args.engine,
+        args.project,
+        args.local_cache,
+        args.dry_run,
+    )?;
+    let profile = &prep.profile;
+    let (network, network_source) = ctx.network(profile, args.network);
 
-    let project = args.project.unwrap_or_else(|| PathBuf::from("."));
-    let project = fs::canonicalize(&project)
-        .with_context(|| format!("project {} not found", project.display()))?;
-    if !project.is_dir() {
-        bail!("project {} is not a directory", project.display());
-    }
-    let key = repo_key(&project);
-
-    let profile = ctx.profile(&args.engine)?;
-    let identity = backend.identity()?;
-    for note in &identity.notes {
-        eprintln!("podbay: note: {note}");
-    }
-    let mut stack = image::layers(&ctx.base_image(), &profile.extensions)?;
-    image::add_identity(&mut stack, identity.uid, identity.gid);
-    let actions = image::ensure(&backend, &stack, false, args.dry_run)?;
-    let image = stack.last().expect("at least the base layer").tag.clone();
-
-    let limits = applicable_limits(&backend, ctx.limits(&profile), &ctx.config.limits)?;
     if !profile.caps.is_empty() {
         let caps: Vec<String> = profile
             .caps
@@ -115,45 +270,60 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     }
     let caps: Vec<String> = profile.caps.iter().map(|c| c.name.clone()).collect();
 
-    let mise_data = if args.local_cache {
-        let dir = ctx.paths.cache_dir.join("mise").join(&key);
-        if !args.dry_run {
-            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        MiseData::Local(dir)
-    } else {
-        MiseData::Shared
-    };
-    let mise_config = mise_config(&ctx.paths, &profile.tools, args.dry_run)?;
-
     let plan = RunPlan::build(plan::Inputs {
-        image,
-        project: project.clone(),
-        repo_key: &key,
-        profile: &profile,
-        identity: &identity,
-        mise_data,
-        mise_config,
+        image: prep.image.clone(),
+        project: prep.project.clone(),
+        project_readonly: false,
+        repo_key: &prep.key,
+        profile,
+        identity: &prep.identity,
+        mise_data: prep.mise_data.clone(),
+        mise_config: prep.mise_config.as_ref().map(|(path, _)| path.clone()),
         command: args.command,
-        tty: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        tty: is_tty(),
         caps: &caps,
-        limits: &limits,
+        limits: &prep.limits,
+        network,
     })?;
-    let program = backend.kind().program();
+    let program = prep.program();
     let argv = plan.args();
 
+    let due = prep
+        .fingerprint()
+        .filter(|f| provision::is_due(&ctx.paths, &prep.key, &prep.mise_data, f));
+
     if args.dry_run {
-        if actions.contains(&Action::Build) {
+        if prep.actions.contains(&Action::Build) {
             eprintln!("podbay: images would be built first; see `podbay build`");
         }
-        let words: Vec<String> = std::iter::once(program.to_owned())
-            .chain(argv)
-            .map(|a| plan::shell_quote(&a))
-            .collect();
-        println!("{}", words.join(" "));
+        if due.is_some() {
+            eprintln!("podbay: tools would be provisioned first; see `podbay provision --dry-run`");
+        }
+        print_command(program, argv);
         return Ok(ExitCode::SUCCESS);
     }
 
+    if let Some(fingerprint) = &due {
+        let status = prep.provision(&ctx, Some(fingerprint))?;
+        if interrupted(status) {
+            return Ok(exit_code(status));
+        }
+        if !status.success() {
+            eprintln!(
+                "podbay: warning: provisioning failed ({status}); the session may be missing \
+                 tools. Retry with `podbay provision`"
+            );
+        }
+    }
+
+    let project = &prep.project;
+    let key = &prep.key;
+    if network == Network::Full {
+        eprintln!(
+            "podbay: warning: the session has full network access (network = \"full\" from \
+             {network_source})"
+        );
+    }
     let chain = match profile.chain.is_empty() {
         true => "no profile".to_owned(),
         false => format!("profile {}", profile.chain.join(" > ")),
@@ -166,7 +336,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         .filter(|m| !m.readonly)
         .map(|m| m.host.clone())
         .collect();
-    let watch = report::Watch::begin(&project, &rw_mounts);
+    let watch = report::Watch::begin(project, &rw_mounts);
     let child = Command::new(program)
         .args(&argv)
         .spawn()
@@ -174,7 +344,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     let status =
         wait_ignoring_interrupts(child).with_context(|| format!("waiting for {program}"))?;
 
-    let report = watch.finish().render(&project);
+    let report = watch.finish().render(project);
     let mut stderr = io::stderr().lock();
     if stderr.is_terminal() {
         // The container controlled the terminal until now. Undo text styling
@@ -257,7 +427,11 @@ fn applicable_limits(
 
 /// Writes the profile's tools as a mise config file, named by its content so
 /// concurrent sessions with different profiles never overwrite each other.
-fn mise_config(paths: &Paths, tools: &toml::Table, dry_run: bool) -> Result<Option<PathBuf>> {
+fn mise_config(
+    paths: &Paths,
+    tools: &toml::Table,
+    dry_run: bool,
+) -> Result<Option<(PathBuf, String)>> {
     if tools.is_empty() {
         return Ok(None);
     }
@@ -268,9 +442,29 @@ fn mise_config(paths: &Paths, tools: &toml::Table, dry_run: bool) -> Result<Opti
     let file = dir.join(format!("{}.toml", &sha256_hex(text.as_bytes())[..16]));
     if !dry_run && !file.exists() {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::write(&file, text).with_context(|| format!("writing {}", file.display()))?;
+        fs::write(&file, &text).with_context(|| format!("writing {}", file.display()))?;
     }
-    Ok(Some(file))
+    Ok(Some((file, text)))
+}
+
+pub fn provision(args: ProvisionArgs) -> Result<ExitCode> {
+    let ctx = Setup::load()?;
+    let prep = Prepared::new(
+        &ctx,
+        &args.engine,
+        args.project,
+        args.local_cache,
+        args.dry_run,
+    )?;
+    if args.dry_run {
+        if prep.actions.contains(&Action::Build) {
+            eprintln!("podbay: images would be built first; see `podbay build`");
+        }
+        print_command(prep.program(), prep.provision_plan()?.args());
+        return Ok(ExitCode::SUCCESS);
+    }
+    let status = prep.provision(&ctx, prep.fingerprint().as_deref())?;
+    Ok(exit_code(status))
 }
 
 pub fn build(args: BuildArgs) -> Result<()> {
@@ -309,13 +503,23 @@ pub fn profile(cmd: ProfileCommand) -> Result<()> {
             let resolved = profile::resolve(&ctx.paths, &name)?;
             let stack = image::layers(&ctx.base_image(), &resolved.extensions)?;
             let limits = ctx.limits(&resolved);
-            print!("{}", describe(&ctx.paths, &resolved, &stack, &limits));
+            let network = ctx.network(&resolved, None);
+            print!(
+                "{}",
+                describe(&ctx.paths, &resolved, &stack, &limits, &network)
+            );
         }
     }
     Ok(())
 }
 
-fn describe(paths: &Paths, p: &ResolvedProfile, stack: &[image::Layer], limits: &Limits) -> String {
+fn describe(
+    paths: &Paths,
+    p: &ResolvedProfile,
+    stack: &[image::Layer],
+    limits: &Limits,
+    (network, source): &(Network, String),
+) -> String {
     let home = |path: &Path| match path.strip_prefix(&paths.home) {
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
@@ -361,6 +565,11 @@ fn describe(paths: &Paths, p: &ResolvedProfile, stack: &[image::Layer], limits: 
     for c in &p.caps {
         out.push_str(&format!("  {}  (from {})\n", c.name, c.profile));
     }
+
+    out.push_str(&format!(
+        "\nnetwork: {}  (from {source})\n",
+        network.as_str()
+    ));
 
     out.push_str("\nlimits:\n");
     let pids = match limits.pids {

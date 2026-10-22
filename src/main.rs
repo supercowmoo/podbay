@@ -8,6 +8,7 @@ mod image;
 mod paths;
 mod plan;
 mod profile;
+mod provision;
 mod repo_key;
 mod report;
 
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Run(args) => commands::run(args),
         Command::Build(args) => commands::build(args).map(|()| ExitCode::SUCCESS),
+        Command::Provision(args) => commands::provision(args),
         Command::Profile(cmd) => commands::profile(cmd).map(|()| ExitCode::SUCCESS),
     };
     match result {

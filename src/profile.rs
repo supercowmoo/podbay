@@ -16,6 +16,8 @@
 //!
 //! [tools]
 //! opencode = "latest"
+//!
+//! network = "full"      # default "none"
 //! ```
 
 use std::collections::HashSet;
@@ -26,7 +28,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::config::Limits;
+use crate::config::{Limits, Network};
 use crate::paths::Paths;
 
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +48,7 @@ struct ProfileFile {
     cap_add: Vec<String>,
     #[serde(default)]
     limits: Limits,
+    network: Option<Network>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +113,8 @@ pub struct ResolvedProfile {
     pub caps: Vec<Capability>,
     /// Limits set by the chain; unset fields fall back to config.toml.
     pub limits: Limits,
+    /// Network access set by the chain, and the profile that set it last.
+    pub network: Option<(Network, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
 }
@@ -369,6 +374,10 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProf
 
     profile.limits.validate()?;
     out.limits.merge(&profile.limits);
+
+    if let Some(network) = profile.network {
+        out.network = Some((network, name.to_owned()));
+    }
     Ok(())
 }
 
@@ -643,6 +652,20 @@ mod tests {
         assert_eq!(caps, [("SYS_PTRACE", "base"), ("NET_RAW", "child")]);
         assert_eq!(r.limits.pids, Some(100));
         assert_eq!(r.limits.memory.as_deref(), Some("8g"));
+    }
+
+    #[test]
+    fn network_is_set_by_the_last_profile() {
+        let f = Fixture::new();
+        f.profile("base", "network = \"full\"\n")
+            .profile("child", "extends = [\"base\"]\n")
+            .profile("strict", "extends = [\"base\"]\nnetwork = \"none\"\n");
+        let r = resolve(&f.paths, "child").unwrap();
+        assert_eq!(r.network, Some((Network::Full, "base".into())));
+        let r = resolve(&f.paths, "strict").unwrap();
+        assert_eq!(r.network, Some((Network::None, "strict".into())));
+        f.profile("bad", "network = \"lan\"\n");
+        assert!(resolve(&f.paths, "bad").is_err());
     }
 
     #[test]

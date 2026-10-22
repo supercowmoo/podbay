@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::backend::BackendKind;
+use crate::config::Network;
 
 /// Disposable, isolated containers around a project.
 #[derive(Debug, Parser)]
@@ -18,6 +19,9 @@ pub enum Command {
     Run(RunArgs),
     /// Build (or rebuild) the images a profile needs.
     Build(BuildArgs),
+    /// Install a project's tools now, with network access. `run` does this
+    /// by itself when the tools it needs changed.
+    Provision(ProvisionArgs),
     /// Manage profiles.
     #[command(subcommand)]
     Profile(ProfileCommand),
@@ -41,6 +45,10 @@ pub struct RunArgs {
     /// shared volume. Use for code you do not trust.
     #[arg(long)]
     pub local_cache: bool,
+    /// Network access for the session [default: profile or config
+    /// `network`, else none]
+    #[arg(long, value_enum)]
+    pub network: Option<Network>,
     /// Print the engine command instead of running it. Builds nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -49,6 +57,21 @@ pub struct RunArgs {
     /// Command to run instead of the image's login shell.
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProvisionArgs {
+    #[command(flatten)]
+    pub engine: EngineArgs,
+    /// Install into this project's private cache, as `run --local-cache`
+    /// uses, instead of the shared volume.
+    #[arg(long)]
+    pub local_cache: bool,
+    /// Print the engine command instead of running it. Builds nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Project directory [default: current directory]
+    pub project: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -95,5 +118,16 @@ mod tests {
         assert_eq!(run.engine.profile.as_deref(), Some("ai"));
         assert_eq!(run.project, Some(PathBuf::from(".")));
         assert_eq!(run.command, ["ls", "-la"]);
+        assert_eq!(run.network, None);
+    }
+
+    #[test]
+    fn network_flag() {
+        let cli = Cli::try_parse_from(["podbay", "run", "--network", "full", "."]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!()
+        };
+        assert_eq!(run.network, Some(Network::Full));
+        assert!(Cli::try_parse_from(["podbay", "run", "--network", "lan"]).is_err());
     }
 }

@@ -11,6 +11,7 @@ everything else is something you declared:
 - named volumes for state that should outlive the container
 - tools that mise installs on top of what the project asks for
 - optional root build scripts baked into a derived image
+- network access, which is off unless a profile turns it on
 
 Anything that needs root, such as changes to the image, can only come from
 your own config directory, never from the mounted project.
@@ -27,15 +28,18 @@ Being rebuilt in Rust, in stages:
    read-only root filesystem, resource limits. *(done)*
 4. Network policy: no network by default, with an allowlist enforced by a
    filtering proxy. Tool installs move to a separate provisioning step.
+   *(no network by default and provisioning done; the allowlist proxy, a
+   small Rust proxy shipped with podbay, is next)*
 5. Landlock and seccomp around processes inside the container.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
 [THREAT_MODEL.md](THREAT_MODEL.md) covers what is and isn't protected
-today, and which stage closes each gap. The two biggest: the container has
-full network access until stage 4, and the project is mounted read-write, so
-code inside can plant git hooks or config that run on your host the next
-time you use git there. The [session report](#session-report) tells you when
-that has happened.
+today, and which stage closes each gap. The two biggest: a session that
+needs the network (an AI agent calling its API) has to be given all of it
+until the allowlist lands, and the project is mounted read-write, so code
+inside can plant git hooks or config that run on your host the next time you
+use git there. The [session report](#session-report) tells you when that has
+happened.
 
 ## Install
 
@@ -54,13 +58,17 @@ podbay run ~/src/some-project
 ```
 
 The first run builds the bundled base image: Debian slim, a non-root `dev`
-user and mise, verified against its signing key. Inside, mise installs
-whatever the project's own config (`.mise.toml`, `.nvmrc`, ...) asks for.
+user and mise, verified against its signing key. Before the session starts,
+podbay [provisions](#provisioning) the tools the project's own config
+(`.mise.toml`, `.nvmrc`, ...) and your profile ask for. The session itself
+has no network.
 
 ```
 podbay run . -- make test     # run a command instead of a shell
 podbay run --dry-run .        # print the exact podman/docker command
+podbay run --network full .   # give this session the network
 podbay build                  # build or refresh the images ahead of time
+podbay provision .            # install or refresh the project's tools now
 ```
 
 podbay's exit code is the command's (or the shell's) exit code.
@@ -82,10 +90,42 @@ and gid.
   entrypoint starts with just enough to set up the home directory and fix
   mount ownership, then drops all of it before your command runs. A profile
   can keep specific capabilities with `cap_add` (see below).
+- **Network**: none. The session has only a loopback interface, so it
+  can't reach the internet, your LAN or the host. A profile can turn on full
+  network access with `network = "full"`, and podbay warns on every run that
+  has it. Tool installs don't need it; see [Provisioning](#provisioning).
 - **Resources**: at most 4096 processes and threads by default. Memory and
   CPU limits are opt-in. Rootless engines can apply a limit only when
   systemd delegates that cgroup controller to your user. When it doesn't,
   podbay warns and runs without that limit.
+
+## Provisioning
+
+Sessions can't download tools, so podbay installs them first, in a separate
+short-lived container that runs `mise install`. That container has network
+access but sees only what installing needs: the project, read-only, the
+mise data directory and the profile's `[tools]`. Your profile's mounts,
+volumes and capabilities are left out, so credentials there never share a
+container with the network.
+
+`podbay run` provisions by itself when anything that decides the tools
+changed since the last successful run: the image, the profile's tools,
+`--local-cache`, or the project's mise and version files (`mise.toml`,
+`.tool-versions`, `.nvmrc`, `.python-version`, `rust-toolchain.toml`, ...).
+It prints a line when it does. If provisioning fails, the session still
+starts, with a warning. Inside the session, mise runs with `MISE_OFFLINE`,
+so it uses what is installed instead of trying to download.
+
+Run `podbay provision` yourself to refresh tools pinned to `latest`, after
+removing the mise volume, or when tools come from somewhere podbay doesn't
+watch. It installs into the same place `run` would; pass `--local-cache` to
+match `run --local-cache`.
+
+If the project has a `mise.toml`, mise asks you to trust it before it
+installs anything, as it does on the host. In a terminal the prompt appears
+during provisioning; without one, provisioning fails until you run
+`podbay provision` in a terminal. Version files such as `.tool-versions`
+need no trust.
 
 ## Session report
 
@@ -148,6 +188,10 @@ extends = ["base"]
 # Relative to the profiles directory; must start with a shebang.
 extension = "ai.sh"
 
+# The agent calls its API, so this profile needs the network. podbay warns
+# on every run that has it.
+network = "full"
+
 # Named volumes keep tool state across runs. Stored as podbay-ai-<name>.
 [[volume]]
 name = "opencode-config"
@@ -177,8 +221,8 @@ memory = "16g"
 
 With `extends`, ancestors are applied first. A later profile's mount or
 volume replaces an inherited one at the same container path, and its tools
-override inherited versions. `cap_add` lists are combined, and `[limits]`
-keys override one at a time. Volumes keep the name of the profile that
+override inherited versions. `cap_add` lists are combined, `[limits]` keys
+override one at a time, and the last profile that sets `network` wins. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
 **Mounts or volumes?** Use mounts for files you own and edit on the host. Use
@@ -201,6 +245,7 @@ automatically.
 backend = "podman"           # or "docker"; default: podman if installed
 default_profile = "base"
 base_image = "my/image:tag"  # use your own image instead of the bundled one
+network = "none"             # or "full"; profiles and --network override it
 
 [limits]                     # profiles can override each key
 pids = 4096                  # processes and threads; 0 for no limit
@@ -210,7 +255,8 @@ cpus = 4                     # default: no limit
 
 A custom base image must provide a `dev` user, `setpriv`, podbay's
 entrypoint, and a copy of `/home/dev` at `/usr/local/share/podbay/home` to
-seed the home directory from (see `base/Containerfile`).
+seed the home directory from (see `base/Containerfile`). Without mise,
+provisioning does nothing.
 
 `PODBAY_CONFIG_DIR` and `PODBAY_CACHE_DIR` move podbay's config and cache
 directories without touching `HOME` or `XDG_*`. Rootless Podman uses those to
@@ -223,8 +269,9 @@ arbitrary code at install time. By default, installed tools live in one
 shared volume (`podbay-mise-data`), so a malicious project could leave
 something behind that other projects then pick up. For code you don't trust,
 `--local-cache` keeps that project's installs in
-`~/.cache/podbay/mise/<repo-key>/`. Review a project's mise config before
-letting it install anything.
+`~/.cache/podbay/mise/<repo-key>/`. Provisioning runs those installs with
+network access and the project visible, so review a project's mise config
+before trusting it.
 
 ## Development
 
@@ -236,5 +283,6 @@ PODBAY_TEST_BACKEND=podman cargo test
 The end-to-end tests run real containers on Docker (or the engine named by
 `PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available. They
 use a small stand-in for the base image (`tests/fixtures/test-base`) with the
-same entrypoint, so they don't need to build the full toolchain. One of them
-plays a hostile session and checks that the session report catches it.
+same entrypoint and a fake `mise` that records what provisioning saw, so
+they don't need to build the full toolchain. One of them plays a hostile
+session and checks that the session report catches it.

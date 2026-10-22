@@ -40,6 +40,11 @@ fn build_test_base(engine: &str) {
         ctx.path().join("entrypoint.sh"),
     )
     .unwrap();
+    fs::copy(
+        repo.join("tests/fixtures/test-base/mise"),
+        ctx.path().join("mise"),
+    )
+    .unwrap();
     let status = StdCommand::new(engine)
         .args(["build", "--quiet", "--tag", TEST_BASE, "--file"])
         .arg(ctx.path().join("Containerfile"))
@@ -338,4 +343,107 @@ test -e ~/left-behind && echo home=persisted || echo home=fresh
         "stdout:\n{out}\nstderr:\n{err}"
     );
     assert!(err.contains("keeps capabilities NET_RAW"), "{err}");
+}
+
+#[test]
+fn tools_are_provisioned_and_sessions_are_offline() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2enet{}", std::process::id());
+    fs::write(
+        profiles.join(format!("{id}.toml")),
+        "network = \"full\"\n[tools]\nnode = \"22\"\n",
+    )
+    .unwrap();
+    fs::write(project.join(".tool-versions"), "node 22\n").unwrap();
+
+    let run = |profile: Option<&str>, script: &str| {
+        let mut cmd = podbay(root);
+        cmd.args(["run", "--backend", &engine, "--local-cache"]);
+        if let Some(p) = profile {
+            cmd.args(["-p", p]);
+        }
+        let output = cmd
+            .arg(&project)
+            .args(["--", "sh", "-c", script])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let session = r#"
+echo "session-network=$(ls /sys/class/net | tr '\n' ' ')"
+echo "offline=${MISE_OFFLINE:-unset}"
+cat ~/.local/share/mise/provisioned
+echo "installs=$(wc -l < ~/.local/share/mise/installs)"
+"#;
+
+    // Provisioning runs first, with network but a read-only project, then
+    // the session runs with loopback only.
+    let (out, err) = run(None, session);
+    assert!(err.contains("provisioning tools for"), "{err}");
+    for expected in [
+        "session-network=lo \n",
+        "offline=1",
+        "project=readonly",
+        "versions=node 22",
+        "installs=1",
+    ] {
+        assert!(
+            out.contains(expected),
+            "missing {expected:?}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+    }
+    let provisioned_network = out
+        .lines()
+        .find_map(|l| l.strip_prefix("network="))
+        .unwrap();
+    assert_ne!(provisioned_network.trim(), "lo", "{out}");
+
+    // Nothing changed, so nothing is installed again.
+    let (out, err) = run(None, session);
+    assert!(!err.contains("provisioning tools"), "{err}");
+    assert!(out.contains("installs=1"), "{out}");
+
+    // A session that edits the project's tools gets them on the next run.
+    run(None, "echo 'node 24' > .tool-versions");
+    let (out, err) = run(None, session);
+    assert!(err.contains("provisioning tools for"), "{err}");
+    assert!(
+        out.contains("versions=node 24") && out.contains("installs=2"),
+        "{out}"
+    );
+
+    // A profile can opt into the network, and podbay says so. Its tools
+    // are provisioned too.
+    let (out, err) = run(Some(&id), session);
+    assert!(
+        err.contains(&format!(
+            "full network access (network = \"full\" from profile {id})"
+        )),
+        "{err}"
+    );
+    assert!(out.contains("tools=[tools] node = \"22\""), "{out}");
+    let session_network = out
+        .lines()
+        .find_map(|l| l.strip_prefix("session-network="))
+        .unwrap();
+    assert_ne!(session_network.trim(), "lo", "{out}");
+    assert!(out.contains("offline=unset"), "{out}");
 }

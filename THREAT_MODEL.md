@@ -1,8 +1,9 @@
 # Threat model
 
 This document covers what podbay protects, from whom, and where the
-boundary currently has holes. It describes the code as it is now, at the end
-of stage 3. Later stages close specific gaps, and each gap below names the
+boundary currently has holes. It describes the code as it is now, partway
+through stage 4: sessions have no network by default, and the allowlist is
+still to come. Later stages close specific gaps, and each gap below names the
 stage that addresses it.
 
 ## What podbay is for
@@ -46,7 +47,8 @@ sources.
 | --- | --- | --- |
 | Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, kernel | See "Privilege inside the container" |
 | Container to host files | Only declared mounts are visible | The project is read-write |
-| Container to host network | **Not enforced** | Unrestricted until stage 4 |
+| Container to network | `--network=none` unless a profile opts in | All or nothing until the stage 4 allowlist |
+| Provisioning to network | **Not enforced** | Runs project-chosen installers; see "Provisioning" |
 | Project to image build | Extensions are read only from your config dir | A project can never add root build steps |
 | Session to session | `--rm`, per-profile volumes | Some state is shared, see below |
 | Container output to host | Session report, escaping | See "The project as a channel" |
@@ -139,10 +141,31 @@ run git; it does not stop anything.
 
 ## Other channels, and the stage that closes them
 
-- **Network (stage 4).** The container has full network access. Anything it
-  can read (the project, mounted files, volumes) can be exfiltrated, and it
-  can reach services on your LAN and, depending on the engine, on the
-  host's loopback.
+- **Network (reduced in stage 4).** A session has only a loopback
+  interface by default, with its own network namespace, so it can reach
+  neither the internet, the LAN nor the host's loopback. Two gaps remain:
+  - A profile (or `config.toml`, or `--network full`) can turn on full
+    access, and an AI agent that calls a hosted API needs it today. Such a
+    session can send anything it can read (the project, mounted files,
+    volumes) anywhere, and reach your LAN and, depending on the engine, the
+    host's loopback. podbay warns on every run that has it. The allowlist
+    proxy, the rest of stage 4, narrows this to named hosts.
+  - Provisioning, below.
+- **Provisioning (stage 4).** Tools are installed before the session, in a
+  container with full network access that runs `mise install`. It gets the
+  project read-only, the mise data directory and the profile's tool list,
+  and nothing else: no profile mounts, no volumes, no `cap_add`, the same
+  hardening as a session otherwise. What it installs is chosen by the
+  project's mise and version files, and mise backends and hooks can run
+  code at install time, so this container can send the project's contents
+  out. That's the non-goal below rather than a new exposure, but it means a
+  project can reach the network once per change to those files, without a
+  session having network access. A session can trigger this for the next
+  run by editing those files, and the next run says so when it
+  provisions. A `mise.toml` still has to be trusted first.
+  Provisioning writes to the mise data directory, so the shared-volume
+  caveat under "Shared state" applies to it; with `--local-cache` the
+  writes stay in that project's cache.
 - **Privilege inside the container (reduced in stage 3).** The session
   runs as `dev` with an empty capability set, including the bounding set,
   and `no-new-privileges`. setuid binaries and file capabilities in the
@@ -190,5 +213,6 @@ run git; it does not stop anything.
 ## Non-goals
 
 - Protecting the project from the code you run in it.
-- Hiding the project's contents from that code.
+- Hiding the project's contents from that code, or from the installers
+  its mise config chooses.
 - Defending against a malicious podbay config, base image or engine.
