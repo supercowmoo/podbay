@@ -503,6 +503,61 @@ echo "installs=$(wc -l < ~/.local/tools/installs)"
 }
 
 #[test]
+fn network_can_be_toggled_per_run() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(root.join("config")).unwrap();
+
+    let run = |flags: &[&str]| {
+        let output = podbay(root)
+            .args(["run", "--backend", &engine])
+            .args(flags)
+            .arg(&project)
+            .args(["--", "sh", "-c", "ls /sys/class/net | tr '\\n' ' '"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        (
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let config = |extra: &str| {
+        fs::write(
+            root.join("config/config.toml"),
+            format!("base_image = {TEST_BASE:?}\n{extra}"),
+        )
+        .unwrap();
+    };
+
+    // Off by default; --online turns it on for one run, without a warning
+    // since you asked for it.
+    config("");
+    let (out, _) = run(&[]);
+    assert_eq!(out, "lo");
+    let (out, err) = run(&["--online"]);
+    assert_ne!(out, "lo", "{err}");
+    assert!(err.contains("network: full (from --online)"), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+
+    // On by default from config.toml, which is stated, not warned about;
+    // --offline turns it off for one run.
+    config("network = \"full\"\n");
+    let (out, err) = run(&[]);
+    assert_ne!(out, "lo", "{err}");
+    assert!(err.contains("network: full (from config.toml)"), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+    let (out, err) = run(&["--offline"]);
+    assert_eq!(out, "lo", "{err}");
+}
+
+#[test]
 fn allowlisted_session_reaches_only_listed_hosts() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);

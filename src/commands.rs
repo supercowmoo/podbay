@@ -73,9 +73,14 @@ impl Setup {
         limits
     }
 
-    /// config.toml, then the profile chain, then `--network`, each applied
-    /// on top of the last; with where the result came from, for messages.
-    fn network(&self, profile: &ResolvedProfile, flag: Option<NetworkMode>) -> (Network, String) {
+    /// config.toml, then the profile chain, then the command line, each
+    /// applied on top of the last; with where the result came from, for
+    /// messages.
+    fn network(
+        &self,
+        profile: &ResolvedProfile,
+        flag: Option<(NetworkMode, &str)>,
+    ) -> (Network, String) {
         let mut network = Network::default();
         let mut sources: Vec<String> = Vec::new();
         let mut apply = |setting: &NetworkSetting, source: String| {
@@ -95,8 +100,8 @@ impl Setup {
         for (setting, name) in &profile.network {
             apply(setting, format!("profile {name}"));
         }
-        if let Some(mode) = flag {
-            apply(&NetworkSetting::Mode(mode), "--network".into());
+        if let Some((mode, name)) = flag {
+            apply(&NetworkSetting::Mode(mode), name.into());
         }
         let profiles: Vec<&str> = sources
             .iter()
@@ -251,6 +256,7 @@ fn interrupted(status: ExitStatus) -> bool {
 
 pub fn run(args: RunArgs) -> Result<ExitCode> {
     let ctx = Setup::load()?;
+    let network_flag = args.network_flag();
     let prep = Prepared::new(
         &ctx,
         &args.engine,
@@ -259,7 +265,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         args.dry_run,
     )?;
     let profile = &prep.profile;
-    let (network, network_source) = ctx.network(profile, args.network);
+    let (network, network_source) = ctx.network(profile, network_flag);
 
     if !profile.caps.is_empty() {
         let caps: Vec<String> = profile
@@ -351,11 +357,18 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     let project = &prep.project;
     let key = &prep.key;
     let relay = match (&network, relay_image) {
-        (Network::Full, _) => {
+        // Full access you chose yourself, in config.toml or on the command
+        // line, is just stated. A profile turning it on gets a warning:
+        // that's the case you might not expect.
+        (Network::Full, _) if network_source.starts_with("profile") => {
             eprintln!(
                 "podbay: warning: the session has full network access (network = \"full\" \
                  from {network_source})"
             );
+            None
+        }
+        (Network::Full, _) => {
+            eprintln!("podbay: network: full (from {network_source})");
             None
         }
         (Network::Allow(hosts), Some(image)) => {

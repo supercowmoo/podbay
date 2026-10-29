@@ -47,8 +47,14 @@ pub struct RunArgs {
     pub local_cache: bool,
     /// Network access for the session, overriding any allowlist
     /// [default: profile or config `network`, else none]
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, conflicts_with_all = ["online", "offline"])]
     pub network: Option<NetworkMode>,
+    /// Same as `--network full`.
+    #[arg(long, conflicts_with = "offline")]
+    pub online: bool,
+    /// Same as `--network none`.
+    #[arg(long)]
+    pub offline: bool,
     /// Print the engine command instead of running it. Builds nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -58,6 +64,19 @@ pub struct RunArgs {
     /// bash).
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+impl RunArgs {
+    /// The network mode chosen on the command line, and the flag that chose
+    /// it, for messages.
+    pub fn network_flag(&self) -> Option<(NetworkMode, &'static str)> {
+        match (self.network, self.online, self.offline) {
+            (Some(mode), _, _) => Some((mode, "--network")),
+            (None, true, _) => Some((NetworkMode::Full, "--online")),
+            (None, _, true) => Some((NetworkMode::None, "--offline")),
+            (None, false, false) => None,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -130,5 +149,36 @@ mod tests {
         };
         assert_eq!(run.network, Some(NetworkMode::Full));
         assert!(Cli::try_parse_from(["podbay", "run", "--network", "lan"]).is_err());
+    }
+
+    #[test]
+    fn online_and_offline() {
+        let flag = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Run(run) = cli.command else {
+                panic!()
+            };
+            run.network_flag()
+        };
+        assert_eq!(flag(&["podbay", "run", "."]), None);
+        assert_eq!(
+            flag(&["podbay", "run", "--online", "."]),
+            Some((NetworkMode::Full, "--online"))
+        );
+        assert_eq!(
+            flag(&["podbay", "run", "--offline", "."]),
+            Some((NetworkMode::None, "--offline"))
+        );
+        assert_eq!(
+            flag(&["podbay", "run", "--network", "none", "."]),
+            Some((NetworkMode::None, "--network"))
+        );
+        for conflicting in [
+            &["podbay", "run", "--online", "--offline"][..],
+            &["podbay", "run", "--online", "--network", "none"],
+            &["podbay", "run", "--offline", "--network", "full"],
+        ] {
+            assert!(Cli::try_parse_from(conflicting).is_err(), "{conflicting:?}");
+        }
     }
 }

@@ -170,10 +170,11 @@ run git; it does not stop anything.
       `/sys` read-only instead of its own, which exposes interface names and
       hardware details but no network access.
   - **Full access** (`network = "full"` in a profile or `config.toml`, or
-    `--network full`) gives the session the engine's network. It can send
+    `--online`) gives the session the engine's network. It can send
     anything it can read (the project, mounted files, volumes) anywhere, and
     reach your LAN and, depending on the engine, the host's loopback.
-    podbay warns on every run that has it.
+    podbay states it on every run that has it, and warns when a profile is
+    what turned it on.
   - Provisioning, below.
 - **Provisioning (stage 4).** Tools are installed before the session, in a
   container with full network access that runs the profile's `[provision]`

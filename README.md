@@ -65,7 +65,8 @@ itself has no network unless you give it some.
 ```
 podbay run . -- make test     # run a command instead of a shell
 podbay run --dry-run .        # print the exact podman/docker command
-podbay run --network full .   # give this session the network
+podbay run --online .         # give this session the network
+podbay run --offline .        # or take it away, whatever the config says
 podbay build                  # build or refresh the images ahead of time
 podbay provision .            # run the profile's [provision] commands now
 ```
@@ -92,8 +93,11 @@ and gid.
 - **Network**: none. The session has only a loopback interface, so it
   can't reach the internet, your LAN or the host. A profile can allow HTTPS
   to specific hosts (see [Network allowlist](#network-allowlist)), or turn
-  on full access with `network = "full"`, which podbay warns about on every
-  run. Installing tools needs neither; see [Provisioning](#provisioning).
+  on full access with `network = "full"`. If you mostly work online, set
+  that in `config.toml` and use `--offline` when you don't want it; podbay
+  states the setting on every run. When a profile turns full access on,
+  podbay prints a warning instead, since that's easy to miss. Installing
+  tools needs neither; see [Provisioning](#provisioning).
 - **Resources**: at most 4096 processes and threads by default. Memory and
   CPU limits are opt-in. Rootless engines can apply a limit only when
   systemd delegates that cgroup controller to your user. When it doesn't,
@@ -110,7 +114,8 @@ network = ["api.anthropic.com", "*.githubusercontent.com", "registry.example.com
 `*.example.com` covers every name below `example.com` (not `example.com`
 itself), and the port is 443 unless you give one. A list in a profile adds to
 the lists of the profiles it extends; `"none"` or `"full"` replaces them.
-`--network none` or `--network full` overrides everything for one run.
+`--offline` and `--online` (or `--network none|full`) override everything
+for one run.
 
 The session still has no network interface besides loopback. podbay starts a
 tiny relay container next to it, with no network either, and the session
@@ -341,7 +346,7 @@ automatically.
 backend = "podman"           # or "docker"; default: podman if installed
 default_profile = "base"
 base_image = "my/image:tag"  # use your own image instead of the bundled one
-network = "none"             # "full", or a host list; see Network allowlist
+network = "none"             # "full", or a host list; --online/--offline override it
 
 [limits]                     # profiles can override each key
 pids = 4096                  # processes and threads; 0 for no limit

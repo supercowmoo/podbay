@@ -24,7 +24,8 @@
 # of hosts allows HTTPS to just those, through podbay's proxy; "*.x.com"
 # covers every name below x.com, and ":port" changes the port from 443.
 # Lists add to the ones in profiles this extends. "full" is everything, and
-# podbay warns on every run with it. [provision] needs none of this.
+# podbay warns on every run it turns on. --online and --offline override
+# this for one run. [provision] needs none of this.
 #
 # network = ["api.anthropic.com", "*.githubusercontent.com"]
 # network = "full"
