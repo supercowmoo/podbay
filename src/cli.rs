@@ -98,7 +98,8 @@ pub struct ProvisionArgs {
 pub struct BuildArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Rebuild every layer even if it already exists.
+    /// Rebuild every layer from scratch: no build cache, and the Debian base
+    /// pulled again, so updated packages and a rebuilt custom base come in.
     #[arg(long)]
     pub force: bool,
 }

@@ -68,7 +68,8 @@ podbay run . -- make test     # run a command instead of a shell
 podbay run --dry-run .        # print the exact podman/docker command
 podbay run --online .         # give this session the network
 podbay run --offline .        # or take it away, whatever the config says
-podbay build                  # build or refresh the images ahead of time
+podbay build                  # build any missing images ahead of time
+podbay build --force          # rebuild them all with current packages
 podbay provision .            # run the profile's [provision] commands now
 ```
 
@@ -141,7 +142,9 @@ and passes every connection to podbay on the host, which:
 
 The session gets `HTTPS_PROXY` and `HTTP_PROXY` (and the lowercase forms)
 pointing at the relay, and `NODE_USE_ENV_PROXY=1` for Node. Most tools,
-including curl, git over HTTPS, npm, pip, cargo and Node, pick these up.
+including curl, git over HTTPS, npm, pip and cargo, pick these up. Node itself
+honors them from 24.5 and 22.21 (`fetch` alone from 24.0); on older versions a
+script's own HTTPS requests fail as if the name didn't resolve.
 Anything that ignores them, or uses another protocol such as SSH, gets no
 connection at all. Plain `http://` URLs are refused.
 
@@ -246,6 +249,7 @@ A profile is a single TOML file in `~/.config/podbay/profiles/`:
 ```
 podbay profile init base
 podbay profile init ai --extends base
+podbay profile list
 podbay profile show ai        # everything ai resolves to, inheritance merged
 podbay run -p ai .
 ```
@@ -307,7 +311,7 @@ container = "/home/dev/.opencode"
 provision = true
 
 [provision]
-command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/install | bash"
+command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/v2/install | bash"
 ```
 
 ```toml
@@ -348,8 +352,10 @@ on your host. The engine creates a missing mount point's parent
 directories as root, and the entrypoint gives them to `dev`.
 
 **Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
-Each tag is a hash of the script and its parent image, so editing a script,
-or any script below it in the chain, rebuilds exactly what changed.
+Each tag is a hash of the script and its parent image's tag, so editing a
+script, or any script below it in the chain, rebuilds exactly what changed.
+What a script downloads isn't part of the hash, and neither is a custom base
+rebuilt under the same tag: run `podbay build --force` to pick those up.
 Extensions run as root at build time, the only time the root filesystem is
 writable. Anything they put in `/home/dev` is copied into the home skeleton
 automatically.

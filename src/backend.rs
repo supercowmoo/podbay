@@ -57,11 +57,21 @@ pub struct Identity {
     pub notes: Vec<String>,
 }
 
+/// How far [`Backend::build_image`] goes to avoid reusing old content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Refresh {
+    /// Run every step again instead of taking it from the build cache.
+    pub no_cache: bool,
+    /// Pull the `FROM` image again first. Only for images that come from a
+    /// registry: podbay's own layers exist only locally.
+    pub pull: bool,
+}
+
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     fn image_exists(&self, image: &str) -> Result<bool>;
     /// Builds `tag` from the `Containerfile` in `context`.
-    fn build_image(&self, tag: &str, context: &Path) -> Result<()>;
+    fn build_image(&self, tag: &str, context: &Path, refresh: Refresh) -> Result<()>;
     fn identity(&self) -> Result<Identity>;
     /// cgroup controllers the engine can use for this user, such as
     /// `memory` and `pids`. `None` when the engine can't say, in which case
@@ -119,11 +129,19 @@ impl Backend for Cli {
         Ok(status.success())
     }
 
-    fn build_image(&self, tag: &str, context: &Path) -> Result<()> {
+    fn build_image(&self, tag: &str, context: &Path, refresh: Refresh) -> Result<()> {
+        let mut cmd = self.command();
+        cmd.args(["build", "--tag", tag]);
+        if refresh.no_cache {
+            cmd.arg("--no-cache");
+        }
+        if refresh.pull {
+            // Both Podman and Docker read `--pull=true` as "always pull".
+            cmd.arg("--pull=true");
+        }
         // Build output goes to stderr so stdout stays clean for callers.
-        let status = self
-            .command()
-            .args(["build", "--tag", tag, "--file"])
+        let status = cmd
+            .arg("--file")
             .arg(context.join("Containerfile"))
             .arg(context)
             .stdout(Stdio::from(std::io::stderr()))

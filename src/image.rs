@@ -1,14 +1,16 @@
 //! Image layering: the bundled base image, one derived image per profile
 //! extension script, and on rootful Docker a final layer that gives `dev` the
-//! host user's ids. Every tag is a hash of everything that went into the
-//! image, so changing any input produces a new tag and stale images are never
-//! reused.
+//! host user's ids. Every tag is a hash of podbay's inputs to the image (its
+//! Containerfile, scripts and parent tag), so changing any of them produces a
+//! new tag. What those inputs fetch is not hashed: the `FROM` images by tag,
+//! the packages `apt-get` installs, and a custom base rebuilt under the same
+//! tag. `podbay build --force` rebuilds against the latest of all of them.
 
 use std::fs;
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::{Backend, IMAGE_DEV_UID};
+use crate::backend::{Backend, IMAGE_DEV_UID, Refresh};
 use crate::hash::sha256_hex_fields;
 use crate::profile::Extension;
 
@@ -131,8 +133,9 @@ pub enum Action {
     Build,
 }
 
-/// Builds any missing layers (all of them with `force`) and returns the
-/// action taken per layer. With `dry_run`, nothing is built.
+/// Builds any missing layers and returns the action taken per layer. With
+/// `force`, every layer is rebuilt without the build cache, pulling the
+/// registry images they start from again. With `dry_run`, nothing is built.
 pub fn ensure(
     backend: &dyn Backend,
     stack: &[Layer],
@@ -156,7 +159,7 @@ pub fn ensure(
         if action == Action::Build {
             rebuild_rest = true;
             if !dry_run {
-                build(backend, layer)?;
+                build(backend, layer, force)?;
             }
         }
         actions.push(action);
@@ -164,7 +167,7 @@ pub fn ensure(
     Ok(actions)
 }
 
-fn build(backend: &dyn Backend, layer: &Layer) -> Result<()> {
+fn build(backend: &dyn Backend, layer: &Layer, force: bool) -> Result<()> {
     let ctx = tempfile::Builder::new().prefix("podbay-build-").tempdir()?;
     match &layer.source {
         LayerSource::Bundled => {
@@ -194,8 +197,14 @@ fn build(backend: &dyn Backend, layer: &Layer) -> Result<()> {
         }
         LayerSource::Custom => unreachable!("custom images are never built"),
     }
+    let refresh = Refresh {
+        no_cache: force,
+        // Only these start from a registry image; the others start from a
+        // podbay layer or a custom base, which exist only locally.
+        pull: force && matches!(layer.source, LayerSource::Bundled | LayerSource::Relay),
+    };
     eprintln!("podbay: building {}", layer.tag);
-    backend.build_image(&layer.tag, ctx.path())
+    backend.build_image(&layer.tag, ctx.path(), refresh)
 }
 
 fn extension_containerfile(parent: &str, profile: &str) -> String {
@@ -238,7 +247,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         images: RefCell<HashSet<String>>,
-        built: RefCell<Vec<(String, String)>>,
+        built: RefCell<Vec<(String, String, Refresh)>>,
     }
 
     impl Backend for FakeBackend {
@@ -248,9 +257,11 @@ mod tests {
         fn image_exists(&self, image: &str) -> Result<bool> {
             Ok(self.images.borrow().contains(image))
         }
-        fn build_image(&self, tag: &str, context: &Path) -> Result<()> {
+        fn build_image(&self, tag: &str, context: &Path, refresh: Refresh) -> Result<()> {
             let containerfile = fs::read_to_string(context.join("Containerfile"))?;
-            self.built.borrow_mut().push((tag.into(), containerfile));
+            self.built
+                .borrow_mut()
+                .push((tag.into(), containerfile, refresh));
             self.images.borrow_mut().insert(tag.into());
             Ok(())
         }
@@ -341,6 +352,34 @@ mod tests {
         assert_eq!(built.len(), 2);
         assert!(built[0].1.starts_with(&format!("FROM {}\n", stack[0].tag)));
         assert!(built[1].1.starts_with(&format!("FROM {}\n", stack[1].tag)));
+        assert!(built.iter().all(|b| b.2 == Refresh::default()));
+    }
+
+    #[test]
+    fn force_rebuilds_uncached_and_pulls_only_registry_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ext(dir.path(), "a", "#!/bin/sh\n");
+        let stack = layers(&BaseImage::Bundled, &[a]).unwrap();
+        let backend = FakeBackend::default();
+        for layer in &stack {
+            backend.images.borrow_mut().insert(layer.tag.clone());
+        }
+
+        let actions = ensure(&backend, &stack, true, false).unwrap();
+        assert_eq!(actions, [Action::Build, Action::Build]);
+        let built = backend.built.borrow();
+        let full = Refresh {
+            no_cache: true,
+            pull: true,
+        };
+        assert_eq!(built[0].2, full);
+        assert_eq!(
+            built[1].2,
+            Refresh {
+                pull: false,
+                ..full
+            }
+        );
     }
 
     #[test]
