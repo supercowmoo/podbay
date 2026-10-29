@@ -14,9 +14,6 @@ use crate::profile::{ResolvedProfile, validate_container_path};
 
 pub const HOME: &str = "/home/dev";
 pub const WORKSPACE: &str = "/home/dev/workspace/repomount";
-pub const MISE_DATA: &str = "/home/dev/.local/share/mise";
-pub const MISE_CONFIG: &str = "/home/dev/.config/mise/config.toml";
-pub const SHARED_MISE_VOLUME: &str = "podbay-mise-data";
 
 /// What the entrypoint needs as root: set up the home directory, fix
 /// ownership of mount points, then drop to dev and shed its capabilities
@@ -90,15 +87,6 @@ pub enum Net {
     Relay(String),
 }
 
-/// Where mise keeps installed tools.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MiseData {
-    /// One volume shared by every project.
-    Shared,
-    /// A host directory private to one project (`--local-cache`).
-    Local(PathBuf),
-}
-
 pub struct Inputs<'a> {
     pub image: String,
     pub project: PathBuf,
@@ -107,9 +95,7 @@ pub struct Inputs<'a> {
     pub repo_key: &'a str,
     pub profile: &'a ResolvedProfile,
     pub identity: &'a Identity,
-    pub mise_data: MiseData,
-    /// Generated mise config holding the profile's tools, if it has any.
-    pub mise_config: Option<PathBuf>,
+    /// What to run; empty runs the profile's shell, else the image's default.
     pub command: Vec<String>,
     pub tty: bool,
     /// Capabilities the session keeps, such as `SYS_PTRACE`.
@@ -135,24 +121,6 @@ impl RunPlan {
             target: WORKSPACE.into(),
             readonly: inputs.project_readonly,
         }];
-        mounts.push(match inputs.mise_data {
-            MiseData::Shared => Mount::Volume {
-                name: SHARED_MISE_VOLUME.into(),
-                target: MISE_DATA.into(),
-            },
-            MiseData::Local(dir) => Mount::Bind {
-                source: dir,
-                target: MISE_DATA.into(),
-                readonly: false,
-            },
-        });
-        if let Some(config) = inputs.mise_config {
-            mounts.push(Mount::Bind {
-                source: config,
-                target: MISE_CONFIG.into(),
-                readonly: true,
-            });
-        }
         for m in &inputs.profile.mounts {
             mounts.push(Mount::Bind {
                 source: m.host.clone(),
@@ -187,7 +155,7 @@ impl RunPlan {
         // create volume mount points (and their parents) as root.
         let writable: Vec<&str> = mounts
             .iter()
-            .filter(|m| matches!(m, Mount::Volume { .. }) || m.target() == MISE_DATA)
+            .filter(|m| matches!(m, Mount::Volume { .. }))
             .map(Mount::target)
             .collect();
 
@@ -215,11 +183,18 @@ impl RunPlan {
             ),
             ("PODBAY_PROFILE".into(), inputs.profile.chain.join(",")),
         ];
-        if inputs.network != Net::Full {
-            // Use the tools provisioning installed instead of trying, and
-            // failing slowly, to download missing ones.
-            env.push(("MISE_OFFLINE".into(), "1".into()));
+        if !inputs.profile.path.is_empty() {
+            // The entrypoint and login shells put this in front of PATH, so
+            // the image's own PATH is kept whatever it is.
+            env.push(("PODBAY_PATH".into(), inputs.profile.path.join(":")));
         }
+        env.extend(
+            inputs
+                .profile
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         if let Net::Relay(_) = inputs.network {
             let proxy = format!("http://{}", egress::PROXY_ADDR);
             for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
@@ -281,12 +256,17 @@ impl RunPlan {
             flags.push(format!("--cpus={cpus}"));
         }
 
+        let command = match (inputs.command.is_empty(), &inputs.profile.shell) {
+            (true, Some(shell)) => vec![shell.clone(), "-l".into()],
+            _ => inputs.command,
+        };
+
         Ok(Self {
             image: inputs.image,
             flags,
             mounts,
             env,
-            command: inputs.command,
+            command,
         })
     }
 
@@ -398,8 +378,6 @@ mod tests {
             repo_key: "app-0123",
             profile,
             identity,
-            mise_data: MiseData::Shared,
-            mise_config: None,
             command: vec![],
             tty: false,
             caps: &[],
@@ -441,15 +419,13 @@ mod tests {
                 "--tmpfs=/var/tmp:rw,exec,nosuid,nodev,mode=1777",
                 "--network=none",
                 "--mount=type=bind,source=/src/app,target=/home/dev/workspace/repomount",
-                "--mount=type=volume,source=podbay-mise-data,target=/home/dev/.local/share/mise",
                 "--env=PODBAY_UID=1234",
                 "--env=PODBAY_GID=1234",
                 "--env=PODBAY_WORKSPACE=/home/dev/workspace/repomount",
-                "--env=PODBAY_VOLUME_PATHS=/home/dev/.local/share/mise",
-                "--env=PODBAY_MOUNT_PATHS=/home/dev/workspace/repomount:/home/dev/.local/share/mise",
+                "--env=PODBAY_VOLUME_PATHS=",
+                "--env=PODBAY_MOUNT_PATHS=/home/dev/workspace/repomount",
                 "--env=PODBAY_CAPS=",
                 "--env=PODBAY_PROFILE=",
-                "--env=MISE_OFFLINE=1",
                 "img:1",
             ]
         );
@@ -468,41 +444,56 @@ mod tests {
             volumes: vec![Volume {
                 name: "podbay-ai-oc".into(),
                 container: "/home/dev/.config/opencode".into(),
+                provision: false,
                 profile: "ai".into(),
             }],
+            shell: Some("zsh".into()),
             ..Default::default()
         };
         let id = identity();
         let mut i = inputs(&profile, &id);
-        i.mise_data = MiseData::Local("/c/mise/app".into());
-        i.mise_config = Some("/c/mise-config.toml".into());
         i.command = vec!["sh".into(), "-c".into(), "id".into()];
         i.tty = true;
         let plan = RunPlan::build(i).unwrap();
         let args = plan.args();
 
         assert!(args.contains(&"--tty".to_owned()));
-        assert!(args.contains(
-            &"--mount=type=bind,source=/c/mise/app,target=/home/dev/.local/share/mise".to_owned()
-        ));
-        assert!(args.contains(
-            &"--mount=type=bind,source=/c/mise-config.toml,target=/home/dev/.config/mise/config.toml,readonly"
-                .to_owned()
-        ));
         assert!(
             args.contains(
                 &"--mount=type=bind,source=/h/.gitconfig,target=/home/dev/.gitconfig,readonly"
                     .to_owned()
             )
         );
-        assert!(
-            args.contains(
-                &"--env=PODBAY_VOLUME_PATHS=/home/dev/.local/share/mise:/home/dev/.config/opencode"
-                    .to_owned()
-            )
-        );
+        assert!(args.contains(&"--env=PODBAY_VOLUME_PATHS=/home/dev/.config/opencode".to_owned()));
         assert!(args.contains(&"--env=PODBAY_PROFILE=base,ai".to_owned()));
+        // An explicit command wins over the profile's shell.
         assert_eq!(&args[args.len() - 4..], ["img:1", "sh", "-c", "id"]);
+        let args = RunPlan::build(inputs(&profile, &id)).unwrap().args();
+        assert_eq!(&args[args.len() - 3..], ["img:1", "zsh", "-l"]);
+    }
+
+    #[test]
+    fn env_and_path() {
+        let profile = ResolvedProfile {
+            env: [("CARGO_HOME".to_owned(), "/home/dev/.cargo".to_owned())].into(),
+            path: vec!["/home/dev/.cargo/bin".into(), "/opt/bin".into()],
+            ..Default::default()
+        };
+        let id = identity();
+        let args = RunPlan::build(inputs(&profile, &id)).unwrap().args();
+        for expected in [
+            "--env=PODBAY_PATH=/home/dev/.cargo/bin:/opt/bin",
+            "--env=CARGO_HOME=/home/dev/.cargo",
+        ] {
+            assert!(
+                args.contains(&expected.to_owned()),
+                "missing {expected}: {args:?}"
+            );
+        }
+        assert!(
+            !args.iter().any(|a| a.starts_with("--env=PATH=")),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -543,12 +534,7 @@ mod tests {
         i.network = Net::Full;
         i.project_readonly = true;
         let args = RunPlan::build(i).unwrap().args();
-        assert!(
-            !args
-                .iter()
-                .any(|a| a.starts_with("--network") || a.contains("MISE_OFFLINE")),
-            "{args:?}"
-        );
+        assert!(!args.iter().any(|a| a.starts_with("--network")), "{args:?}");
         assert!(
             args.contains(
                 &"--mount=type=bind,source=/src/app,target=/home/dev/workspace/repomount,readonly"
@@ -569,7 +555,6 @@ mod tests {
             "--env=HTTPS_PROXY=http://127.0.0.1:3128",
             "--env=http_proxy=http://127.0.0.1:3128",
             "--env=NO_PROXY=localhost,127.0.0.1,::1",
-            "--env=MISE_OFFLINE=1",
         ] {
             assert!(
                 args.contains(&expected.to_owned()),
@@ -659,6 +644,7 @@ mod tests {
             volumes: vec![Volume {
                 name: "podbay-x-tmp".into(),
                 container: "/tmp".into(),
+                provision: false,
                 profile: "x".into(),
             }],
             ..Default::default()
@@ -671,8 +657,9 @@ mod tests {
     fn rejects_duplicate_targets() {
         let profile = ResolvedProfile {
             volumes: vec![Volume {
-                name: "podbay-x-mise".into(),
-                container: MISE_DATA.into(),
+                name: "podbay-x-src".into(),
+                container: WORKSPACE.into(),
+                provision: false,
                 profile: "x".into(),
             }],
             ..Default::default()

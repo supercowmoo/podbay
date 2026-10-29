@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck base/entrypoint.sh tests/fixtures/test-base/mise
+      - run: shellcheck base/entrypoint.sh tests/fixtures/test-base/probe-install
 
   base-image:
     name: bundled base image builds

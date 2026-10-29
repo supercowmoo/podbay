@@ -1,0 +1,22 @@
+#!/bin/sh
+# Stand-in for a toolchain manager in the test image. Used as a profile's
+# [provision] command, it records what the provisioning container could see
+# and reach into the directory it's given, which should be a volume.
+set -e
+dest=$1
+if touch .podbay-probe 2>/dev/null; then
+  rm -f .podbay-probe
+  project="writable"
+else
+  project="readonly"
+fi
+if [ -e /home/dev/.secret ]; then secret=mounted; else secret=absent; fi
+{
+  # shellcheck disable=SC2012 # interface names are plain
+  echo "network=$(ls /sys/class/net | tr '\n' ' ')"
+  echo "project=$project"
+  echo "secret=$secret"
+  echo "env=${E2E_TOOLS:-unset}"
+  echo "versions=$(cat .tool-versions 2>/dev/null)"
+} > "$dest/provisioned"
+echo x >> "$dest/installs"

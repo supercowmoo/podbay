@@ -3,21 +3,28 @@
 # Run with:  podbay run --profile {name} <project>
 # Inspect:   podbay profile show {name}
 
-# Profiles to build on. Their mounts, volumes, tools and extensions are
-# applied first; entries here win when they target the same container path
-# or tool.
+# Profiles to build on. Their settings are applied first; entries here win
+# when they target the same container path or variable.
 {extends}
 
 # Optional root build script, relative to this directory. It is baked into a
-# derived image and run as root at build time, for system packages mise
-# cannot install. It is never read from the project you mount.
+# derived image and run as root at build time, for system packages (zsh,
+# fish, libraries) or a toolchain manager itself. It is never read from the
+# project you mount.
 # extension = "{name}.sh"
+
+# Shell for interactive sessions, started as a login shell. The image must
+# have it (see extension). Default: bash.
+# shell = "zsh"
+
+# Directories put in front of PATH, for tools installed into volumes.
+# path = ["/home/dev/.cargo/bin"]
 
 # Network access for the session. "none" (default) is loopback only. A list
 # of hosts allows HTTPS to just those, through podbay's proxy; "*.x.com"
 # covers every name below x.com, and ":port" changes the port from 443.
 # Lists add to the ones in profiles this extends. "full" is everything, and
-# podbay warns on every run with it. Tool installs need none of this.
+# podbay warns on every run with it. [provision] needs none of this.
 #
 # network = ["api.anthropic.com", "*.githubusercontent.com"]
 # network = "full"
@@ -28,8 +35,10 @@
 # cap_add = ["SYS_PTRACE"]
 
 # Bind mounts from the host. Best for files you edit on the host, such as
-# dotfiles. mode is "ro" (default) or "rw". A missing host path is skipped
-# with a warning.
+# dotfiles. mode is "ro" (default) or "rw". Keep anything your host runs
+# (shell rc files, toolchain directories) read-only: a session that can
+# write it can run code on your host. A missing host path is skipped with a
+# warning.
 #
 # [[mount]]
 # host = "~/.gitconfig"
@@ -39,18 +48,34 @@
 # The home directory is a fresh tmpfs every session.
 #
 # Named volumes that persist across runs, for state the container writes:
-# tool config, auth, caches. Stored as podbay-{name}-<name>.
+# toolchains, tool config, auth, caches. Stored as podbay-{name}-<name>.
+# provision = true also mounts it while provisioning, for installed tools;
+# leave it off for anything holding credentials.
 #
 # [[volume]]
 # name = "opencode-config"
 # container = "/home/dev/.config/opencode"
-
-# Tools mise installs for every project, on top of what the project asks
-# for. They are installed in a provisioning step before the session starts.
 #
-# [tools]
-# opencode = "latest"
-# node = "22"
+# [[volume]]
+# name = "rustup"
+# container = "/home/dev/.rustup"
+# provision = true
+
+# Environment for the session and provisioning. Set PATH with `path` above.
+#
+# [env]
+# RUSTUP_HOME = "/home/dev/.rustup"
+# CARGO_HOME = "/home/dev/.cargo"
+
+# A command that installs tools, with whatever toolchain manager you use.
+# It runs before the session in a separate container with network access,
+# the project read-only, and only the provision volumes and [env]. It runs
+# again when the image, this setting or a watched project file changes.
+# Commands from profiles this extends run first.
+#
+# [provision]
+# command = "rustup toolchain install"
+# watch = ["rust-toolchain.toml"]
 
 # Resource limits, overriding config.toml. pids = 0 means no limit.
 #

@@ -19,8 +19,8 @@ pub enum Command {
     Run(RunArgs),
     /// Build (or rebuild) the images a profile needs.
     Build(BuildArgs),
-    /// Install a project's tools now, with network access. `run` does this
-    /// by itself when the tools it needs changed.
+    /// Run the profile's [provision] commands now, with network access.
+    /// `run` does this by itself when what they depend on changed.
     Provision(ProvisionArgs),
     /// Manage profiles.
     #[command(subcommand)]
@@ -41,8 +41,8 @@ pub struct EngineArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Keep this project's mise installs in a private cache instead of the
-    /// shared volume. Use for code you do not trust.
+    /// Give this project its own copies of the profile's provision volumes
+    /// instead of sharing them. Use for code you do not trust.
     #[arg(long)]
     pub local_cache: bool,
     /// Network access for the session, overriding any allowlist
@@ -54,7 +54,8 @@ pub struct RunArgs {
     pub dry_run: bool,
     /// Project directory to mount [default: current directory]
     pub project: Option<PathBuf>,
-    /// Command to run instead of the image's login shell.
+    /// Command to run instead of a login shell (the profile's `shell`, else
+    /// bash).
     #[arg(last = true)]
     pub command: Vec<String>,
 }
@@ -63,8 +64,8 @@ pub struct RunArgs {
 pub struct ProvisionArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Install into this project's private cache, as `run --local-cache`
-    /// uses, instead of the shared volume.
+    /// Install into this project's own copies of the provision volumes, as
+    /// `run --local-cache` uses, instead of the shared ones.
     #[arg(long)]
     pub local_cache: bool,
     /// Print the engine command instead of running it. Builds nothing.

@@ -11,10 +11,9 @@ use crate::backend::{Backend, BackendKind, Identity};
 use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
 use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
 use crate::egress;
-use crate::hash::sha256_hex;
 use crate::image::{self, Action, BaseImage, LayerSource};
 use crate::paths::Paths;
-use crate::plan::{self, MiseData, Net, RunPlan};
+use crate::plan::{self, Net, RunPlan};
 use crate::profile::{self, ResolvedProfile};
 use crate::provision;
 use crate::repo_key::repo_key;
@@ -120,7 +119,7 @@ impl Setup {
 }
 
 /// What both a session and provisioning need: the project, its profile,
-/// the image, and where mise keeps its tools.
+/// and the image.
 struct Prepared {
     backend: crate::backend::Cli,
     project: PathBuf,
@@ -130,9 +129,8 @@ struct Prepared {
     image: String,
     actions: Vec<Action>,
     limits: Limits,
-    mise_data: MiseData,
-    /// The generated mise config with the profile's tools, and its text.
-    mise_config: Option<(PathBuf, String)>,
+    /// `--local-cache`: provision volumes are this project's own copies.
+    local_cache: bool,
 }
 
 impl Prepared {
@@ -153,7 +151,10 @@ impl Prepared {
         }
         let key = repo_key(&project);
 
-        let profile = ctx.profile(engine)?;
+        let mut profile = ctx.profile(engine)?;
+        if local_cache {
+            profile.localize_provision_volumes(&key);
+        }
         let identity = backend.identity()?;
         for note in &identity.notes {
             eprintln!("podbay: note: {note}");
@@ -165,17 +166,6 @@ impl Prepared {
 
         let limits = applicable_limits(&backend, ctx.limits(&profile), &ctx.config.limits)?;
 
-        let mise_data = if local_cache {
-            let dir = ctx.paths.cache_dir.join("mise").join(&key);
-            if !dry_run {
-                fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            }
-            MiseData::Local(dir)
-        } else {
-            MiseData::Shared
-        };
-        let mise_config = mise_config(&ctx.paths, &profile.tools, dry_run)?;
-
         Ok(Self {
             backend,
             project,
@@ -185,8 +175,7 @@ impl Prepared {
             image,
             actions,
             limits,
-            mise_data,
-            mise_config,
+            local_cache,
         })
     }
 
@@ -196,30 +185,21 @@ impl Prepared {
 
     /// The provisioning fingerprint, or `None` if there's nothing to install.
     fn fingerprint(&self) -> Option<String> {
-        provision::fingerprint(
-            &self.project,
-            &provision::Inputs {
-                image: &self.image,
-                mise_data: &self.mise_data,
-                tools: self.mise_config.as_ref().map(|(_, text)| text.as_str()),
-            },
-        )
+        provision::fingerprint(&self.project, &self.image, &self.profile, self.local_cache)
     }
 
     /// A container that installs the project's tools: network on, the
-    /// project read-only, and none of the profile's mounts, volumes or
-    /// capabilities.
+    /// project read-only, the provision volumes and the profile's
+    /// environment, and none of its other mounts, volumes or capabilities.
     fn provision_plan(&self) -> Result<RunPlan> {
         RunPlan::build(plan::Inputs {
             image: self.image.clone(),
             project: self.project.clone(),
             project_readonly: true,
             repo_key: &self.key,
-            profile: &ResolvedProfile::default(),
+            profile: &self.profile.for_provisioning(),
             identity: &self.identity,
-            mise_data: self.mise_data.clone(),
-            mise_config: self.mise_config.as_ref().map(|(path, _)| path.clone()),
-            command: vec!["sh".into(), "-c".into(), provision::COMMAND.into()],
+            command: vec!["sh".into(), "-c".into(), provision::script(&self.profile)],
             tty: is_tty(),
             caps: &[],
             limits: &self.limits,
@@ -244,7 +224,7 @@ impl Prepared {
         if status.success()
             && let Some(fingerprint) = fingerprint
         {
-            provision::record(&ctx.paths, &self.key, &self.mise_data, fingerprint)?;
+            provision::record(&ctx.paths, &self.key, self.local_cache, fingerprint)?;
         }
         Ok(status)
     }
@@ -324,8 +304,6 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         repo_key: &prep.key,
         profile,
         identity: &prep.identity,
-        mise_data: prep.mise_data.clone(),
-        mise_config: prep.mise_config.as_ref().map(|(path, _)| path.clone()),
         command: args.command,
         tty: is_tty(),
         caps: &caps,
@@ -337,7 +315,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
 
     let due = prep
         .fingerprint()
-        .filter(|f| provision::is_due(&ctx.paths, &prep.key, &prep.mise_data, f));
+        .filter(|f| provision::is_due(&ctx.paths, &prep.key, prep.local_cache, f));
 
     if args.dry_run {
         if prep.actions.contains(&Action::Build) {
@@ -556,28 +534,6 @@ fn applicable_limits(
     Ok(limits)
 }
 
-/// Writes the profile's tools as a mise config file, named by its content so
-/// concurrent sessions with different profiles never overwrite each other.
-fn mise_config(
-    paths: &Paths,
-    tools: &toml::Table,
-    dry_run: bool,
-) -> Result<Option<(PathBuf, String)>> {
-    if tools.is_empty() {
-        return Ok(None);
-    }
-    let mut doc = toml::Table::new();
-    doc.insert("tools".into(), toml::Value::Table(tools.clone()));
-    let text = toml::to_string(&doc)?;
-    let dir = paths.cache_dir.join("mise-config");
-    let file = dir.join(format!("{}.toml", &sha256_hex(text.as_bytes())[..16]));
-    if !dry_run && !file.exists() {
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::write(&file, &text).with_context(|| format!("writing {}", file.display()))?;
-    }
-    Ok(Some((file, text)))
-}
-
 pub fn provision(args: ProvisionArgs) -> Result<ExitCode> {
     let ctx = Setup::load()?;
     let prep = Prepared::new(
@@ -587,6 +543,10 @@ pub fn provision(args: ProvisionArgs) -> Result<ExitCode> {
         args.local_cache,
         args.dry_run,
     )?;
+    if prep.profile.provision.is_empty() {
+        eprintln!("podbay: the profile has no [provision] command; nothing to provision");
+        return Ok(ExitCode::SUCCESS);
+    }
     if args.dry_run {
         if prep.actions.contains(&Action::Build) {
             eprintln!("podbay: images would be built first; see `podbay build`");
@@ -682,15 +642,34 @@ fn describe(
 
     out.push_str("\nvolumes:\n");
     for v in &p.volumes {
+        let provision = if v.provision { "provision, " } else { "" };
         out.push_str(&format!(
-            "  {} -> {}  (from {})\n",
+            "  {} -> {}  ({provision}from {})\n",
             v.name, v.container, v.profile
         ));
     }
 
-    out.push_str("\ntools:\n");
-    for (tool, version) in &p.tools {
-        out.push_str(&format!("  {tool} = {version}\n"));
+    out.push_str(&format!(
+        "\nshell: {}\n",
+        p.shell.as_deref().unwrap_or("image default")
+    ));
+
+    out.push_str("\nenv:\n");
+    for (k, v) in &p.env {
+        out.push_str(&format!("  {k} = {v}\n"));
+    }
+
+    out.push_str("\npath:\n");
+    for dir in &p.path {
+        out.push_str(&format!("  {dir}\n"));
+    }
+
+    out.push_str("\nprovision:\n");
+    for step in &p.provision {
+        out.push_str(&format!("  {}  (from {})\n", step.command, step.profile));
+    }
+    if !p.watch.is_empty() {
+        out.push_str(&format!("  watching {}\n", p.watch.join(", ")));
     }
 
     out.push_str("\ncapabilities:\n");

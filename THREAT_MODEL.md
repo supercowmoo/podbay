@@ -23,8 +23,8 @@ In rough order of value:
    sessions, tokens in your shell environment.
 3. **Secrets you mount in**: whatever your profile shares (a `~/.gitconfig`,
    an agent's auth volume).
-4. **Other projects**, and the state podbay shares between projects (mise
-   tools, profile volumes).
+4. **Other projects**, and the state podbay shares between projects
+   (provisioned toolchains, profile volumes).
 5. **The project itself.** It's mounted read-write by design. Damage to it is
    in scope only where it turns into one of the above.
 
@@ -47,7 +47,7 @@ sources.
 | Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, kernel | See "Privilege inside the container" |
 | Container to host files | Only declared mounts are visible | The project is read-write |
 | Container to network | `--network=none`, or a relay and podbay's allowlist | A profile can still opt into full access |
-| Provisioning to network | **Not enforced** | Runs project-chosen installers; see "Provisioning" |
+| Provisioning to network | **Not enforced** | Runs your installers on project-chosen versions; see "Provisioning" |
 | Project to image build | Extensions are read only from your config dir | A project can never add root build steps |
 | Session to session | `--rm`, per-profile volumes | Some state is shared, see below |
 | Container output to host | Session report, escaping | See "The project as a channel" |
@@ -176,20 +176,26 @@ run git; it does not stop anything.
     podbay warns on every run that has it.
   - Provisioning, below.
 - **Provisioning (stage 4).** Tools are installed before the session, in a
-  container with full network access that runs `mise install`. It gets the
-  project read-only, the mise data directory and the profile's tool list,
-  and nothing else: no profile mounts, no volumes, no `cap_add`, the same
-  hardening as a session otherwise. What it installs is chosen by the
-  project's mise and version files, and mise backends and hooks can run
-  code at install time, so this container can send the project's contents
-  out. That's the non-goal below rather than a new exposure, but it means a
-  project can reach the network once per change to those files, without a
-  session having network access. A session can trigger this for the next
-  run by editing those files, and the next run says so when it
-  provisions. A `mise.toml` still has to be trusted first.
-  Provisioning writes to the mise data directory, so the shared-volume
-  caveat under "Shared state" applies to it; with `--local-cache` the
-  writes stay in that project's cache.
+  container with full network access that runs the profile's `[provision]`
+  commands. The commands come only from your config directory. The
+  container gets the project read-only, the volumes marked
+  `provision = true`, and the profile's `[env]` and `path`, and nothing
+  else: no bind mounts, no other volumes, no `cap_add`, the same hardening
+  as a session otherwise. Which versions get installed is usually chosen by
+  project files (`rust-toolchain.toml`, `.nvmrc`, lockfiles), and many
+  installers run code at install time, so this container can send the
+  project's contents out. That's the non-goal below rather than a new
+  exposure, but it means a project can reach the network once per change
+  to the files the profile watches, without a session having network
+  access. A session can trigger this for the next run by editing those
+  files, and the next run says so when it provisions. Provisioning writes
+  to the provision volumes, so the shared-volume caveat under "Shared
+  state" applies to it; with `--local-cache` the writes stay in that
+  project's own copies.
+- **The profile's `path`.** Its directories usually live in volumes the
+  session can write. They apply only to the session's own processes: the
+  entrypoint resolves everything it runs as root from the image's PATH
+  before adding them.
 - **Privilege inside the container (reduced in stage 3).** The session
   runs as `dev` with an empty capability set, including the bounding set,
   and `no-new-privileges`. setuid binaries and file capabilities in the
@@ -222,10 +228,11 @@ run git; it does not stop anything.
 
 ## Shared state between projects
 
-- **`podbay-mise-data`**, the shared mise volume. A malicious project can
-  install or replace tools that other projects then run. Use
-  `--local-cache` for untrusted code. It keeps that project's installs in
-  `~/.cache/podbay/mise/<repo-key>/`.
+- **Provision volumes**, where toolchains are installed. A malicious
+  project can install or replace tools that later projects using the same
+  profile then run. Use `--local-cache` for untrusted code. It gives
+  that project its own copies of the provision volumes
+  (`podbay-<profile>-<name>-<repo-key>`).
 - **Profile volumes** are shared by every project run with that profile (and
   every profile that extends it). A malicious project can tamper with an
   agent's config or steal its credentials there, and that affects the next
@@ -238,5 +245,5 @@ run git; it does not stop anything.
 
 - Protecting the project from the code you run in it.
 - Hiding the project's contents from that code, or from the installers
-  its mise config chooses.
+  your provisioning commands run for it.
 - Defending against a malicious podbay config, base image or engine.

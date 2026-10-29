@@ -1,16 +1,22 @@
 # Minimal stand-in for the bundled base image: the same dev user layout and
-# entrypoint, without the network-heavy toolchain, and a fake mise that
+# entrypoint, without the network-heavy toolchain, and a fake installer that
 # records what provisioning saw. Used by the end-to-end tests via the
 # `base_image` config setting.
 FROM debian:trixie-slim
 RUN useradd -m -u 1000 -U -s /bin/bash dev \
-  && mkdir -p /home/dev/workspace /home/dev/.config/mise /home/dev/.local/share/mise \
+  && mkdir -p /home/dev/workspace \
   && chown -R dev:dev /home/dev \
   && mkdir -p /usr/local/share/podbay \
   && cp -a /home/dev /usr/local/share/podbay/home
+# Same as the bundled image: login shells get the profile's `path` back.
+RUN printf '%s\n' \
+    'if [ -n "${PODBAY_PATH:-}" ]; then' \
+    '  case ":$PATH:" in *":$PODBAY_PATH:"*) ;; *) PATH="$PODBAY_PATH:$PATH" ;; esac' \
+    '  export PATH' \
+    'fi' > /etc/profile.d/podbay-path.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY mise /usr/local/bin/mise
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/mise
+COPY probe-install /usr/local/bin/probe-install
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/probe-install
 WORKDIR /home/dev/workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash", "-l"]

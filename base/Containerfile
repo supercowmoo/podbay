@@ -2,33 +2,26 @@ FROM debian:trixie-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    ca-certificates git curl unzip tar zsh build-essential gnupg \
+    ca-certificates git curl unzip xz-utils tar build-essential \
   && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/24853EC9F655CE80B48E6C3A8B81C9D17413A06D -o /tmp/mise.asc \
-  && gpg --batch --import /tmp/mise.asc \
-  && gpg --batch --fingerprint 24853EC9F655CE80B48E6C3A8B81C9D17413A06D >/dev/null \
-  && curl -fsSL https://mise.jdx.dev/install.sh.sig -o /tmp/mise-install.sig \
-  && gpg --batch --decrypt /tmp/mise-install.sig > /tmp/mise-install.sh \
-  && MISE_VERSION=v2026.8.14 MISE_INSTALL_PATH=/usr/local/bin/mise sh /tmp/mise-install.sh \
-  && rm -f /tmp/mise.asc /tmp/mise-install.sig /tmp/mise-install.sh
-
-RUN useradd -m -u 1000 -U -s /usr/bin/zsh dev \
+RUN useradd -m -u 1000 -U -s /bin/bash dev \
   && mkdir -p /home/dev/workspace \
-    /home/dev/.config/mise \
-    /home/dev/.local/share/mise \
-    /home/dev/.local/state/mise \
   && chown -R dev:dev /home/dev \
   && mkdir -p /usr/local/share/podbay \
   && cp -a /home/dev /usr/local/share/podbay/home
 
-RUN printf '\neval "$(mise activate zsh)"\n' >> /etc/zsh/zshrc
-
-ENV PATH="/home/dev/.local/share/mise/shims:${PATH}"
+# Login shells reset PATH from /etc/profile; put the profile's `path`
+# entries (PODBAY_PATH) back in front.
+RUN printf '%s\n' \
+    'if [ -n "${PODBAY_PATH:-}" ]; then' \
+    '  case ":$PATH:" in *":$PODBAY_PATH:"*) ;; *) PATH="$PODBAY_PATH:$PATH" ;; esac' \
+    '  export PATH' \
+    'fi' > /etc/profile.d/podbay-path.sh
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /home/dev/workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["zsh", "-l"]
+CMD ["bash", "-l"]

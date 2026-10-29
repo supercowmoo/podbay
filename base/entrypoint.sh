@@ -12,15 +12,28 @@
 #   PODBAY_CAPS               comma-separated capabilities to keep, such as
 #                             sys_ptrace (empty: none)
 #   PODBAY_WORKSPACE          directory to start in
+#   PODBAY_PATH               colon-separated directories to put in front
+#                             of PATH (the profile's `path`)
 set -euo pipefail
 
 workspace=${PODBAY_WORKSPACE:-/home/dev/workspace/repomount}
 skeleton=/usr/local/share/podbay/home
 
+# The profile's PATH entries apply to the session only. They usually point
+# into volumes the session can write, so nothing this script runs as root
+# may be looked up there.
+session_path() {
+  if [ -n "${PODBAY_PATH:-}" ]; then
+    export PATH="$PODBAY_PATH:$PATH"
+  fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
   cd "$workspace"
+  session_path
   exec "$@"
 fi
+setpriv=$(command -v setpriv)
 
 uid=${PODBAY_UID:-1000}
 gid=${PODBAY_GID:-1000}
@@ -85,11 +98,12 @@ own_mount_parents
 own_volume_paths
 
 cd "$workspace"
+session_path
 if [ "$uid" -eq 0 ]; then
   # Root inside a rootless engine: keep the uid, lose the capabilities.
-  exec setpriv --inh-caps="$caps" --bounding-set="$caps" -- "$@"
+  exec "$setpriv" --inh-caps="$caps" --bounding-set="$caps" -- "$@"
 fi
 # Dropping from root to dev clears every capability; kept ones come back
 # through the ambient set. The bounding set stops anything else returning.
-exec setpriv --reuid="$uid" --regid="$gid" --init-groups \
+exec "$setpriv" --reuid="$uid" --regid="$gid" --init-groups \
   --inh-caps="$caps" --ambient-caps="$caps" --bounding-set="$caps" -- "$@"

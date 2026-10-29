@@ -1,16 +1,19 @@
 //! Provisioning: installing a project's tools before the session starts.
 //!
-//! Sessions have no network by default, so mise can't download anything
-//! once they're running. Instead, a separate short-lived container with
-//! network access runs `mise install` first. It sees only what installing
-//! needs: the project, read-only, the mise data directory and the profile's
-//! tool list. Profile mounts and volumes, which may hold credentials, are
-//! left out.
+//! Profiles bring their own toolchain managers: a `[provision]` command
+//! (`rustup toolchain install`, `uv sync`, `nvm install`, ...) that installs
+//! into volumes marked `provision = true`. It runs in a separate short-lived
+//! container with network access, so tools are in place even when the
+//! session itself is offline. That container sees only what installing
+//! needs: the project, read-only, the provision volumes and the profile's
+//! environment. Bind mounts and other volumes, which may hold credentials,
+//! are left out.
 //!
 //! `podbay run` provisions automatically when anything that decides the
-//! installed tools changed since the last time: the image, the profile's
-//! tools, where mise data lives, or the project's mise files. That is
-//! tracked by a fingerprint stored per project under the cache directory.
+//! installed tools changed since the last time: the image, the commands,
+//! the provision volumes, the environment, or the project files the
+//! profile watches. That is tracked by a fingerprint stored per project
+//! under the cache directory.
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -21,94 +24,79 @@ use anyhow::{Context, Result};
 
 use crate::hash::sha256_hex_fields;
 use crate::paths::Paths;
-use crate::plan::MiseData;
-
-/// Project files mise reads its tool versions from: its own config files and
-/// the idiomatic version files of common languages. Tools configured
-/// anywhere else need an explicit `podbay provision`.
-const PROJECT_FILES: &[&str] = &[
-    "mise.toml",
-    "mise.local.toml",
-    ".mise.toml",
-    ".mise.local.toml",
-    "mise/config.toml",
-    ".mise/config.toml",
-    ".config/mise.toml",
-    ".config/mise/config.toml",
-    ".tool-versions",
-    ".nvmrc",
-    ".node-version",
-    ".bun-version",
-    ".python-version",
-    ".python-versions",
-    ".ruby-version",
-    ".go-version",
-    ".java-version",
-    ".sdkmanrc",
-    ".terraform-version",
-    "rust-toolchain",
-    "rust-toolchain.toml",
-];
-
-/// Directories whose `*.toml` files mise also loads.
-const PROJECT_DIRS: &[&str] = &[".config/mise/conf.d"];
+use crate::profile::ResolvedProfile;
 
 /// Files larger than this are fingerprinted by size alone.
 const MAX_READ: u64 = 1 << 20;
 
-/// The command provisioning runs. Images without mise (a custom base image)
-/// have nothing to provision.
-pub const COMMAND: &str = "if command -v mise >/dev/null 2>&1; then exec mise install; fi; \
-     echo 'podbay: the image has no mise; nothing to provision' >&2";
+/// Entries of a watched directory beyond this are ignored.
+const MAX_DIR_ENTRIES: usize = 1_000;
 
-/// What decides which tools a session gets.
-pub struct Inputs<'a> {
-    pub image: &'a str,
-    pub mise_data: &'a MiseData,
-    /// The generated mise config with the profile's tools, if any.
-    pub tools: Option<&'a str>,
+/// The shell script provisioning runs: every step in order, stopping at the
+/// first that fails.
+pub fn script(profile: &ResolvedProfile) -> String {
+    let mut out = "set -e\n".to_owned();
+    for step in &profile.provision {
+        out.push_str(&step.command);
+        out.push('\n');
+    }
+    out
 }
 
 /// The fingerprint of everything provisioning depends on, or `None` when
-/// there's nothing to install: no profile tools and no project mise files.
-pub fn fingerprint(project: &Path, inputs: &Inputs<'_>) -> Option<String> {
-    let files = project_files(project);
-    if files.is_empty() && inputs.tools.is_none() {
+/// the profile has nothing to provision. `local` is `--local-cache`, which
+/// installs into the project's own copies of the provision volumes.
+pub fn fingerprint(
+    project: &Path,
+    image: &str,
+    profile: &ResolvedProfile,
+    local: bool,
+) -> Option<String> {
+    if profile.provision.is_empty() {
         return None;
     }
-    let data = match inputs.mise_data {
-        MiseData::Shared => "shared".to_owned(),
-        MiseData::Local(dir) => format!("local:{}", dir.display()),
-    };
-    let mut fields: Vec<&[u8]> = vec![
-        inputs.image.as_bytes(),
-        data.as_bytes(),
-        inputs.tools.unwrap_or_default().as_bytes(),
+    let mut fields: Vec<Vec<u8>> = vec![
+        image.into(),
+        if local { "local" } else { "shared" }.into(),
+        script(profile).into(),
+        profile.path.join(":").into(),
     ];
-    for (rel, state) in &files {
-        fields.push(rel.as_bytes());
+    for (k, v) in &profile.env {
+        fields.push(format!("env:{k}").into());
+        fields.push(v.as_bytes().to_vec());
+    }
+    for v in profile.volumes.iter().filter(|v| v.provision) {
+        fields.push(format!("volume:{}:{}", v.name, v.container).into());
+    }
+    for (rel, state) in watched_files(project, &profile.watch) {
+        fields.push(rel.into());
         fields.push(state);
     }
+    let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
     Some(sha256_hex_fields(&fields))
 }
 
-/// The project's mise files and their state, by relative path.
-fn project_files(project: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut rels: Vec<String> = PROJECT_FILES.iter().map(|&r| r.to_owned()).collect();
-    for dir in PROJECT_DIRS {
-        if !no_symlinks_below(project, Path::new(dir)) {
+/// The watched files and their state, by relative path. A watched directory
+/// stands for the files directly in it.
+fn watched_files(project: &Path, watch: &[String]) -> Vec<(String, Vec<u8>)> {
+    let mut rels: Vec<String> = Vec::new();
+    for rel in watch {
+        let path = Path::new(rel);
+        let is_dir = no_symlinks_below(project, path);
+        if !is_dir {
+            rels.push(rel.clone());
             continue;
         }
-        let Ok(entries) = fs::read_dir(project.join(dir)) else {
+        let Ok(entries) = fs::read_dir(project.join(path)) else {
             continue;
         };
         let mut names: Vec<String> = entries
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".toml"))
-            .take(1_000)
+            .take(MAX_DIR_ENTRIES)
             .collect();
         names.sort();
+        let dir = rel.trim_end_matches('/');
         rels.extend(names.into_iter().map(|n| format!("{dir}/{n}")));
     }
     rels.into_iter()
@@ -176,12 +164,9 @@ fn read_nofollow(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 /// Where the fingerprint of the last successful provisioning is kept. The
-/// shared and local mise data are provisioned separately.
-fn stamp_file(paths: &Paths, repo_key: &str, mise_data: &MiseData) -> PathBuf {
-    let kind = match mise_data {
-        MiseData::Shared => "shared",
-        MiseData::Local(_) => "local",
-    };
+/// shared volumes and the project's own copies are provisioned separately.
+fn stamp_file(paths: &Paths, repo_key: &str, local: bool) -> PathBuf {
+    let kind = if local { "local" } else { "shared" };
     paths
         .cache_dir
         .join("provisioned")
@@ -189,20 +174,15 @@ fn stamp_file(paths: &Paths, repo_key: &str, mise_data: &MiseData) -> PathBuf {
 }
 
 /// True unless the last successful provisioning had this fingerprint.
-pub fn is_due(paths: &Paths, repo_key: &str, mise_data: &MiseData, fingerprint: &str) -> bool {
-    match fs::read_to_string(stamp_file(paths, repo_key, mise_data)) {
+pub fn is_due(paths: &Paths, repo_key: &str, local: bool, fingerprint: &str) -> bool {
+    match fs::read_to_string(stamp_file(paths, repo_key, local)) {
         Ok(previous) => previous.trim() != fingerprint,
         Err(_) => true,
     }
 }
 
-pub fn record(
-    paths: &Paths,
-    repo_key: &str,
-    mise_data: &MiseData,
-    fingerprint: &str,
-) -> Result<()> {
-    let file = stamp_file(paths, repo_key, mise_data);
+pub fn record(paths: &Paths, repo_key: &str, local: bool, fingerprint: &str) -> Result<()> {
+    let file = stamp_file(paths, repo_key, local);
     let dir = file.parent().expect("stamp files live in a directory");
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     fs::write(&file, format!("{fingerprint}\n"))
@@ -213,57 +193,84 @@ pub fn record(
 mod tests {
     use super::*;
     use crate::paths::test_paths;
+    use crate::profile::{ProvisionStep, Volume};
     use std::os::unix::fs::symlink;
 
     const IMAGE: &str = "img:1";
 
-    fn print(project: &Path, tools: Option<&str>) -> Option<String> {
-        fingerprint(
-            project,
-            &Inputs {
-                image: IMAGE,
-                mise_data: &MiseData::Shared,
-                tools,
-            },
-        )
+    fn profile(watch: &[&str]) -> ResolvedProfile {
+        ResolvedProfile {
+            provision: vec![ProvisionStep {
+                command: "install".into(),
+                profile: "p".into(),
+            }],
+            watch: watch.iter().map(|&w| w.to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn print(project: &Path, profile: &ResolvedProfile) -> Option<String> {
+        fingerprint(project, IMAGE, profile, false)
     }
 
     #[test]
-    fn nothing_to_install() {
+    fn script_runs_every_step() {
+        let mut p = profile(&[]);
+        p.provision.push(ProvisionStep {
+            command: "second && third".into(),
+            profile: "q".into(),
+        });
+        assert_eq!(script(&p), "set -e\ninstall\nsecond && third\n");
+    }
+
+    #[test]
+    fn nothing_to_provision() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("README"), "hi").unwrap();
-        assert_eq!(print(dir.path(), None), None);
-        assert!(print(dir.path(), Some("[tools]\nnode = \"22\"\n")).is_some());
+        fs::write(dir.path().join("rust-toolchain.toml"), "x").unwrap();
+        assert_eq!(print(dir.path(), &ResolvedProfile::default()), None);
+        assert!(print(dir.path(), &profile(&[])).is_some());
     }
 
     #[test]
-    fn follows_project_files() {
+    fn follows_watched_files() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
+        let prof = profile(&[".tool-versions", "conf.d"]);
         fs::write(p.join(".tool-versions"), "node 22\n").unwrap();
-        let first = print(p, None).unwrap();
-        assert_eq!(print(p, None).unwrap(), first);
+        let first = print(p, &prof).unwrap();
+        assert_eq!(print(p, &prof).unwrap(), first);
 
         fs::write(p.join(".tool-versions"), "node 24\n").unwrap();
-        let second = print(p, None).unwrap();
+        let second = print(p, &prof).unwrap();
         assert_ne!(second, first);
 
-        fs::create_dir_all(p.join(".config/mise/conf.d")).unwrap();
-        fs::write(p.join(".config/mise/conf.d/extra.toml"), "").unwrap();
-        assert_ne!(print(p, None).unwrap(), second);
+        fs::create_dir_all(p.join("conf.d")).unwrap();
+        fs::write(p.join("conf.d/extra.toml"), "").unwrap();
+        let third = print(p, &prof).unwrap();
+        assert_ne!(third, second);
 
-        // A different image or tool list needs its own install.
-        let tools = print(p, Some("[tools]\nx = \"1\"\n")).unwrap();
-        let local = fingerprint(
-            p,
-            &Inputs {
-                image: IMAGE,
-                mise_data: &MiseData::Local("/c/mise/app".into()),
-                tools: Some("[tools]\nx = \"1\"\n"),
-            },
-        )
-        .unwrap();
-        assert_ne!(tools, local);
+        // Unwatched files don't matter.
+        fs::write(p.join("README"), "hi").unwrap();
+        assert_eq!(print(p, &prof).unwrap(), third);
+
+        // Commands, environment, provision volumes, the cache choice and
+        // the image all count.
+        let mut other = prof.clone();
+        other.provision[0].command = "install --all".into();
+        assert_ne!(print(p, &other).unwrap(), third);
+        let mut other = prof.clone();
+        other.env.insert("RUSTUP_HOME".into(), "/x".into());
+        assert_ne!(print(p, &other).unwrap(), third);
+        let mut other = prof.clone();
+        other.volumes.push(Volume {
+            name: "podbay-p-rustup".into(),
+            container: "/home/dev/.rustup".into(),
+            provision: true,
+            profile: "p".into(),
+        });
+        assert_ne!(print(p, &other).unwrap(), third);
+        assert_ne!(fingerprint(p, IMAGE, &prof, true).unwrap(), third);
+        assert_ne!(fingerprint(p, "img:2", &prof, false).unwrap(), third);
     }
 
     #[test]
@@ -272,33 +279,28 @@ mod tests {
         let p = dir.path().join("project");
         let outside = dir.path().join("outside");
         fs::create_dir_all(&p).unwrap();
-        fs::create_dir_all(outside.join("mise")).unwrap();
+        fs::create_dir_all(outside.join("conf")).unwrap();
         fs::write(outside.join("secret"), "one").unwrap();
-        fs::write(outside.join("mise/config.toml"), "one").unwrap();
+        fs::write(outside.join("conf/config.toml"), "one").unwrap();
         symlink(outside.join("secret"), p.join(".tool-versions")).unwrap();
-        symlink(outside.join("mise"), p.join("mise")).unwrap();
+        symlink(outside.join("conf"), p.join("conf")).unwrap();
+        let prof = profile(&[".tool-versions", "conf", "conf/config.toml"]);
 
-        let before = print(&p, None).unwrap();
+        let before = print(&p, &prof).unwrap();
         fs::write(outside.join("secret"), "two").unwrap();
-        fs::write(outside.join("mise/config.toml"), "two").unwrap();
-        assert_eq!(print(&p, None).unwrap(), before);
+        fs::write(outside.join("conf/config.toml"), "two").unwrap();
+        assert_eq!(print(&p, &prof).unwrap(), before);
     }
 
     #[test]
     fn stamps() {
         let dir = tempfile::tempdir().unwrap();
         let paths = test_paths(dir.path());
-        let data = MiseData::Shared;
-        assert!(is_due(&paths, "app-1", &data, "abc"));
-        record(&paths, "app-1", &data, "abc").unwrap();
-        assert!(!is_due(&paths, "app-1", &data, "abc"));
-        assert!(is_due(&paths, "app-1", &data, "def"));
-        assert!(is_due(
-            &paths,
-            "app-1",
-            &MiseData::Local("/x".into()),
-            "abc"
-        ));
-        assert!(is_due(&paths, "app-2", &data, "abc"));
+        assert!(is_due(&paths, "app-1", false, "abc"));
+        record(&paths, "app-1", false, "abc").unwrap();
+        assert!(!is_due(&paths, "app-1", false, "abc"));
+        assert!(is_due(&paths, "app-1", false, "def"));
+        assert!(is_due(&paths, "app-1", true, "abc"));
+        assert!(is_due(&paths, "app-2", false, "abc"));
     }
 }

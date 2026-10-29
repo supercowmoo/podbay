@@ -10,14 +10,21 @@
 //! container = "/home/dev/.gitconfig"
 //! mode = "ro"           # default
 //!
-//! [[volume]]
-//! name = "opencode-config"
-//! container = "/home/dev/.config/opencode"
-//!
-//! [tools]
-//! opencode = "latest"
-//!
+//! shell = "zsh"                  # login shell for interactive sessions
+//! path = ["/home/dev/.cargo/bin"] # prepended to PATH
 //! network = ["api.example.com"]   # or "full"; default "none"
+//!
+//! [env]
+//! RUSTUP_HOME = "/home/dev/.rustup"
+//!
+//! [[volume]]
+//! name = "rustup"
+//! container = "/home/dev/.rustup"
+//! provision = true      # also mounted while provisioning
+//!
+//! [provision]
+//! command = "rustup toolchain install"
+//! watch = ["rust-toolchain.toml"]
 //! ```
 
 use std::collections::HashSet;
@@ -41,8 +48,14 @@ struct ProfileFile {
     mounts: Vec<MountEntry>,
     #[serde(default, rename = "volume")]
     volumes: Vec<VolumeEntry>,
+    /// Removed along with mise; kept only to explain what replaced it.
+    tools: Option<toml::Value>,
+    shell: Option<String>,
     #[serde(default)]
-    tools: toml::Table,
+    env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    path: Vec<String>,
+    provision: Option<ProvisionEntry>,
     /// Capabilities the session keeps, such as "SYS_PTRACE".
     #[serde(default)]
     cap_add: Vec<String>,
@@ -73,6 +86,16 @@ enum Mode {
 struct VolumeEntry {
     name: String,
     container: String,
+    #[serde(default)]
+    provision: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionEntry {
+    command: String,
+    #[serde(default)]
+    watch: Vec<String>,
 }
 
 /// A bind mount from the host.
@@ -90,6 +113,15 @@ pub struct Mount {
 pub struct Volume {
     pub name: String,
     pub container: String,
+    /// Also mounted in the provisioning container, which installs into it.
+    pub provision: bool,
+    pub profile: String,
+}
+
+/// A provisioning command and the profile that declared it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionStep {
+    pub command: String,
     pub profile: String,
 }
 
@@ -101,13 +133,23 @@ pub struct Extension {
 }
 
 /// A profile with its `extends` chain flattened.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedProfile {
     /// Profiles in the order they were applied (ancestors first).
     pub chain: Vec<String>,
     pub mounts: Vec<Mount>,
     pub volumes: Vec<Volume>,
-    pub tools: toml::Table,
+    /// Shell started when no command is given; the image's default if unset.
+    pub shell: Option<String>,
+    /// Environment for the session and provisioning.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Directories put in front of PATH, highest priority first.
+    pub path: Vec<String>,
+    /// Commands provisioning runs, ancestors first.
+    pub provision: Vec<ProvisionStep>,
+    /// Project-relative files and directories whose changes mean the
+    /// provisioning commands must run again.
+    pub watch: Vec<String>,
     pub extensions: Vec<Extension>,
     /// Capabilities added back for the session, in the order declared.
     pub caps: Vec<Capability>,
@@ -118,6 +160,34 @@ pub struct ResolvedProfile {
     pub network: Vec<(NetworkSetting, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
+}
+
+impl ResolvedProfile {
+    /// What the provisioning container gets: the environment and the
+    /// provision volumes, none of the bind mounts, other volumes or
+    /// capabilities, and no shell.
+    pub fn for_provisioning(&self) -> Self {
+        Self {
+            chain: self.chain.clone(),
+            volumes: self
+                .volumes
+                .iter()
+                .filter(|v| v.provision)
+                .cloned()
+                .collect(),
+            env: self.env.clone(),
+            path: self.path.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Gives every provision volume a per-project name (`--local-cache`), so
+    /// a project's installs can't reach any other project.
+    pub fn localize_provision_volumes(&mut self, repo_key: &str) {
+        for v in self.volumes.iter_mut().filter(|v| v.provision) {
+            v.name = format!("{}-{repo_key}", v.name);
+        }
+    }
 }
 
 /// A Linux capability a profile adds back, by its name without `CAP_`.
@@ -223,6 +293,34 @@ pub fn validate_container_path(path: &str) -> Result<()> {
     }
     if path.split('/').any(|seg| seg == "..") {
         bail!("container path {path:?} must not contain '..'");
+    }
+    Ok(())
+}
+
+/// Environment variable names, minus the ones podbay sets itself.
+fn validate_env_name(name: &str) -> Result<()> {
+    let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        bail!("invalid environment variable name {name:?}");
+    }
+    if name == "PATH" {
+        bail!("set PATH with `path = [...]`, which adds to it instead of replacing it");
+    }
+    if name.starts_with("PODBAY_") {
+        bail!("{name} is reserved for podbay");
+    }
+    Ok(())
+}
+
+/// Paths in the project that provisioning watches: relative, and never
+/// leaving the project.
+fn validate_project_path(path: &str) -> Result<()> {
+    if path.is_empty() || path.starts_with('/') {
+        bail!("watch path {path:?} must be relative to the project");
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        bail!("watch path {path:?} must not contain '..'");
     }
     Ok(())
 }
@@ -355,12 +453,51 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProf
         out.volumes.push(Volume {
             name: format!("podbay-{name}-{}", entry.name),
             container: entry.container,
+            provision: entry.provision,
             profile: name.to_owned(),
         });
     }
 
-    for (tool, version) in profile.tools {
-        out.tools.insert(tool, version);
+    if profile.tools.is_some() {
+        bail!(
+            "[tools] is gone: podbay no longer bundles mise. Install tools with a \
+             [provision] command and keep them in a volume with provision = true"
+        );
+    }
+
+    if let Some(shell) = profile.shell {
+        if shell.is_empty() || shell.contains(char::is_whitespace) {
+            bail!("shell {shell:?} must be a program name or path, without spaces");
+        }
+        out.shell = Some(shell);
+    }
+
+    for (key, value) in profile.env {
+        validate_env_name(&key)?;
+        out.env.insert(key, value);
+    }
+
+    // A profile's own directories go in front of inherited ones.
+    for dir in profile.path.iter().rev() {
+        validate_container_path(dir)?;
+        out.path.retain(|d| d != dir);
+        out.path.insert(0, dir.clone());
+    }
+
+    if let Some(provision) = profile.provision {
+        if provision.command.trim().is_empty() {
+            bail!("[provision] command must not be empty");
+        }
+        for rel in provision.watch {
+            validate_project_path(&rel)?;
+            if !out.watch.contains(&rel) {
+                out.watch.push(rel);
+            }
+        }
+        out.provision.push(ProvisionStep {
+            command: provision.command,
+            profile: name.to_owned(),
+        });
     }
 
     for cap in &profile.cap_add {
@@ -492,10 +629,7 @@ mod tests {
             [[volume]]
             name = "oc"
             container = "/home/dev/.config/opencode"
-
-            [tools]
-            opencode = "latest"
-            node = { version = "22" }
+            provision = true
             "#,
         );
         let r = resolve(&f.paths, "ai").unwrap();
@@ -506,7 +640,7 @@ mod tests {
         assert_eq!(r.mounts[1].container, "/home/dev/#notacomment");
         assert!(!r.mounts[1].readonly);
         assert_eq!(r.volumes[0].name, "podbay-ai-oc");
-        assert_eq!(r.tools.len(), 2);
+        assert!(r.volumes[0].provision);
         assert_eq!(r.extensions[0].script, f.paths.profiles_dir().join("ai.sh"));
         assert!(r.warnings.is_empty());
     }
@@ -555,9 +689,6 @@ mod tests {
             [[volume]]
             name = "cfg"
             container = "/cfg"
-            [tools]
-            node = "20"
-            git = "latest"
             "#,
         )
         .profile(
@@ -568,8 +699,6 @@ mod tests {
             host = "~/b"
             container = "/shared"
             mode = "rw"
-            [tools]
-            node = "22"
             "#,
         );
         let r = resolve(&f.paths, "child").unwrap();
@@ -580,19 +709,99 @@ mod tests {
         // Volumes keep the namespace of the profile that declared them, so
         // every profile extending `base` shares the same volume.
         assert_eq!(r.volumes[0].name, "podbay-base-cfg");
-        assert_eq!(r.tools["node"].as_str(), Some("22"));
-        assert_eq!(r.tools["git"].as_str(), Some("latest"));
+        assert!(!r.volumes[0].provision);
+    }
+
+    #[test]
+    fn shell_env_path_and_provision_merge_down_the_chain() {
+        let f = Fixture::new();
+        f.profile(
+            "base",
+            r#"
+            shell = "zsh"
+            path = ["/opt/a", "/opt/shared"]
+            [env]
+            A = "1"
+            B = "base"
+            [provision]
+            command = "install-a"
+            watch = ["a.lock", "shared.lock"]
+            "#,
+        )
+        .profile(
+            "child",
+            r#"
+            extends = ["base"]
+            shell = "fish"
+            path = ["/opt/shared", "/opt/b"]
+            [env]
+            B = "child"
+            [provision]
+            command = "install-b"
+            watch = ["shared.lock", "conf.d"]
+            "#,
+        );
+        let r = resolve(&f.paths, "child").unwrap();
+        assert_eq!(r.shell.as_deref(), Some("fish"));
+        assert_eq!(r.path, ["/opt/shared", "/opt/b", "/opt/a"]);
+        assert_eq!(r.env["A"], "1");
+        assert_eq!(r.env["B"], "child");
+        let steps: Vec<(&str, &str)> = r
+            .provision
+            .iter()
+            .map(|s| (s.command.as_str(), s.profile.as_str()))
+            .collect();
+        assert_eq!(steps, [("install-a", "base"), ("install-b", "child")]);
+        assert_eq!(r.watch, ["a.lock", "shared.lock", "conf.d"]);
+    }
+
+    #[test]
+    fn rejects_bad_shell_env_path_and_watch() {
+        let f = Fixture::new();
+        for (name, body, needle) in [
+            (
+                "tools",
+                "[tools]\nnode = \"22\"\n",
+                "no longer bundles mise",
+            ),
+            ("shell", "shell = \"zsh -l\"\n", "without spaces"),
+            ("pathenv", "[env]\nPATH = \"/x\"\n", "path = [...]"),
+            ("reserved", "[env]\nPODBAY_UID = \"0\"\n", "reserved"),
+            ("envname", "[env]\n\"A-B\" = \"1\"\n", "invalid environment"),
+            ("relpath", "path = [\"bin\"]\n", "absolute"),
+            ("colon", "path = [\"/a:/b\"]\n", "must not contain"),
+            (
+                "abswatch",
+                "[provision]\ncommand = \"x\"\nwatch = [\"/etc\"]\n",
+                "relative",
+            ),
+            (
+                "upwatch",
+                "[provision]\ncommand = \"x\"\nwatch = [\"../x\"]\n",
+                "'..'",
+            ),
+            (
+                "empty",
+                "[provision]\ncommand = \" \"\n",
+                "must not be empty",
+            ),
+        ] {
+            f.profile(name, body);
+            let err = format!("{:#}", resolve(&f.paths, name).unwrap_err());
+            assert!(err.contains(needle), "{name}: {err}");
+        }
     }
 
     #[test]
     fn diamond_applies_shared_parent_once() {
         let f = Fixture::new();
-        f.profile("root", "[tools]\nx = \"1\"\n")
+        f.profile("root", "[provision]\ncommand = \"x\"\n")
             .profile("left", "extends = [\"root\"]\n")
             .profile("right", "extends = [\"root\"]\n")
             .profile("top", "extends = [\"left\", \"right\"]\n");
         let r = resolve(&f.paths, "top").unwrap();
         assert_eq!(r.chain, ["root", "left", "right", "top"]);
+        assert_eq!(r.provision.len(), 1);
     }
 
     #[test]

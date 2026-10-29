@@ -7,9 +7,11 @@ agents and code you don't fully trust, without handing them your machine.
 project is mounted read-write at `/home/dev/workspace/repomount`, and
 everything else is something you declared:
 
-- dotfiles mounted read-only
+- dotfiles mounted read-only, including your shell config
 - named volumes for state that should outlive the container
-- tools that mise installs on top of what the project asks for
+- your own toolchain managers (rustup, uv, nvm, nix, mise, ...), run by a
+  provisioning step into volumes
+- the shell you want, environment variables and PATH entries
 - optional root build scripts baked into a derived image
 - network access: none, HTTPS to the hosts you list, or everything
 
@@ -54,18 +56,18 @@ root on the host, and podbay says so on every run.
 podbay run ~/src/some-project
 ```
 
-The first run builds the bundled base image: Debian slim, a non-root `dev`
-user and mise, verified against its signing key. Before the session starts,
-podbay [provisions](#provisioning) the tools the project's own config
-(`.mise.toml`, `.nvmrc`, ...) and your profile ask for. The session itself
-has no network.
+The first run builds the bundled base image: Debian slim with git, curl,
+build-essential, bash and a non-root `dev` user. No language toolchains:
+profiles bring those, with whatever manager you already use, and podbay
+[provisions](#provisioning) them before the session starts. The session
+itself has no network unless you give it some.
 
 ```
 podbay run . -- make test     # run a command instead of a shell
 podbay run --dry-run .        # print the exact podman/docker command
 podbay run --network full .   # give this session the network
 podbay build                  # build or refresh the images ahead of time
-podbay provision .            # install or refresh the project's tools now
+podbay provision .            # run the profile's [provision] commands now
 ```
 
 podbay's exit code is the command's (or the shell's) exit code.
@@ -91,7 +93,7 @@ and gid.
   can't reach the internet, your LAN or the host. A profile can allow HTTPS
   to specific hosts (see [Network allowlist](#network-allowlist)), or turn
   on full access with `network = "full"`, which podbay warns about on every
-  run. Tool installs need neither; see [Provisioning](#provisioning).
+  run. Installing tools needs neither; see [Provisioning](#provisioning).
 - **Resources**: at most 4096 processes and threads by default. Memory and
   CPU limits are opt-in. Rootless engines can apply a limit only when
   systemd delegates that cgroup controller to your user. When it doesn't,
@@ -143,38 +145,67 @@ pinned Rust image, and is under 1 MB.
 
 ## Provisioning
 
-Sessions can't download tools, so podbay installs them first, in a separate
-short-lived container that runs `mise install`. That container has network
-access but sees only what installing needs: the project, read-only, the
-mise data directory and the profile's `[tools]`. Your profile's mounts,
-volumes and capabilities are left out, so credentials there never share a
-container with the network.
+podbay doesn't pick a toolchain manager for you. A profile names a command
+that installs tools, and volumes for them to live in:
+
+```toml
+# ~/.config/podbay/profiles/rust.toml
+path = ["/home/dev/.cargo/bin"]
+
+[env]
+RUSTUP_HOME = "/home/dev/.rustup"
+CARGO_HOME = "/home/dev/.cargo"
+
+[[volume]]
+name = "rustup"
+container = "/home/dev/.rustup"
+provision = true
+
+[[volume]]
+name = "cargo"
+container = "/home/dev/.cargo"
+provision = true
+
+[provision]
+command = """
+command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+rustup show active-toolchain || rustup toolchain install
+"""
+watch = ["rust-toolchain.toml", "rust-toolchain"]
+```
+
+The command runs with `sh -e` before the session, in a separate short-lived
+container. That container has network access but sees only what installing
+needs: the project, read-only, the volumes marked `provision = true`, and
+the profile's `[env]` and `path`. Bind mounts, other volumes and
+capabilities are left out, so credentials kept there never share a
+container with the network, even when the session itself is offline.
+Commands from every profile in the `extends` chain run in order, ancestors
+first.
 
 `podbay run` provisions by itself when anything that decides the tools
-changed since the last successful run: the image, the profile's tools,
-`--local-cache`, or the project's mise and version files (`mise.toml`,
-`.tool-versions`, `.nvmrc`, `.python-version`, `rust-toolchain.toml`, ...).
-It prints a line when it does. If provisioning fails, the session still
-starts, with a warning. Inside the session, mise runs with `MISE_OFFLINE`,
-so it uses what is installed instead of trying to download.
+changed since the last successful run: the image, the commands, the
+provision volumes, `[env]`, `path`, `--local-cache`, or a file listed in
+`watch`. A watched directory covers the files directly in it. podbay prints
+a line when it provisions. If provisioning fails, the session still starts,
+with a warning.
 
 Run `podbay provision` yourself to refresh tools pinned to `latest`, after
-removing the mise volume, or when tools come from somewhere podbay doesn't
-watch. It installs into the same place `run` would; pass `--local-cache` to
-match `run --local-cache`.
+removing a volume, or when tools come from files you don't watch. It
+installs into the same volumes `run` would; pass `--local-cache` to match
+`run --local-cache`.
 
-If the project has a `mise.toml`, mise asks you to trust it before it
-installs anything, as it does on the host. In a terminal the prompt appears
-during provisioning; without one, provisioning fails until you run
-`podbay provision` in a terminal. Version files such as `.tool-versions`
-need no trust.
+A toolchain manager itself can come from the provisioning command, as
+above, or from an [extension](#profiles) baked into the image. mise is just
+one more option: install it in an extension, give it a volume for
+`~/.local/share/mise`, and use `mise install` as the command.
 
 ## Session report
 
 When the container exits, podbay reports anything it changed that the host
 will act on later: git hooks, git config, the `.git` entry itself, nested
-repositories, and a few files that editors and shells run (`.envrc`,
-`.vscode/`, mise config).
+repositories, and a few files that editors and tools on the host run
+(`.envrc`, `.vscode/`, mise config).
 
 ```
 podbay: session report: 2 warnings, 1 notice
@@ -218,6 +249,17 @@ host = "~/.gitconfig"
 container = "/home/dev/.gitconfig"
 
 [[mount]]
+host = "~/.bashrc"
+container = "/home/dev/.bashrc"
+```
+
+```toml
+# ~/.config/podbay/profiles/zsh.toml: for zsh users. bash is the default.
+extends = ["base"]
+extension = "zsh.sh"       # apt-get install -y zsh
+shell = "zsh"              # started as a login shell when no command is given
+
+[[mount]]
 host = "~/.zshrc"
 container = "/home/dev/.zshrc"
 ```
@@ -226,12 +268,15 @@ container = "/home/dev/.zshrc"
 # ~/.config/podbay/profiles/ai.toml
 extends = ["base"]
 
-# Optional: a root build script for system packages mise can't install.
+# Optional: a root build script for system packages.
 # Relative to the profiles directory; must start with a shebang.
 extension = "ai.sh"
 
 # The agent calls its API, and nothing else.
 network = ["api.anthropic.com"]
+
+# Where the provisioned agent lives (see the last volume).
+path = ["/home/dev/.opencode/bin"]
 
 # Named volumes keep tool state across runs. Stored as podbay-ai-<name>.
 [[volume]]
@@ -242,9 +287,14 @@ container = "/home/dev/.config/opencode"
 name = "opencode-data"
 container = "/home/dev/.local/share/opencode"
 
-# Tools mise installs in every session, on top of the project's own.
-[tools]
-opencode = "latest"
+# The agent itself, installed into its own volume.
+[[volume]]
+name = "opencode-bin"
+container = "/home/dev/.opencode"
+provision = true
+
+[provision]
+command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/install | bash"
 ```
 
 ```toml
@@ -261,16 +311,20 @@ memory = "16g"
 ```
 
 With `extends`, ancestors are applied first. A later profile's mount or
-volume replaces an inherited one at the same container path, and its tools
-override inherited versions. `cap_add` lists are combined, `[limits]` keys
-override one at a time, and `network` host lists add up while `"none"` or
-`"full"` replaces what came before. Volumes keep the name of the profile that
+volume replaces an inherited one at the same container path, `[env]` keys
+and `shell` override inherited ones, and its `path` entries go in front of
+inherited ones. `[provision]` commands and `watch` lists, and `cap_add`
+lists, are combined. `[limits]` keys override one at a time, and `network`
+host lists add up while `"none"` or `"full"` replaces what came before. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
-**Mounts or volumes?** Use mounts for files you own and edit on the host. Use
-volumes for directories the container creates or writes into, since the home
-directory is wiped after every session. The engine creates a missing mount
-point's parent directories as root, and the entrypoint gives them to `dev`.
+**Mounts or volumes?** Use mounts for files you own and edit on the host, such
+as shell and git config. Use volumes for directories the container creates
+or writes into, such as toolchains, since the home directory is wiped after
+every session. Keep mounts of anything your host runs read-only: a
+read-write `~/.bashrc` or `~/.cargo` lets the session plant code that runs
+on your host. The engine creates a missing mount point's parent
+directories as root, and the entrypoint gives them to `dev`.
 
 **Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
 Each tag is a hash of the script and its parent image, so editing a script,
@@ -297,23 +351,23 @@ cpus = 4                     # default: no limit
 
 A custom base image must provide a `dev` user, `setpriv`, podbay's
 entrypoint, and a copy of `/home/dev` at `/usr/local/share/podbay/home` to
-seed the home directory from (see `base/Containerfile`). Without mise,
-provisioning does nothing.
+seed the home directory from (see `base/Containerfile`). For `path` to
+survive login shells, it also needs the `/etc/profile.d/podbay-path.sh`
+snippet from there.
 
 `PODBAY_CONFIG_DIR` and `PODBAY_CACHE_DIR` move podbay's config and cache
 directories without touching `HOME` or `XDG_*`. Rootless Podman uses those to
 find its own storage.
 
-## A note on mise and trust
+## Shared toolchains and trust
 
-mise can install tools from many sources, and some of its backends run
-arbitrary code at install time. By default, installed tools live in one
-shared volume (`podbay-mise-data`), so a malicious project could leave
-something behind that other projects then pick up. For code you don't trust,
-`--local-cache` keeps that project's installs in
-`~/.cache/podbay/mise/<repo-key>/`. Provisioning runs those installs with
-network access and the project visible, so review a project's mise config
-before trusting it.
+Provision volumes are shared by every project run with the profile that
+declared them, so tools installed for one project are there for the next.
+Installers run with network access and the project visible, and the project
+chooses versions through its watched files, so a malicious project could
+leave something behind in a shared volume that other projects then run. For
+code you don't trust, `--local-cache` gives that project its own copies of
+the provision volumes (`podbay-<profile>-<name>-<repo-key>`).
 
 ## Development
 
@@ -325,7 +379,7 @@ PODBAY_TEST_BACKEND=podman cargo test
 The end-to-end tests run real containers on Docker (or the engine named by
 `PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available. They
 use a small stand-in for the base image (`tests/fixtures/test-base`) with the
-same entrypoint and a fake `mise` that records what provisioning saw, so
+same entrypoint and a fake installer that records what provisioning saw, so
 they don't need to build the full toolchain. Two of them play a hostile
 session: one checks that the session report catches it, the other that the
 network allowlist holds. Set `PODBAY_TEST_INTERNET=1` to also check that an

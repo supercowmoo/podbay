@@ -41,8 +41,8 @@ fn build_test_base(engine: &str) {
     )
     .unwrap();
     fs::copy(
-        repo.join("tests/fixtures/test-base/mise"),
-        ctx.path().join("mise"),
+        repo.join("tests/fixtures/test-base/probe-install"),
+        ctx.path().join("probe-install"),
     )
     .unwrap();
     let status = StdCommand::new(engine)
@@ -75,6 +75,31 @@ impl Drop for Cleanup<'_> {
         let _ = StdCommand::new(self.engine)
             .args([self.kind, "rm", "--force", &self.name])
             .output();
+    }
+}
+
+/// Removes every volume whose name starts with `prefix` when dropped, for
+/// the per-project copies `--local-cache` makes.
+struct VolumeCleanup<'a> {
+    engine: &'a str,
+    prefix: String,
+}
+
+impl Drop for VolumeCleanup<'_> {
+    fn drop(&mut self) {
+        let Ok(out) = StdCommand::new(self.engine)
+            .args(["volume", "ls", "--quiet"])
+            .output()
+        else {
+            return;
+        };
+        for name in String::from_utf8_lossy(&out.stdout).lines() {
+            if name.starts_with(&self.prefix) {
+                let _ = StdCommand::new(self.engine)
+                    .args(["volume", "rm", "--force", name])
+                    .output();
+            }
+        }
     }
 }
 
@@ -117,6 +142,10 @@ fn session_round_trip() {
         format!(
             r#"
 extension = "{id}.sh"
+path = ["/opt/e2e/bin"]
+
+[env]
+E2E_VAR = "hello"
 
 [[mount]]
 host = {gitconfig:?}
@@ -125,9 +154,6 @@ container = "/home/dev/.gitconfig"
 [[volume]]
 name = "state"
 container = "/home/dev/.config/tool/state"
-
-[tools]
-node = "22"
 "#,
             gitconfig = home.join(".gitconfig"),
         ),
@@ -142,7 +168,9 @@ echo "marker=$(cat /etc/podbay-marker)"
 grep -q 'name = test' ~/.gitconfig && echo gitconfig=readable
 if (echo x >> ~/.gitconfig) 2>/dev/null; then echo gitconfig=writable; else echo gitconfig=readonly; fi
 touch ~/.config/tool/state/ok && echo volume=writable
-grep -q 'node = "22"' ~/.config/mise/config.toml && echo tools=present
+echo "var=$E2E_VAR"
+case "$PATH" in /opt/e2e/bin:*) echo path=prepended ;; *) echo "path=$PATH" ;; esac
+bash -lc 'case "$PATH" in /opt/e2e/bin:*) echo login-path=prepended ;; *) echo "login-path=$PATH" ;; esac'
 touch created-in-container
 "#;
 
@@ -185,7 +213,9 @@ touch created-in-container
         "gitconfig=readable",
         "gitconfig=readonly",
         "volume=writable",
-        "tools=present",
+        "var=hello",
+        "path=prepended",
+        "login-path=prepended",
     ] {
         assert!(
             out.contains(expected),
@@ -197,10 +227,6 @@ touch created-in-container
     // project belong to the host user.
     let created = fs::metadata(project.join("created-in-container")).unwrap();
     assert_eq!(created.uid(), rustix::process::getuid().as_raw());
-
-    // --local-cache keeps mise data in a per-project host directory.
-    let cache = root.join("cache/mise");
-    assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
 }
 
 #[test]
@@ -303,7 +329,7 @@ grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status && echo nnp=on
 grep '^CapEff' /proc/self/status | tr -d '\t'
 grep '^CapBnd' /proc/self/status | tr -d '\t'
 if touch /usr/podbay-probe 2>/dev/null; then echo rootfs=writable; else echo rootfs=readonly; fi
-test -f ~/.bashrc && test -d ~/.config/mise && echo home=seeded
+test -f ~/.bashrc && echo home=seeded
 touch ~/left-behind && echo home=writable
 printf '#!/bin/sh\necho tmp=exec\n' > /tmp/probe && chmod +x /tmp/probe && /tmp/probe
 echo "pids=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)"
@@ -346,7 +372,7 @@ test -e ~/left-behind && echo home=persisted || echo home=fresh
 }
 
 #[test]
-fn tools_are_provisioned_and_sessions_are_offline() {
+fn provisioning_runs_profile_commands_and_sessions_are_offline() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
@@ -361,10 +387,35 @@ fn tools_are_provisioned_and_sessions_are_offline() {
         format!("base_image = {TEST_BASE:?}\n"),
     )
     .unwrap();
-    let id = format!("e2enet{}", std::process::id());
+    let id = format!("e2eprov{}", std::process::id());
+    let _volumes = VolumeCleanup {
+        engine: &engine,
+        prefix: format!("podbay-{id}"),
+    };
     fs::write(
         profiles.join(format!("{id}.toml")),
-        "network = \"full\"\n[tools]\nnode = \"22\"\n",
+        r#"
+[env]
+E2E_TOOLS = "from-env"
+
+[[volume]]
+name = "tools"
+container = "/home/dev/.local/tools"
+provision = true
+
+[[volume]]
+name = "secret"
+container = "/home/dev/.secret"
+
+[provision]
+command = "probe-install /home/dev/.local/tools"
+watch = [".tool-versions"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        profiles.join(format!("{id}-online.toml")),
+        format!("extends = [\"{id}\"]\nnetwork = \"full\"\n"),
     )
     .unwrap();
     fs::write(project.join(".tool-versions"), "node 22\n").unwrap();
@@ -389,19 +440,24 @@ fn tools_are_provisioned_and_sessions_are_offline() {
     };
     let session = r#"
 echo "session-network=$(ls /sys/class/net | tr '\n' ' ')"
-echo "offline=${MISE_OFFLINE:-unset}"
-cat ~/.local/share/mise/provisioned
-echo "installs=$(wc -l < ~/.local/share/mise/installs)"
+cat ~/.local/tools/provisioned
+echo "installs=$(wc -l < ~/.local/tools/installs)"
 "#;
 
-    // Provisioning runs first, with network but a read-only project, then
-    // the session runs with loopback only.
-    let (out, err) = run(None, session);
+    // Without a [provision] command there is nothing to provision.
+    let (_, err) = run(None, "true");
+    assert!(!err.contains("provisioning tools"), "{err}");
+
+    // Provisioning runs first, with network, a read-only project, the
+    // profile's environment and only the provision volumes; then the
+    // session runs with loopback only.
+    let (out, err) = run(Some(&id), session);
     assert!(err.contains("provisioning tools for"), "{err}");
     for expected in [
         "session-network=lo \n",
-        "offline=1",
         "project=readonly",
+        "secret=absent",
+        "env=from-env",
         "versions=node 22",
         "installs=1",
     ] {
@@ -417,35 +473,33 @@ echo "installs=$(wc -l < ~/.local/share/mise/installs)"
     assert_ne!(provisioned_network.trim(), "lo", "{out}");
 
     // Nothing changed, so nothing is installed again.
-    let (out, err) = run(None, session);
+    let (out, err) = run(Some(&id), session);
     assert!(!err.contains("provisioning tools"), "{err}");
     assert!(out.contains("installs=1"), "{out}");
 
-    // A session that edits the project's tools gets them on the next run.
-    run(None, "echo 'node 24' > .tool-versions");
-    let (out, err) = run(None, session);
+    // A session that edits a watched file gets a new install next run.
+    run(Some(&id), "echo 'node 24' > .tool-versions");
+    let (out, err) = run(Some(&id), session);
     assert!(err.contains("provisioning tools for"), "{err}");
     assert!(
         out.contains("versions=node 24") && out.contains("installs=2"),
         "{out}"
     );
 
-    // A profile can opt into the network, and podbay says so. Its tools
-    // are provisioned too.
-    let (out, err) = run(Some(&id), session);
+    // A profile can opt into the network, and podbay says so. It extends
+    // the first, so it shares its tools volume and its install.
+    let (out, err) = run(Some(&format!("{id}-online")), session);
     assert!(
         err.contains(&format!(
-            "full network access (network = \"full\" from profile {id})"
+            "full network access (network = \"full\" from profile {id}-online)"
         )),
         "{err}"
     );
-    assert!(out.contains("tools=[tools] node = \"22\""), "{out}");
     let session_network = out
         .lines()
         .find_map(|l| l.strip_prefix("session-network="))
         .unwrap();
     assert_ne!(session_network.trim(), "lo", "{out}");
-    assert!(out.contains("offline=unset"), "{out}");
 }
 
 #[test]
