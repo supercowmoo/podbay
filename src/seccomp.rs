@@ -34,16 +34,22 @@ const MOBY_DEFAULT: &str = include_str!("seccomp/moby-default.json");
 const PTRACE: &[&str] = &["ptrace", "process_vm_readv", "process_vm_writev"];
 
 /// The filter as JSON, with `allow` permitted on top.
+///
+/// Every other rule naming an allowed call is dropped first: libseccomp keeps
+/// an earlier rule without argument filters over a later one, so Docker's
+/// `clone3` rule, for one, would otherwise still return `ENOSYS`.
 pub fn profile(allow: &[String]) -> String {
     let mut doc: Value = serde_json::from_str(MOBY_DEFAULT).expect("vendored profile is valid");
     let rules = doc["syscalls"]
         .as_array_mut()
         .expect("vendored profile has syscalls");
     for rule in rules.iter_mut() {
-        if is_unconditional_allow(rule) {
-            let names = rule["names"].as_array_mut().expect("rules have names");
-            names.retain(|n| !PTRACE.contains(&n.as_str().unwrap_or_default()));
-        }
+        let unconditional = is_unconditional_allow(rule);
+        let names = rule["names"].as_array_mut().expect("rules have names");
+        names.retain(|n| {
+            let n = n.as_str().unwrap_or_default();
+            !(unconditional && PTRACE.contains(&n)) && !allow.iter().any(|a| a == n)
+        });
     }
     rules.retain(|rule| !rule["names"].as_array().is_some_and(Vec::is_empty));
     if !allow.is_empty() {
@@ -197,6 +203,29 @@ mod tests {
         assert!(open.iter().any(|n| n == "io_uring_setup"));
         // Stable output, so the file name is too.
         assert_eq!(profile(&[]), base);
+    }
+
+    #[test]
+    fn allow_overrides_earlier_rules() {
+        // Upstream denies clone3 with ENOSYS and filters clone's flags; an
+        // allow has to leave the call with no other rule to lose to.
+        let doc: Value =
+            serde_json::from_str(&profile(&["clone3".into(), "clone".into()])).unwrap();
+        let rules: Vec<&Value> = doc["syscalls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r["names"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == "clone3" || n == "clone")
+            })
+            .collect();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(is_unconditional_allow(rules[0]));
+        assert!(!profile(&[]).contains(r#""names":[]"#));
     }
 
     #[test]

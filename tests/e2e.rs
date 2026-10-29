@@ -389,7 +389,7 @@ fn seccomp_filter_blocks_namespaces_and_ptrace() {
     .unwrap();
     let id = format!("e2esec{}", std::process::id());
     for (name, body) in [
-        ("allow", "[seccomp]\nallow = [\"ptrace\"]\n"),
+        ("allow", "[seccomp]\nallow = [\"ptrace\", \"clone3\"]\n"),
         ("cap", "cap_add = [\"SYS_PTRACE\"]\n"),
         ("engine", "[seccomp]\nengine_default = true\n"),
     ] {
@@ -407,6 +407,10 @@ esac
 if [ -n "$nr" ]; then
   perl -e "print 'ptrace=', (syscall($nr, 0, 0, 0, 0) == 0 ? 'allowed' : 'denied'), qq(\n)"
 fi
+# clone3 with no arguments: ENOSYS (38) when the filter stops it, EINVAL
+# (22) from the kernel. Upstream's own rule for it returns ENOSYS, so this
+# catches an allow that loses to it.
+perl -e "syscall(435, 0, 0); print 'clone3=', \$!+0, qq(\n)"
 if unshare --user true 2>/dev/null; then echo userns=allowed; else echo userns=denied; fi
 "#;
     let run = |profile: Option<String>| {
@@ -438,6 +442,7 @@ if unshare --user true 2>/dev/null; then echo userns=allowed; else echo userns=d
         out.contains("userns=denied"),
         "stdout:\n{out}\nstderr:\n{err}"
     );
+    assert!(out.contains("clone3=38"), "stdout:\n{out}\nstderr:\n{err}");
     let Some(default) = ptrace(&out) else {
         eprintln!("skipping the ptrace checks: no syscall number for this machine");
         return;
@@ -449,10 +454,11 @@ if unshare --user true 2>/dev/null; then echo userns=allowed; else echo userns=d
     assert_eq!(ptrace(&out).as_deref(), Some("allowed"), "{out}\n{err}");
     assert!(
         err.contains(&format!(
-            "seccomp filter also allows ptrace (from {id}-allow)"
+            "seccomp filter also allows ptrace (from {id}-allow), clone3 (from {id}-allow)"
         )),
         "{err}"
     );
+    assert!(out.contains("clone3=22"), "{out}");
     assert!(out.contains("userns=denied"), "{out}");
     let (out, err) = run(Some(format!("{id}-cap")));
     assert_eq!(ptrace(&out).as_deref(), Some("allowed"), "{out}\n{err}");
