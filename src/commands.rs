@@ -18,6 +18,7 @@ use crate::profile::{self, ResolvedProfile};
 use crate::provision;
 use crate::repo_key::repo_key;
 use crate::report;
+use crate::seccomp;
 
 struct Setup {
     paths: Paths,
@@ -136,6 +137,9 @@ struct Prepared {
     limits: Limits,
     /// `--local-cache`: provision volumes are this project's own copies.
     local_cache: bool,
+    /// podbay's seccomp filter with the profile's additions, or `None` when
+    /// the profile chose the engine's default.
+    seccomp: Option<PathBuf>,
 }
 
 impl Prepared {
@@ -171,6 +175,18 @@ impl Prepared {
 
         let limits = applicable_limits(&backend, ctx.limits(&profile), &ctx.config.limits)?;
 
+        let seccomp = match &profile.engine_seccomp {
+            Some(_) => None,
+            None => {
+                let names: Vec<String> = profile.syscalls.iter().map(|s| s.name.clone()).collect();
+                let json = seccomp::profile(&names);
+                Some(match dry_run {
+                    true => seccomp::path(&ctx.paths, &json),
+                    false => seccomp::write(&ctx.paths, &json)?,
+                })
+            }
+        };
+
         Ok(Self {
             backend,
             project,
@@ -181,6 +197,7 @@ impl Prepared {
             actions,
             limits,
             local_cache,
+            seccomp,
         })
     }
 
@@ -209,6 +226,7 @@ impl Prepared {
             caps: &[],
             limits: &self.limits,
             network: Net::Full,
+            seccomp: self.seccomp.clone(),
         })
     }
 
@@ -279,6 +297,23 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         );
     }
     let caps: Vec<String> = profile.caps.iter().map(|c| c.name.clone()).collect();
+    if let Some(source) = &profile.engine_seccomp {
+        eprintln!(
+            "podbay: note: the session uses {}'s default seccomp filter instead of podbay's \
+             (from {source})",
+            prep.program()
+        );
+    } else if !profile.syscalls.is_empty() {
+        let syscalls: Vec<String> = profile
+            .syscalls
+            .iter()
+            .map(|s| format!("{} (from {})", s.name, s.profile))
+            .collect();
+        eprintln!(
+            "podbay: note: the seccomp filter also allows {}",
+            syscalls.join(", ")
+        );
+    }
 
     let relay_name = format!("podbay-relay-{}-{}", prep.key, std::process::id());
     let relay_image = match &network {
@@ -315,6 +350,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         caps: &caps,
         limits: &prep.limits,
         network: net,
+        seccomp: prep.seccomp.clone(),
     })?;
     let program = prep.program();
     let argv = plan.args();
@@ -376,7 +412,13 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
                 "podbay: network: HTTPS to {} only (from {network_source})",
                 network.describe().trim_start_matches("allow ")
             );
-            Some(Relay::start(&prep, hosts.clone(), &image, relay_name)?)
+            Some(Relay::start(
+                &ctx.paths,
+                &prep,
+                hosts.clone(),
+                &image,
+                relay_name,
+            )?)
         }
         _ => None,
     };
@@ -426,11 +468,14 @@ struct Relay {
 
 impl Relay {
     fn start(
+        paths: &Paths,
         prep: &Prepared,
         allow: Vec<egress::HostPattern>,
         image: &str,
         name: String,
     ) -> Result<Self> {
+        // podbay's own binary: the base filter, whatever the profile says.
+        let filter = seccomp::write(paths, &seccomp::profile(&[]))?;
         let server = egress::Server::start(allow)?;
         let relay = Self {
             program: prep.program(),
@@ -444,6 +489,7 @@ impl Relay {
             identity: &prep.identity,
             repo_key: &prep.key,
             limits: &prep.limits,
+            seccomp: Some(&filter),
         })?;
         let status = Command::new(relay.program)
             .args(&args)
@@ -688,6 +734,18 @@ fn describe(
     out.push_str("\ncapabilities:\n");
     for c in &p.caps {
         out.push_str(&format!("  {}  (from {})\n", c.name, c.profile));
+    }
+
+    match &p.engine_seccomp {
+        Some(source) => out.push_str(&format!(
+            "\nseccomp: the engine's default  (from {source})\n"
+        )),
+        None => {
+            out.push_str("\nseccomp: podbay's filter\n");
+            for s in &p.syscalls {
+                out.push_str(&format!("  + {}  (from {})\n", s.name, s.profile));
+            }
+        }
     }
 
     out.push_str(&format!(

@@ -103,6 +103,8 @@ pub struct Inputs<'a> {
     /// Limits the engine can apply; see [`Limits`].
     pub limits: &'a Limits,
     pub network: Net,
+    /// podbay's seccomp filter, or `None` for the engine's default.
+    pub seccomp: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,10 +233,11 @@ impl RunPlan {
         // One flag per capability: docker reads a comma list as one name.
         flags.push("--cap-drop=ALL".into());
         flags.extend(caps.iter().map(|c| format!("--cap-add={c}")));
-        flags.extend([
-            "--security-opt=no-new-privileges".into(),
-            "--read-only".into(),
-        ]);
+        flags.push("--security-opt=no-new-privileges".into());
+        if let Some(file) = &inputs.seccomp {
+            flags.push(seccomp_flag(file)?);
+        }
+        flags.push("--read-only".into());
         for (target, options) in TMPFS {
             flags.push(format!("--tmpfs={target}:{options}"));
         }
@@ -282,6 +285,14 @@ impl RunPlan {
     }
 }
 
+fn seccomp_flag(file: &Path) -> Result<String> {
+    let file = file.to_string_lossy();
+    if file.contains([',', '\n']) {
+        bail!("seccomp profile path {file} must not contain ',' or newlines");
+    }
+    Ok(format!("--security-opt=seccomp={file}"))
+}
+
 /// Where the relay sees the directory holding podbay's socket.
 const RELAY_SOCKET_DIR: &str = "/run/podbay";
 
@@ -293,6 +304,8 @@ pub struct RelayInputs<'a> {
     pub identity: &'a Identity,
     pub repo_key: &'a str,
     pub limits: &'a Limits,
+    /// podbay's seccomp filter, or `None` for the engine's default.
+    pub seccomp: Option<&'a Path>,
 }
 
 /// `run` arguments for the relay container of an allowlisted session. It
@@ -313,10 +326,15 @@ pub fn relay_args(inputs: &RelayInputs<'_>) -> Result<Vec<String>> {
         "--read-only".into(),
         "--cap-drop=ALL".into(),
         "--security-opt=no-new-privileges".into(),
+    ];
+    if let Some(file) = inputs.seccomp {
+        args.push(seccomp_flag(file)?);
+    }
+    args.extend([
         // It holds no state, and as PID 1 without handlers it would ignore
         // SIGTERM, making engines wait before removing it.
         "--stop-signal=SIGKILL".into(),
-    ];
+    ]);
     // The session's user namespace setup, but never root inside it unless
     // root already is the host user.
     args.extend(
@@ -383,6 +401,7 @@ mod tests {
             caps: &[],
             limits: &NO_LIMITS,
             network: Net::None,
+            seccomp: None,
         }
     }
 
@@ -470,6 +489,24 @@ mod tests {
         assert_eq!(&args[args.len() - 4..], ["img:1", "sh", "-c", "id"]);
         let args = RunPlan::build(inputs(&profile, &id)).unwrap().args();
         assert_eq!(&args[args.len() - 3..], ["img:1", "zsh", "-l"]);
+    }
+
+    #[test]
+    fn seccomp_filter() {
+        let profile = ResolvedProfile::default();
+        let id = identity();
+        let mut i = inputs(&profile, &id);
+        i.seccomp = Some("/c/seccomp/ab.json".into());
+        let args = RunPlan::build(i).unwrap().args();
+        let nnp = args
+            .iter()
+            .position(|a| a == "--security-opt=no-new-privileges")
+            .unwrap();
+        assert_eq!(args[nnp + 1], "--security-opt=seccomp=/c/seccomp/ab.json");
+
+        let mut i = inputs(&profile, &id);
+        i.seccomp = Some("/c/a,b.json".into());
+        assert!(RunPlan::build(i).is_err());
     }
 
     #[test]
@@ -612,6 +649,7 @@ mod tests {
             identity: &podman,
             repo_key: "app-1",
             limits: &limits,
+            seccomp: Some(Path::new("/c/seccomp/relay.json")),
         })
         .unwrap();
         assert_eq!(
@@ -626,6 +664,7 @@ mod tests {
                 "--read-only",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
+                "--security-opt=seccomp=/c/seccomp/relay.json",
                 "--stop-signal=SIGKILL",
                 "--userns=keep-id:uid=1000,gid=1000",
                 "--user=1000:1000",

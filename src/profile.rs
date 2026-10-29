@@ -25,6 +25,9 @@
 //! [provision]
 //! command = "rustup toolchain install"
 //! watch = ["rust-toolchain.toml"]
+//!
+//! [seccomp]
+//! allow = ["io_uring_setup"]   # syscalls podbay's filter blocks
 //! ```
 
 use std::collections::HashSet;
@@ -56,6 +59,7 @@ struct ProfileFile {
     #[serde(default)]
     path: Vec<String>,
     provision: Option<ProvisionEntry>,
+    seccomp: Option<SeccompEntry>,
     /// Capabilities the session keeps, such as "SYS_PTRACE".
     #[serde(default)]
     cap_add: Vec<String>,
@@ -88,6 +92,15 @@ struct VolumeEntry {
     container: String,
     #[serde(default)]
     provision: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeccompEntry {
+    #[serde(default)]
+    allow: Vec<String>,
+    /// Use the engine's default filter instead of podbay's.
+    engine_default: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +166,11 @@ pub struct ResolvedProfile {
     pub extensions: Vec<Extension>,
     /// Capabilities added back for the session, in the order declared.
     pub caps: Vec<Capability>,
+    /// Syscalls allowed on top of podbay's seccomp filter.
+    pub syscalls: Vec<Syscall>,
+    /// The profile that chose the engine's default seccomp filter over
+    /// podbay's, if one did.
+    pub engine_seccomp: Option<String>,
     /// Limits set by the chain; unset fields fall back to config.toml.
     pub limits: Limits,
     /// `network` settings down the chain, ancestors first, each with the
@@ -188,6 +206,13 @@ impl ResolvedProfile {
             v.name = format!("{}-{repo_key}", v.name);
         }
     }
+}
+
+/// A syscall a profile allows through podbay's seccomp filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Syscall {
+    pub name: String,
+    pub profile: String,
 }
 
 /// A Linux capability a profile adds back, by its name without `CAP_`.
@@ -510,6 +535,23 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProf
         }
     }
 
+    if let Some(seccomp) = profile.seccomp {
+        for syscall in seccomp.allow {
+            crate::seccomp::validate_name(&syscall)?;
+            if !out.syscalls.iter().any(|s| s.name == syscall) {
+                out.syscalls.push(Syscall {
+                    name: syscall,
+                    profile: name.to_owned(),
+                });
+            }
+        }
+        match seccomp.engine_default {
+            Some(true) => out.engine_seccomp = Some(name.to_owned()),
+            Some(false) => out.engine_seccomp = None,
+            None => {}
+        }
+    }
+
     profile.limits.validate()?;
     out.limits.merge(&profile.limits);
 
@@ -753,6 +795,44 @@ mod tests {
             .collect();
         assert_eq!(steps, [("install-a", "base"), ("install-b", "child")]);
         assert_eq!(r.watch, ["a.lock", "shared.lock", "conf.d"]);
+    }
+
+    #[test]
+    fn seccomp_merges_down_the_chain() {
+        let f = Fixture::new();
+        f.profile(
+            "base",
+            "[seccomp]\nallow = [\"ptrace\", \"io_uring_setup\"]\nengine_default = true\n",
+        )
+        .profile(
+            "child",
+            "extends = [\"base\"]\n[seccomp]\nallow = [\"ptrace\", \"kcmp\"]\n",
+        )
+        .profile(
+            "strict",
+            "extends = [\"base\"]\n[seccomp]\nengine_default = false\n",
+        );
+        let r = resolve(&f.paths, "child").unwrap();
+        let names: Vec<(&str, &str)> = r
+            .syscalls
+            .iter()
+            .map(|s| (s.name.as_str(), s.profile.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("ptrace", "base"),
+                ("io_uring_setup", "base"),
+                ("kcmp", "child")
+            ]
+        );
+        // Unset keeps the inherited choice; false takes it back.
+        assert_eq!(r.engine_seccomp.as_deref(), Some("base"));
+        assert_eq!(resolve(&f.paths, "strict").unwrap().engine_seccomp, None);
+
+        f.profile("bad", "[seccomp]\nallow = [\"PTRACE\"]\n");
+        let err = format!("{:#}", resolve(&f.paths, "bad").unwrap_err());
+        assert!(err.contains("invalid syscall name"), "{err}");
     }
 
     #[test]

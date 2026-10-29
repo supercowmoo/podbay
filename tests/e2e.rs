@@ -372,6 +372,101 @@ test -e ~/left-behind && echo home=persisted || echo home=fresh
 }
 
 #[test]
+fn seccomp_filter_blocks_namespaces_and_ptrace() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2esec{}", std::process::id());
+    for (name, body) in [
+        ("allow", "[seccomp]\nallow = [\"ptrace\"]\n"),
+        ("cap", "cap_add = [\"SYS_PTRACE\"]\n"),
+        ("engine", "[seccomp]\nengine_default = true\n"),
+    ] {
+        fs::write(profiles.join(format!("{id}-{name}.toml")), body).unwrap();
+    }
+
+    // PTRACE_TRACEME through perl's syscall(), by number: the test image
+    // has no strace or gdb, but Debian always has perl and unshare.
+    let script = r#"
+case $(uname -m) in
+  x86_64) nr=101 ;;
+  aarch64) nr=117 ;;
+  *) nr= ;;
+esac
+if [ -n "$nr" ]; then
+  perl -e "print 'ptrace=', (syscall($nr, 0, 0, 0, 0) == 0 ? 'allowed' : 'denied'), qq(\n)"
+fi
+if unshare --user true 2>/dev/null; then echo userns=allowed; else echo userns=denied; fi
+"#;
+    let run = |profile: Option<String>| {
+        let mut cmd = podbay(root);
+        cmd.args(["run", "--backend", &engine]);
+        if let Some(p) = profile {
+            cmd.args(["-p", &p]);
+        }
+        let output = cmd
+            .arg(&project)
+            .args(["--", "sh", "-c", script])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let ptrace = |out: &str| {
+        out.lines()
+            .find_map(|l| l.strip_prefix("ptrace="))
+            .map(str::to_owned)
+    };
+
+    let (out, err) = run(None);
+    assert!(
+        out.contains("userns=denied"),
+        "stdout:\n{out}\nstderr:\n{err}"
+    );
+    let Some(default) = ptrace(&out) else {
+        eprintln!("skipping the ptrace checks: no syscall number for this machine");
+        return;
+    };
+    assert_eq!(default, "denied", "stdout:\n{out}\nstderr:\n{err}");
+
+    // A profile can allow it by name, or by keeping SYS_PTRACE.
+    let (out, err) = run(Some(format!("{id}-allow")));
+    assert_eq!(ptrace(&out).as_deref(), Some("allowed"), "{out}\n{err}");
+    assert!(
+        err.contains(&format!(
+            "seccomp filter also allows ptrace (from {id}-allow)"
+        )),
+        "{err}"
+    );
+    assert!(out.contains("userns=denied"), "{out}");
+    let (out, err) = run(Some(format!("{id}-cap")));
+    assert_eq!(ptrace(&out).as_deref(), Some("allowed"), "{out}\n{err}");
+
+    // Or fall back to the engine's default, which allows it everywhere.
+    let (out, err) = run(Some(format!("{id}-engine")));
+    assert_eq!(ptrace(&out).as_deref(), Some("allowed"), "{out}\n{err}");
+    assert!(
+        err.contains("default seccomp filter instead of podbay's"),
+        "{err}"
+    );
+}
+
+#[test]
 fn provisioning_runs_profile_commands_and_sessions_are_offline() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);

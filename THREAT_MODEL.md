@@ -44,7 +44,7 @@ sources.
 
 | Boundary | Enforced by | Notes |
 | --- | --- | --- |
-| Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, kernel | See "Privilege inside the container" |
+| Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, podbay's seccomp filter, kernel | See "Privilege inside the container" |
 | Container to host files | Only declared mounts are visible | The project is read-write |
 | Container to network | `--network=none`, or a relay and podbay's allowlist | A profile can still opt into full access |
 | Provisioning to network | **Not enforced** | Runs your installers on project-chosen versions; see "Provisioning" |
@@ -218,8 +218,21 @@ run git; it does not stop anything.
   has to run without a limit. tmpfs space counts against memory, so a
   session can still fill RAM through `/tmp` unless a memory limit is set.
   Disk usage in the project and volumes is not limited.
-- **Kernel attack surface (stage 5).** No custom seccomp or Landlock policy
-  yet beyond the engine's defaults.
+- **Kernel attack surface (reduced in stage 5).** Every container podbay
+  starts (sessions, provisioning, the relay) runs under podbay's seccomp
+  filter instead of the engine's default. It is Docker's default profile
+  with `ptrace`, `process_vm_readv` and `process_vm_writev` also blocked
+  unless the session keeps `SYS_PTRACE`. That matters most on Podman, whose
+  default lets a container `unshare` a user namespace and then hold every
+  capability inside it, which most kernel privilege escalations start
+  from, plus `mount`, `setns` and `keyctl`. Three gaps remain:
+  - A profile's `[seccomp] allow` and `cap_add` reopen calls on purpose;
+    podbay prints them on every run. `engine_default = true` drops
+    podbay's filter altogether, which podbay also prints.
+  - Syscalls the filter allows can still have kernel bugs. The filter
+    limits which kernel code is reachable, not whether it is correct.
+  - No Landlock policy yet, so within the container, file access is
+    limited only by ownership and the read-only root filesystem.
 - **The terminal.** With `--tty`, the container writes directly to your
   terminal. Escape sequences can change the window title, write to the
   clipboard (OSC 52) on terminals that allow it, or hit bugs in the

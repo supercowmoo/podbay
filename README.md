@@ -31,7 +31,8 @@ Being rebuilt in Rust, in stages:
 4. Network policy: no network by default, with an allowlist enforced by a
    filtering proxy. Tool installs move to a separate provisioning step.
    *(done)*
-5. Landlock and seccomp around processes inside the container.
+5. Landlock and seccomp around processes inside the container. Seccomp:
+   *(done)*. Landlock: next.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
 [THREAT_MODEL.md](THREAT_MODEL.md) covers what is and isn't protected
@@ -90,6 +91,13 @@ and gid.
   entrypoint starts with just enough to set up the home directory and fix
   mount ownership, then drops all of it before your command runs. A profile
   can keep specific capabilities with `cap_add` (see below).
+- **Syscalls**: podbay's seccomp filter, the same on Podman and Docker. It
+  is Docker's default profile with `ptrace` and reading or writing other
+  processes' memory also blocked, so a session can't create namespaces,
+  mount filesystems, use io_uring, BPF or keyrings, or trace processes.
+  Podman's own default allows namespaces, mounts, keyrings and `ptrace`. A profile can allow specific
+  calls back (see below), and `cap_add` brings back the calls that go with
+  a capability, as with Docker.
 - **Network**: none. The session has only a loopback interface, so it
   can't reach the internet, your LAN or the host. A profile can allow HTTPS
   to specific hosts (see [Network allowlist](#network-allowlist)), or turn
@@ -307,8 +315,15 @@ command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/in
 extends = ["base"]
 
 # Capabilities the session keeps (none by default). podbay prints them on
-# every run that uses this profile.
+# every run that uses this profile. SYS_PTRACE also lets ptrace through
+# the seccomp filter.
 cap_add = ["SYS_PTRACE"]   # gdb, strace
+
+# Syscalls the seccomp filter blocks that this profile needs. podbay
+# prints them on every run. engine_default = true uses the engine's own
+# filter instead, which on Podman is much looser.
+[seccomp]
+allow = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
 
 # Override the limits from config.toml.
 [limits]
@@ -318,8 +333,9 @@ memory = "16g"
 With `extends`, ancestors are applied first. A later profile's mount or
 volume replaces an inherited one at the same container path, `[env]` keys
 and `shell` override inherited ones, and its `path` entries go in front of
-inherited ones. `[provision]` commands and `watch` lists, and `cap_add`
-lists, are combined. `[limits]` keys override one at a time, and `network`
+inherited ones. `[provision]` commands and `watch` lists, `cap_add` and
+`[seccomp] allow` lists are combined, and `engine_default` is inherited
+until a profile sets it. `[limits]` keys override one at a time, and `network`
 host lists add up while `"none"` or `"full"` replaces what came before. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 

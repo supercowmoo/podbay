@@ -35,6 +35,14 @@
 #
 # cap_add = ["SYS_PTRACE"]
 
+# Syscalls podbay's seccomp filter blocks that this profile needs, such as
+# io_uring_setup. podbay prints them on every run. engine_default = true
+# uses the engine's own filter instead (much looser on Podman).
+#
+# [seccomp]
+# allow = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
+# engine_default = false
+
 # Bind mounts from the host. Best for files you edit on the host, such as
 # dotfiles. mode is "ro" (default) or "rw". Keep anything your host runs
 # (shell rc files, toolchain directories) read-only: a session that can

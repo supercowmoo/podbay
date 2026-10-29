@@ -12,6 +12,7 @@ mod profile;
 mod provision;
 mod repo_key;
 mod report;
+mod seccomp;
 
 use std::process::ExitCode;
 
