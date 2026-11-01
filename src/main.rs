@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod egress;
+mod forward;
 mod gitconfig;
 mod hash;
 mod image;

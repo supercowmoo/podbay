@@ -11,6 +11,7 @@ use crate::backend::{Backend, BackendKind, Identity};
 use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
 use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
 use crate::egress;
+use crate::forward::{self, Forwarder, Port};
 use crate::image::{self, Action, BaseImage, LayerSource};
 use crate::paths::Paths;
 use crate::plan::{self, Net, RunPlan};
@@ -315,9 +316,24 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         );
     }
 
+    let mut ports: Vec<Port> = profile.ports.iter().map(|(p, _)| *p).collect();
+    for port in &args.ports {
+        forward::add(&mut ports, *port)?;
+    }
+    if let Network::Allow(_) = &network
+        && let Some(port) = ports.iter().find(|p| p.container == egress::PROXY_PORT)
+    {
+        bail!(
+            "session port {} is where podbay's proxy listens in an allowlisted session; \
+             forward a different one",
+            port.container
+        );
+    }
+    let needs_relay = matches!(network, Network::Allow(_)) || !ports.is_empty();
+
     let relay_name = format!("podbay-relay-{}-{}", prep.key, std::process::id());
-    let relay_image = match &network {
-        Network::Allow(_) => {
+    let relay_image = match needs_relay {
+        true => {
             let layer = image::relay_layer();
             let actions = image::ensure(
                 &prep.backend,
@@ -330,12 +346,19 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
             }
             Some(layer.tag)
         }
-        _ => None,
+        false => None,
     };
-    let net = match network {
-        Network::None => Net::None,
-        Network::Full => Net::Full,
-        Network::Allow(_) => Net::Relay(relay_name.clone()),
+    let net = match (&network, needs_relay) {
+        (Network::Allow(_), _) => Net::Relay {
+            container: relay_name.clone(),
+            proxy: true,
+        },
+        (_, true) => Net::Relay {
+            container: relay_name.clone(),
+            proxy: false,
+        },
+        (Network::None, false) => Net::None,
+        (Network::Full, false) => Net::Full,
     };
 
     let plan = RunPlan::build(plan::Inputs {
@@ -372,10 +395,26 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
                  with podbay's proxy on {}",
                 egress::PROXY_ADDR
             );
+        } else if needs_relay {
+            eprintln!(
+                "podbay: the session would share the network of relay container {relay_name}"
+            );
+        }
+        for port in &ports {
+            eprintln!(
+                "podbay: 127.0.0.1:{} on the host would be forwarded to session port {}",
+                port.host, port.container
+            );
         }
         print_command(program, argv);
         return Ok(ExitCode::SUCCESS);
     }
+
+    // Taken ports fail the run here, before provisioning or the session.
+    let forwarder = match ports.is_empty() {
+        true => None,
+        false => Some(Forwarder::start(&ports)?),
+    };
 
     if let Some(fingerprint) = &due {
         let status = prep.provision(&ctx, Some(fingerprint))?;
@@ -392,35 +431,46 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
 
     let project = &prep.project;
     let key = &prep.key;
-    let relay = match (&network, relay_image) {
+    match &network {
         // Full access you chose yourself, in config.toml or on the command
         // line, is just stated. A profile turning it on gets a warning:
         // that's the case you might not expect.
-        (Network::Full, _) if network_source.starts_with("profile") => {
+        Network::Full if network_source.starts_with("profile") => {
             eprintln!(
                 "podbay: warning: the session has full network access (network = \"full\" \
                  from {network_source})"
             );
-            None
         }
-        (Network::Full, _) => {
-            eprintln!("podbay: network: full (from {network_source})");
-            None
-        }
-        (Network::Allow(hosts), Some(image)) => {
-            eprintln!(
-                "podbay: network: HTTPS to {} only (from {network_source})",
-                network.describe().trim_start_matches("allow ")
-            );
-            Some(Relay::start(
+        Network::Full => eprintln!("podbay: network: full (from {network_source})"),
+        Network::Allow(_) => eprintln!(
+            "podbay: network: HTTPS to {} only (from {network_source})",
+            network.describe().trim_start_matches("allow ")
+        ),
+        Network::None => {}
+    }
+    let relay = match relay_image {
+        Some(image) => {
+            let allow = match &network {
+                Network::Allow(hosts) => Some(hosts.clone()),
+                _ => None,
+            };
+            let relay = Relay::start(
                 &ctx.paths,
                 &prep,
-                hosts.clone(),
+                RelayJobs {
+                    allow,
+                    forwarder,
+                    full_network: matches!(network, Network::Full),
+                },
                 &image,
                 relay_name,
-            )?)
+            )?;
+            if let Some(forwarder) = &relay.forwarder {
+                eprint!("{}", forwarder.describe());
+            }
+            Some(relay)
         }
-        _ => None,
+        None => None,
     };
     let chain = match profile.chain.is_empty() {
         true => "no profile".to_owned(),
@@ -457,35 +507,58 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
     Ok(exit_code(status))
 }
 
-/// The relay container an allowlisted session shares its network namespace
-/// with, and the policy server behind it. The container is removed when
-/// this is dropped, however the session ended.
+/// What a relay container does for its session.
+struct RelayJobs {
+    /// The allowlist, for a session that has one.
+    allow: Option<Vec<egress::HostPattern>>,
+    /// Forwarded ports, already listening on the host.
+    forwarder: Option<Forwarder>,
+    /// The session has full network access, which it gets through the
+    /// relay's namespace.
+    full_network: bool,
+}
+
+/// The relay container a session shares its network namespace with, when
+/// it has an allowlist or forwarded ports, and the host side of both. The
+/// container is removed when this is dropped, however the session ended.
 struct Relay {
     program: &'static str,
     name: String,
-    server: egress::Server,
+    server: Option<egress::Server>,
+    forwarder: Option<Forwarder>,
 }
 
 impl Relay {
     fn start(
         paths: &Paths,
         prep: &Prepared,
-        allow: Vec<egress::HostPattern>,
+        jobs: RelayJobs,
         image: &str,
         name: String,
     ) -> Result<Self> {
         // podbay's own binary: the base filter, whatever the profile says.
         let filter = seccomp::write(paths, &seccomp::profile(&[]))?;
-        let server = egress::Server::start(allow)?;
+        let server = jobs.allow.map(egress::Server::start).transpose()?;
         let relay = Self {
             program: prep.program(),
             name,
             server,
+            forwarder: jobs.forwarder,
         };
+        let container_ports = relay
+            .forwarder
+            .as_ref()
+            .map(Forwarder::container_ports)
+            .unwrap_or_default();
         let args = plan::relay_args(&plan::RelayInputs {
             image,
             name: &relay.name,
-            socket_dir: relay.server.dir(),
+            egress_dir: relay.server.as_ref().map(egress::Server::dir),
+            forward: relay
+                .forwarder
+                .as_ref()
+                .map(|f| (f.dir(), container_ports.as_slice())),
+            full_network: jobs.full_network,
             identity: &prep.identity,
             repo_key: &prep.key,
             limits: &prep.limits,
@@ -499,15 +572,31 @@ impl Relay {
         if !status.success() {
             bail!("starting the network relay container failed ({status})");
         }
-        if !relay.server.wait_ready(Duration::from_secs(20)) {
+        let timeout = Duration::from_secs(20);
+        let ready = relay.server.as_ref().is_none_or(|s| s.wait_ready(timeout))
+            && relay
+                .forwarder
+                .as_ref()
+                .is_none_or(|f| f.wait_ready(timeout));
+        if !ready {
             bail!("the network relay container did not start within 20 seconds");
         }
         Ok(relay)
     }
 
-    /// Removes the container and returns what the session connected to.
-    fn stop(self) -> String {
-        let summary = self.server.summary();
+    /// Removes the container and returns what the session connected to,
+    /// and what connected to it.
+    fn stop(mut self) -> String {
+        let mut summary = String::new();
+        if let Some(server) = &self.server {
+            summary.push_str(&server.summary());
+        }
+        // Stop listening before the summary, so the counts are final.
+        if let Some(forwarder) = self.forwarder.take() {
+            let text = forwarder.summary();
+            drop(forwarder);
+            summary.push_str(&text);
+        }
         drop(self);
         summary
     }
@@ -752,6 +841,14 @@ fn describe(
         "\nnetwork: {}  (from {source})\n",
         network.describe()
     ));
+
+    out.push_str("\nports:\n");
+    for (port, profile) in &p.ports {
+        out.push_str(&format!(
+            "  127.0.0.1:{} -> session port {}  (from {profile})\n",
+            port.host, port.container
+        ));
+    }
 
     out.push_str("\nlimits:\n");
     let pids = match limits.pids {

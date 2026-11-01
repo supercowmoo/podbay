@@ -14,6 +14,7 @@ everything else is something you declared:
 - the shell you want, environment variables and PATH entries
 - optional root build scripts baked into a derived image
 - network access: none, HTTPS to the hosts you list, or everything
+- ports you forward, so the host can reach a server in the session
 
 Anything that needs root, such as changes to the image, can only come from
 your own config directory, never from the mounted project.
@@ -68,6 +69,7 @@ podbay run . -- make test     # run a command instead of a shell
 podbay run --dry-run .        # print the exact podman/docker command
 podbay run --online .         # give this session the network
 podbay run --offline .        # or take it away, whatever the config says
+podbay run --port 3080 .      # reach a server in the session on 127.0.0.1:3080
 podbay build                  # build any missing images ahead of time
 podbay build --force          # rebuild them all with current packages
 podbay provision .            # run the profile's [provision] commands now
@@ -107,6 +109,9 @@ and gid.
   states the setting on every run. When a profile turns full access on,
   podbay prints a warning instead, since that's easy to miss. Installing
   tools needs neither; see [Provisioning](#provisioning).
+- **Incoming connections**: none, unless you
+  [forward a port](#forwarded-ports). Then the host can reach that one
+  port, from its own `127.0.0.1` only.
 - **Resources**: at most 4096 processes and threads by default. Memory and
   CPU limits are opt-in. Rootless engines can apply a limit only when
   systemd delegates that cgroup controller to your user. When it doesn't,
@@ -158,6 +163,48 @@ podbay: network:
 
 The relay image is built from source the first time it's needed, from a
 pinned Rust image, and is under 1 MB.
+
+## Forwarded ports
+
+A web UI, dev server or docs preview running in the session can be made
+reachable from the host:
+
+```toml
+ports = [3080]             # host 127.0.0.1:3080 -> session port 3080
+ports = ["8080:3000"]      # host 127.0.0.1:8080 -> session port 3000
+```
+
+```
+podbay run --port 3080 .
+podbay run --port 8080:3000 .
+podbay: forwarding http://127.0.0.1:8080 to session port 3000
+```
+
+Lists add up across `extends` and `--port`; forwarding one host port to two
+session ports is an error. A host port that's already taken fails the run
+before anything starts.
+
+The server only has to listen on the session's loopback (`127.0.0.1` or
+`::1`), which is the default for most dev servers. podbay listens on the
+host's `127.0.0.1`, never on other addresses, so a forward can't expose a
+session to your LAN. It works with any network setting: the session shares
+the relay container's network namespace, and the relay connects each
+connection podbay passes it to that port. The session can't open anything
+through a forward. After the session, podbay counts the connections:
+
+```
+podbay: forwarded ports:
+  127.0.0.1:8080 -> session port 3000: 12 connections
+```
+
+A forward lets more than you in. Anything on your machine can connect to
+it, including web pages open in your browser, so a server that acts on
+requests (an agent's web UI that runs commands) can be driven by them.
+Pages served from the session can also read and set cookies of every other
+web app you use on `localhost`, since browsers don't separate cookies by
+port. Forward only while you need it, and use a separate browser profile
+for it. [THREAT_MODEL.md](THREAT_MODEL.md#other-channels-and-the-stage-that-closes-them)
+has the details.
 
 ## Provisioning
 
@@ -340,7 +387,8 @@ and `shell` override inherited ones, and its `path` entries go in front of
 inherited ones. `[provision]` commands and `watch` lists, `cap_add` and
 `[seccomp] allow` lists are combined, and `engine_default` is inherited
 until a profile sets it. `[limits]` keys override one at a time, and `network`
-host lists add up while `"none"` or `"full"` replaces what came before. Volumes keep the name of the profile that
+host lists add up while `"none"` or `"full"` replaces what came before.
+`ports` lists add up too. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
 **Mounts or volumes?** Use mounts for files you own and edit on the host, such

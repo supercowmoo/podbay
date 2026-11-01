@@ -31,6 +31,8 @@ use crate::report::printable;
 
 /// Where the relay listens, inside the session's network namespace.
 pub const PROXY_ADDR: &str = "127.0.0.1:3128";
+/// The port of [`PROXY_ADDR`].
+pub const PROXY_PORT: u16 = 3128;
 /// What the relay sends once it is listening; see `relay/src/main.rs`.
 const READY: &[u8] = b"podbay-relay ready\n";
 /// The longest request head accepted.
@@ -237,6 +239,20 @@ pub struct Server {
     shared: Arc<Shared>,
 }
 
+/// A new private directory for Unix sockets shared with the relay.
+/// `$XDG_RUNTIME_DIR` is private to the user; the directory itself is
+/// created 0700 either way. Socket paths are limited to 108 bytes.
+pub fn socket_dir() -> Result<tempfile::TempDir> {
+    let parent = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_dir() && p.as_os_str().len() < 64)
+        .unwrap_or_else(std::env::temp_dir);
+    tempfile::Builder::new()
+        .prefix("podbay-")
+        .tempdir_in(&parent)
+        .with_context(|| format!("creating a directory in {}", parent.display()))
+}
+
 /// The socket's name inside [`Server::dir`].
 pub const SOCKET_NAME: &str = "egress.sock";
 
@@ -246,16 +262,7 @@ impl Server {
     }
 
     fn start_with(allow: Vec<HostPattern>, allow_private: bool) -> Result<Self> {
-        // $XDG_RUNTIME_DIR is private to the user; the directory itself is
-        // created 0700 either way. Socket paths are limited to 108 bytes.
-        let parent = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute() && p.is_dir() && p.as_os_str().len() < 64)
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = tempfile::Builder::new()
-            .prefix("podbay-")
-            .tempdir_in(&parent)
-            .with_context(|| format!("creating a directory in {}", parent.display()))?;
+        let dir = socket_dir()?;
         let path = dir.path().join(SOCKET_NAME);
         let listener = UnixListener::bind(&path)
             .with_context(|| format!("listening on {}", path.display()))?;

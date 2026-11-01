@@ -37,7 +37,8 @@ pub struct Layer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerSource {
     Bundled,
-    /// The network relay for allowlisted sessions, built from `relay/`.
+    /// The network relay for allowlisted sessions and forwarded ports, built
+    /// from `relay/`.
     Relay,
     Custom,
     Extension {
@@ -116,7 +117,8 @@ pub fn add_identity(stack: &mut Vec<Layer>, uid: u32, gid: u32) {
     });
 }
 
-/// The relay image that allowlisted sessions share a network namespace with.
+/// The relay image that sessions with an allowlist or forwarded ports share
+/// a network namespace with.
 /// It stands alone: nothing from the profile goes into it.
 pub fn relay_layer() -> Layer {
     let hash = sha256_hex_fields(&[RELAY_CONTAINERFILE.as_bytes(), RELAY_SOURCE.as_bytes()]);

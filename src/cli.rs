@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::backend::BackendKind;
 use crate::config::NetworkMode;
+use crate::forward::Port;
 
 /// Disposable, isolated containers around a project.
 #[derive(Debug, Parser)]
@@ -55,6 +56,11 @@ pub struct RunArgs {
     /// Same as `--network none`.
     #[arg(long)]
     pub offline: bool,
+    /// Make a port in the session reachable on the host's 127.0.0.1, in
+    /// addition to the profile's `ports`: PORT, or HOST_PORT:SESSION_PORT.
+    /// Repeatable.
+    #[arg(long = "port", value_name = "PORT", value_parser = parse_port)]
+    pub ports: Vec<Port>,
     /// Print the engine command instead of running it. Builds nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -64,6 +70,10 @@ pub struct RunArgs {
     /// bash).
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+fn parse_port(spec: &str) -> Result<Port, String> {
+    Port::parse(spec).map_err(|e| e.to_string())
 }
 
 impl RunArgs {
@@ -150,6 +160,26 @@ mod tests {
         };
         assert_eq!(run.network, Some(NetworkMode::Full));
         assert!(Cli::try_parse_from(["podbay", "run", "--network", "lan"]).is_err());
+    }
+
+    #[test]
+    fn ports() {
+        let cli = Cli::try_parse_from([
+            "podbay",
+            "run",
+            "--port",
+            "3080",
+            "--port",
+            "8080:3000",
+            ".",
+        ])
+        .unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!()
+        };
+        let ports: Vec<String> = run.ports.iter().map(Port::to_string).collect();
+        assert_eq!(ports, ["3080", "8080:3000"]);
+        assert!(Cli::try_parse_from(["podbay", "run", "--port", "0", "."]).is_err());
     }
 
     #[test]

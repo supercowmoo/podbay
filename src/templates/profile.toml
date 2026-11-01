@@ -30,6 +30,14 @@
 # network = ["api.anthropic.com", "*.githubusercontent.com"]
 # network = "full"
 
+# Ports in the session the host can reach, on its 127.0.0.1 only: 3080, or
+# "8080:3000" for host port 8080 to session port 3000. Anything on your
+# machine can connect to them, including web pages in your browser; see
+# "Forwarded ports" in podbay's README before forwarding a web UI.
+# --port adds more for one run.
+#
+# ports = [3080]
+
 # Capabilities the session keeps. None by default; each one weakens the
 # boundary, and podbay prints them on every run.
 #

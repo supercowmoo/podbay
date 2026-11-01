@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use crate::backend::Identity;
 use crate::config::Limits;
 use crate::egress;
+use crate::forward;
 use crate::profile::{ResolvedProfile, validate_container_path};
 
 pub const HOME: &str = "/home/dev";
@@ -82,9 +83,9 @@ pub enum Net {
     None,
     /// The engine's default network.
     Full,
-    /// Share the network namespace of this relay container, which has
-    /// only loopback and podbay's proxy on it.
-    Relay(String),
+    /// Share the network namespace of this relay container. `proxy`: it
+    /// runs podbay's allowlist proxy, which the session is pointed at.
+    Relay { container: String, proxy: bool },
 }
 
 pub struct Inputs<'a> {
@@ -197,7 +198,7 @@ impl RunPlan {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
-        if let Net::Relay(_) = inputs.network {
+        if let Net::Relay { proxy: true, .. } = inputs.network {
             let proxy = format!("http://{}", egress::PROXY_ADDR);
             for var in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
                 env.push((var.into(), proxy.clone()));
@@ -219,7 +220,9 @@ impl RunPlan {
                 // A container may only set up a network namespace its own
                 // user namespace owns, so share the relay's (created with
                 // the same mapping) instead of getting a new one.
-                Net::Relay(relay) if flag.starts_with("--userns=") => {
+                Net::Relay {
+                    container: relay, ..
+                } if flag.starts_with("--userns=") => {
                     flags.push(format!("--userns=container:{relay}"));
                 }
                 _ => flags.push(flag.clone()),
@@ -244,7 +247,9 @@ impl RunPlan {
         match &inputs.network {
             Net::None => flags.push("--network=none".into()),
             Net::Full => {}
-            Net::Relay(container) => flags.push(format!("--network=container:{container}")),
+            Net::Relay { container, .. } => {
+                flags.push(format!("--network=container:{container}"));
+            }
         }
 
         match inputs.limits.pids {
@@ -293,14 +298,22 @@ fn seccomp_flag(file: &Path) -> Result<String> {
     Ok(format!("--security-opt=seccomp={file}"))
 }
 
-/// Where the relay sees the directory holding podbay's socket.
+/// Where the relay sees the directory holding podbay's egress socket.
 const RELAY_SOCKET_DIR: &str = "/run/podbay";
+/// Where the relay creates its sockets for forwarded ports.
+const RELAY_FORWARD_DIR: &str = "/run/podbay-forward";
 
 pub struct RelayInputs<'a> {
     pub image: &'a str,
     pub name: &'a str,
-    /// Host directory holding podbay's policy socket.
-    pub socket_dir: &'a Path,
+    /// Host directory holding podbay's egress socket, for an allowlist.
+    pub egress_dir: Option<&'a Path>,
+    /// Host directory the relay creates forward sockets in, and the
+    /// session ports they lead to.
+    pub forward: Option<(&'a Path, &'a [u16])>,
+    /// Give the relay, and so the session, the engine's default network.
+    /// Only without an allowlist.
+    pub full_network: bool,
     pub identity: &'a Identity,
     pub repo_key: &'a str,
     pub limits: &'a Limits,
@@ -308,13 +321,27 @@ pub struct RelayInputs<'a> {
     pub seccomp: Option<&'a Path>,
 }
 
-/// `run` arguments for the relay container of an allowlisted session. It
-/// has no network, no capabilities and nothing writable, and runs as the
-/// user that owns podbay's socket so it can connect to it.
+/// `run` arguments for the relay container a session shares its network
+/// namespace with. It has no capabilities and nothing writable but the
+/// forward socket directory, and runs as the user that owns podbay's
+/// sockets so it can use them. It has no network either, unless the
+/// session was given full access.
 pub fn relay_args(inputs: &RelayInputs<'_>) -> Result<Vec<String>> {
-    let dir = inputs.socket_dir.to_string_lossy();
-    if dir.contains([',', '\n']) {
-        bail!("socket directory {dir} must not contain ',' or newlines");
+    if inputs.full_network && inputs.egress_dir.is_some() {
+        bail!("a relay with an allowlist can't have full network access");
+    }
+    let dirs: Vec<&Path> = inputs
+        .egress_dir
+        .into_iter()
+        .chain(inputs.forward.map(|(dir, _)| dir))
+        .collect();
+    for dir in &dirs {
+        if dir.to_string_lossy().contains([',', '\n']) {
+            bail!(
+                "socket directory {} must not contain ',' or newlines",
+                dir.display()
+            );
+        }
     }
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -322,11 +349,15 @@ pub fn relay_args(inputs: &RelayInputs<'_>) -> Result<Vec<String>> {
         "--rm".into(),
         format!("--name={}", inputs.name),
         format!("--label=io.podbay.repo-key={}", inputs.repo_key),
-        "--network=none".into(),
+    ];
+    if !inputs.full_network {
+        args.push("--network=none".into());
+    }
+    args.extend([
         "--read-only".into(),
         "--cap-drop=ALL".into(),
         "--security-opt=no-new-privileges".into(),
-    ];
+    ]);
     if let Some(file) = inputs.seccomp {
         args.push(seccomp_flag(file)?);
     }
@@ -352,12 +383,35 @@ pub fn relay_args(inputs: &RelayInputs<'_>) -> Result<Vec<String>> {
     if inputs.limits.pids.is_some_and(|n| n > 0) {
         args.push("--pids-limit=512".into());
     }
-    args.push(format!(
-        "--mount=type=bind,source={dir},target={RELAY_SOCKET_DIR},readonly"
-    ));
+    if let Some(dir) = inputs.egress_dir {
+        args.push(format!(
+            "--mount=type=bind,source={},target={RELAY_SOCKET_DIR},readonly",
+            dir.display()
+        ));
+    }
+    if let Some((dir, _)) = inputs.forward {
+        args.push(format!(
+            "--mount=type=bind,source={},target={RELAY_FORWARD_DIR}",
+            dir.display()
+        ));
+    }
     args.push(inputs.image.into());
-    args.push(egress::PROXY_ADDR.into());
-    args.push(format!("{RELAY_SOCKET_DIR}/{}", egress::SOCKET_NAME));
+    if inputs.egress_dir.is_some() {
+        args.extend([
+            "--egress".into(),
+            egress::PROXY_ADDR.into(),
+            format!("{RELAY_SOCKET_DIR}/{}", egress::SOCKET_NAME),
+        ]);
+    }
+    if let Some((_, ports)) = inputs.forward {
+        for port in ports {
+            args.extend([
+                "--forward".into(),
+                format!("{RELAY_FORWARD_DIR}/{}", forward::socket_name(*port)),
+                port.to_string(),
+            ]);
+        }
+    }
     Ok(args)
 }
 
@@ -585,7 +639,10 @@ mod tests {
         let profile = ResolvedProfile::default();
         let id = identity();
         let mut i = inputs(&profile, &id);
-        i.network = Net::Relay("podbay-relay-app-1".into());
+        i.network = Net::Relay {
+            container: "podbay-relay-app-1".into(),
+            proxy: true,
+        };
         let args = RunPlan::build(i).unwrap().args();
         for expected in [
             "--network=container:podbay-relay-app-1",
@@ -602,6 +659,23 @@ mod tests {
     }
 
     #[test]
+    fn relay_without_proxy_sets_no_proxy_variables() {
+        let profile = ResolvedProfile::default();
+        let id = identity();
+        let mut i = inputs(&profile, &id);
+        i.network = Net::Relay {
+            container: "relay-1".into(),
+            proxy: false,
+        };
+        let args = RunPlan::build(i).unwrap().args();
+        assert!(
+            args.contains(&"--network=container:relay-1".to_owned()),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("PROXY")), "{args:?}");
+    }
+
+    #[test]
     fn relay_sessions_share_its_user_namespace() {
         let profile = ResolvedProfile::default();
         let id = Identity {
@@ -614,7 +688,10 @@ mod tests {
             notes: vec![],
         };
         let mut i = inputs(&profile, &id);
-        i.network = Net::Relay("relay-1".into());
+        i.network = Net::Relay {
+            container: "relay-1".into(),
+            proxy: true,
+        };
         let args = RunPlan::build(i).unwrap().args();
         assert!(
             args.contains(&"--userns=container:relay-1".to_owned()),
@@ -627,9 +704,8 @@ mod tests {
         assert!(args.contains(&"--user=0:0".to_owned()), "{args:?}");
     }
 
-    #[test]
-    fn relay_container() {
-        let podman = Identity {
+    fn podman() -> Identity {
+        Identity {
             flags: vec![
                 "--userns=keep-id:uid=1000,gid=1000".into(),
                 "--user=0:0".into(),
@@ -637,19 +713,33 @@ mod tests {
             uid: 1000,
             gid: 1000,
             notes: vec![],
-        };
+        }
+    }
+
+    fn relay_inputs<'a>(id: &'a Identity, limits: &'a Limits) -> RelayInputs<'a> {
+        RelayInputs {
+            image: "podbay-relay:1",
+            name: "podbay-relay-app-1",
+            egress_dir: None,
+            forward: None,
+            full_network: false,
+            identity: id,
+            repo_key: "app-1",
+            limits,
+            seccomp: Some(Path::new("/c/seccomp/relay.json")),
+        }
+    }
+
+    #[test]
+    fn relay_container() {
+        let id = podman();
         let limits = Limits {
             pids: Some(4096),
             ..NO_LIMITS.clone()
         };
         let args = relay_args(&RelayInputs {
-            image: "podbay-relay:1",
-            name: "podbay-relay-app-1",
-            socket_dir: Path::new("/run/user/1000/podbay-x"),
-            identity: &podman,
-            repo_key: "app-1",
-            limits: &limits,
-            seccomp: Some(Path::new("/c/seccomp/relay.json")),
+            egress_dir: Some(Path::new("/run/user/1000/podbay-x")),
+            ..relay_inputs(&id, &limits)
         })
         .unwrap();
         assert_eq!(
@@ -671,9 +761,79 @@ mod tests {
                 "--pids-limit=512",
                 "--mount=type=bind,source=/run/user/1000/podbay-x,target=/run/podbay,readonly",
                 "podbay-relay:1",
+                "--egress",
                 "127.0.0.1:3128",
                 "/run/podbay/egress.sock",
             ]
+        );
+    }
+
+    #[test]
+    fn relay_for_forwarded_ports() {
+        let id = podman();
+        let ports = [3080, 8000];
+        // Offline: no network, a writable socket directory, no egress.
+        let args = relay_args(&RelayInputs {
+            forward: Some((Path::new("/run/user/1000/podbay-f"), &ports)),
+            ..relay_inputs(&id, &NO_LIMITS)
+        })
+        .unwrap();
+        assert!(args.contains(&"--network=none".to_owned()), "{args:?}");
+        assert!(!args.contains(&"--egress".to_owned()), "{args:?}");
+        let image = args.iter().position(|a| a == "podbay-relay:1").unwrap();
+        assert_eq!(
+            args[image - 1],
+            "--mount=type=bind,source=/run/user/1000/podbay-f,target=/run/podbay-forward"
+        );
+        assert_eq!(
+            args[image + 1..],
+            [
+                "--forward",
+                "/run/podbay-forward/3080.sock",
+                "3080",
+                "--forward",
+                "/run/podbay-forward/8000.sock",
+                "8000",
+            ]
+        );
+
+        // Full network goes to the relay, which the session joins.
+        let args = relay_args(&RelayInputs {
+            forward: Some((Path::new("/run/user/1000/podbay-f"), &ports)),
+            full_network: true,
+            ..relay_inputs(&id, &NO_LIMITS)
+        })
+        .unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("--network")), "{args:?}");
+
+        // With an allowlist, both.
+        let args = relay_args(&RelayInputs {
+            egress_dir: Some(Path::new("/run/user/1000/podbay-x")),
+            forward: Some((Path::new("/run/user/1000/podbay-f"), &ports[..1])),
+            ..relay_inputs(&id, &NO_LIMITS)
+        })
+        .unwrap();
+        let image = args.iter().position(|a| a == "podbay-relay:1").unwrap();
+        assert_eq!(
+            args[image + 1..],
+            [
+                "--egress",
+                "127.0.0.1:3128",
+                "/run/podbay/egress.sock",
+                "--forward",
+                "/run/podbay-forward/3080.sock",
+                "3080",
+            ]
+        );
+
+        // An allowlisted relay never gets the network itself.
+        assert!(
+            relay_args(&RelayInputs {
+                egress_dir: Some(Path::new("/run/user/1000/podbay-x")),
+                full_network: true,
+                ..relay_inputs(&id, &NO_LIMITS)
+            })
+            .is_err()
         );
     }
 

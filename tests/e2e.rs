@@ -5,9 +5,13 @@
 //! no toolchain) so the test needs no network beyond pulling Debian.
 
 use std::fs;
+use std::io::Read;
+use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command as StdCommand;
+use std::process::{Command as StdCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 
@@ -665,7 +669,7 @@ fn allowlisted_session_reaches_only_listed_hosts() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let project = root.join("project");
+    let project = root.join("allowlist-project");
     let profiles = root.join("config/profiles");
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&profiles).unwrap();
@@ -744,9 +748,154 @@ fi
         );
     }
 
-    // The relay is gone with the session.
+    // The relay is gone with the session. Other tests run relays at the
+    // same time, so look for this project's only.
     let left = StdCommand::new(&engine)
-        .args(["ps", "--all", "--quiet", "--filter", "name=podbay-relay-"])
+        .args(["ps", "--all", "--quiet", "--filter"])
+        .arg("name=podbay-relay-allowlist-project-")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&left.stdout).trim().is_empty(),
+        "relay containers left behind"
+    );
+}
+
+/// A server in the session, on its own loopback, reached from the host
+/// through a forwarded port, in every network mode. The forward goes one
+/// way: the session still can't reach the host or the internet.
+#[test]
+fn forwarded_port_reaches_a_server_in_the_session() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("ports-project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2eports{}", std::process::id());
+    fs::write(
+        profiles.join(format!("{id}.toml")),
+        "network = [\"allowed.podbay.test\"]\n",
+    )
+    .unwrap();
+
+    // Serves one connection on loopback only, then checks what the session
+    // itself can reach. The test image has perl but no netcat or python.
+    let script = r#"
+echo "interfaces=$(tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d ' ' | sort | tr '\n' ' ')"
+perl -MIO::Socket::INET -e '
+  my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 3080,
+                                Listen => 5, ReuseAddr => 1) or die "listen: $!";
+  my $c = $s->accept; print $c "hello from the session
+"; close $c;'
+if timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$HOST_PORT" 2>/dev/null; then
+  echo host-port=open
+else
+  echo host-port=closed
+fi
+"#;
+
+    for (flags, mode) in [
+        (&["--offline"][..], "offline"),
+        (&[], "allowlist"),
+        (&["--online"], "full"),
+    ] {
+        let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut child = StdCommand::new(env!("CARGO_BIN_EXE_podbay"))
+            .env("PODBAY_CONFIG_DIR", root.join("config"))
+            .env("PODBAY_CACHE_DIR", root.join("cache"))
+            .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
+            .args(flags)
+            .args(["--port", &format!("{host_port}:3080")])
+            .arg(&project)
+            .args([
+                "--",
+                "env",
+                &format!("HOST_PORT={host_port}"),
+                "bash",
+                "-c",
+                script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // The host side listens before the session's server is up; until
+        // then connections close with nothing read.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let reply = loop {
+            if let Ok(mut conn) = TcpStream::connect(("127.0.0.1", host_port)) {
+                let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut reply = String::new();
+                let _ = conn.read_to_string(&mut reply);
+                if !reply.is_empty() {
+                    break reply;
+                }
+            }
+            if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{mode}: no reply through the forward\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(reply, "hello from the session\n", "{mode}");
+
+        let output = child.wait_with_output().unwrap();
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{mode}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+        for expected in [
+            format!("forwarding http://127.0.0.1:{host_port} to session port 3080"),
+            format!("127.0.0.1:{host_port} -> session port 3080: "),
+        ] {
+            assert!(
+                err.contains(&expected),
+                "{mode}: missing {expected:?}\n{err}"
+            );
+        }
+        // The session never sees the host's loopback.
+        assert!(out.contains("host-port=closed"), "{mode}\n{out}");
+        match mode {
+            "full" => assert!(!out.contains("interfaces=lo \n"), "{mode}\n{out}"),
+            _ => assert!(out.contains("interfaces=lo \n"), "{mode}\n{out}"),
+        }
+        assert_eq!(
+            err.contains("podbay: network:\n") || err.contains("no connections through"),
+            mode == "allowlist",
+            "{mode}\n{err}"
+        );
+
+        // The port closes with the session.
+        assert!(
+            TcpStream::connect(("127.0.0.1", host_port)).is_err(),
+            "{mode}: host port {host_port} still open"
+        );
+    }
+
+    let left = StdCommand::new(&engine)
+        .args(["ps", "--all", "--quiet", "--filter"])
+        .arg("name=podbay-relay-ports-project-")
         .output()
         .unwrap();
     assert!(

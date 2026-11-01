@@ -47,6 +47,7 @@ sources.
 | Container to host processes | Engine namespaces, no capabilities, `no-new-privileges`, podbay's seccomp filter, kernel | See "Privilege inside the container" |
 | Container to host files | Only declared mounts are visible | The project is read-write |
 | Container to network | `--network=none`, or a relay and podbay's allowlist | A profile can still opt into full access |
+| Host to session | Nothing listens unless you forward a port | Opt-in; see "Forwarded ports" |
 | Provisioning to network | **Not enforced** | Runs your installers on project-chosen versions; see "Provisioning" |
 | Project to image build | Extensions are read only from your config dir | A project can never add root build steps |
 | Session to session | `--rm`, per-profile volumes | Some state is shared, see below |
@@ -176,6 +177,39 @@ run git; it does not stop anything.
     podbay states it on every run that has it, and warns when a profile is
     what turned it on.
   - Provisioning, below.
+- **Forwarded ports (opt-in).** `ports` in a profile or `--port` makes a
+  server in the session reachable from the host. podbay listens on the
+  host's `127.0.0.1` only, never on other addresses, and passes each
+  connection over a Unix socket to the relay container, which connects to
+  that one port on the session's loopback. The relay is started with the
+  port numbers and takes no destination from the connection, so a forward
+  can't be used to reach anything else, and the session can't open
+  anything through it: the host's loopback stays out of its reach. A
+  session with forwarded ports always shares the relay's network
+  namespace; with full access, the relay gets the engine's network and the
+  session joins it. What a forward exposes:
+  - **Anything on the host can connect.** Other users and processes on
+    the machine can reach `127.0.0.1:<port>`, and so can web pages open in
+    your browser: through DNS rebinding, or plain requests to localhost
+    that the browser sends without reading the reply. If the server in the
+    session acts on requests, such as an agent's web UI that runs
+    commands, a web page can drive it. The session's own limits still hold
+    (no host files beyond its mounts, only the network it was given), but
+    the server is open to more than you. Prefer servers that require a
+    token or check the `Host` header, and forward only while you use them.
+  - **The session serves content to your browser.** A page from a
+    forwarded port runs as the origin `http://127.0.0.1:<port>`. Browsers
+    scope cookies by host, not port, so its scripts can read and set
+    cookies of every other web app you use on `127.0.0.1` or `localhost`
+    (any port), and of anything that stores them there. Don't sign in to
+    other local web apps in the same browser profile while you use a
+    forward, or use a separate browser profile for it.
+  - **More code in the path.** The server in the session, the relay and
+    podbay's forwarder handle bytes from both sides. podbay and the relay
+    copy them without parsing.
+  podbay prints every forward when the session starts, and the number of
+  connections to each when it ends. Connections are capped at 256 per
+  port, and the ports close when the session does.
 - **Provisioning (stage 4).** Tools are installed before the session, in a
   container with full network access that runs the profile's `[provision]`
   commands. The commands come only from your config directory. The

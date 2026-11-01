@@ -13,6 +13,7 @@
 //! shell = "zsh"                  # login shell for interactive sessions
 //! path = ["/home/dev/.cargo/bin"] # prepended to PATH
 //! network = ["api.example.com"]   # or "full"; default "none"
+//! ports = [3080, "8080:3000"]     # host 127.0.0.1 port, then the session's
 //!
 //! [env]
 //! RUSTUP_HOME = "/home/dev/.rustup"
@@ -39,6 +40,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::config::{Limits, NetworkSetting};
+use crate::forward::{self, Port};
 use crate::paths::Paths;
 
 #[derive(Debug, Default, Deserialize)]
@@ -66,6 +68,9 @@ struct ProfileFile {
     #[serde(default)]
     limits: Limits,
     network: Option<NetworkSetting>,
+    /// Session ports reachable from the host's loopback.
+    #[serde(default)]
+    ports: Vec<Port>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +181,9 @@ pub struct ResolvedProfile {
     /// `network` settings down the chain, ancestors first, each with the
     /// profile that set it.
     pub network: Vec<(NetworkSetting, String)>,
+    /// Forwarded ports down the chain, ancestors first, each with the
+    /// profile that added it.
+    pub ports: Vec<(Port, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
 }
@@ -557,6 +565,14 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProf
 
     if let Some(network) = profile.network {
         out.network.push((network, name.to_owned()));
+    }
+
+    for port in profile.ports {
+        let mut taken: Vec<Port> = out.ports.iter().map(|(p, _)| *p).collect();
+        forward::add(&mut taken, port)?;
+        if !out.ports.iter().any(|(p, _)| *p == port) {
+            out.ports.push((port, name.to_owned()));
+        }
     }
     Ok(())
 }
@@ -984,6 +1000,29 @@ mod tests {
         assert!(err.contains("SYS_EVERYTHING"), "{err}");
         f.profile("lim", "[limits]\ncpus = 0\n");
         assert!(resolve(&f.paths, "lim").is_err());
+    }
+
+    #[test]
+    fn ports_add_up_down_the_chain() {
+        let f = Fixture::new();
+        f.profile("base", "ports = [3080]\n")
+            .profile(
+                "web",
+                "extends = [\"base\"]\nports = [3080, \"8080:3000\"]\n",
+            )
+            .profile("clash", "extends = [\"base\"]\nports = [\"3080:4000\"]\n");
+        let r = resolve(&f.paths, "web").unwrap();
+        let ports: Vec<(String, &str)> = r
+            .ports
+            .iter()
+            .map(|(p, from)| (p.to_string(), from.as_str()))
+            .collect();
+        assert_eq!(
+            ports,
+            [("3080".into(), "base"), ("8080:3000".into(), "web")]
+        );
+        let err = format!("{:#}", resolve(&f.paths, "clash").unwrap_err());
+        assert!(err.contains("host port 3080 is forwarded twice"), "{err}");
     }
 
     #[test]

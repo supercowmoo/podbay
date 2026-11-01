@@ -1,5 +1,5 @@
 # The relay image: one static binary on an empty filesystem. podbay builds
-# it the first time a session uses a network allowlist.
+# it the first time a session uses a network allowlist or forwards a port.
 FROM rust:1.90.0-alpine3.22 AS build
 COPY main.rs /src/main.rs
 RUN rustc --edition 2024 -C opt-level=s -C panic=abort \
