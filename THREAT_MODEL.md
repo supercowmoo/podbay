@@ -228,17 +228,19 @@ run git; it does not stop anything.
   state" applies to it; with `--local-cache` the writes stay in that
   project's own copies.
 - **The profile's `path`.** Its directories usually live in volumes the
-  session can write. They apply only to the session's own processes: the
-  entrypoint resolves everything it runs as root from the image's PATH
-  before adding them.
+  session can write. They apply only to the session's own processes: podbay-init
+  runs nothing from PATH while privileged, and adds them only for the
+  command it starts after dropping to `dev`.
 - **Privilege inside the container (reduced in stage 3).** The session
   runs as `dev` with an empty capability set, including the bounding set,
   and `no-new-privileges`. setuid binaries and file capabilities in the
   image give nothing. The root filesystem is read-only; only `/home/dev`,
   `/tmp` and `/var/tmp` (tmpfs, fresh each session) and the declared
-  mounts are writable. The entrypoint runs as (namespaced) root with
-  CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETPCAP and SETUID, for under a
-  second, before your command runs. Two gaps remain:
+  mounts are writable. The container's first process, podbay-init (a
+  static binary from `init/`), runs as (namespaced) root with CHOWN,
+  DAC_OVERRIDE, FOWNER, SETGID, SETPCAP and SETUID, for under a second,
+  before your command runs. It never follows symbolic links while fixing
+  ownership, so links a session plants in a volume can't redirect it. Two gaps remain:
   - A profile's `cap_add` hands capabilities back on purpose. podbay
     prints them on every run, but some (`SYS_ADMIN`, `SYS_MODULE`,
     `SYS_RAWIO`, `NET_ADMIN`, `DAC_READ_SEARCH`, ...) amount to giving up

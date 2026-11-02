@@ -1,5 +1,5 @@
 [workspace]
-members = ["relay"]
+members = ["relay", "init"]
 
 [package]
 name = "podbay"

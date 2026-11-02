@@ -315,6 +315,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "podbay-init"
+version = "0.1.0"
+
+[[package]]
 name = "podbay-relay"
 version = "0.1.0"
 

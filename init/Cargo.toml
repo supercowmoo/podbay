@@ -1,0 +1,9 @@
+[package]
+name = "podbay-init"
+version = "0.1.0"
+edition = "2024"
+description = "Sets up a podbay session and drops to the dev user before running its command"
+publish = false
+
+# Standard library only: the base image builds this file with plain rustc.
+[dependencies]

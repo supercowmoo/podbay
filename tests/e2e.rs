@@ -1,7 +1,7 @@
 //! End-to-end runs against a real engine. Skipped when the engine is not
 //! available. Select it with PODBAY_TEST_BACKEND (default: docker).
 //!
-//! Uses a lightweight stand-in for the bundled base image (same entrypoint,
+//! Uses a lightweight stand-in for the bundled base image (same podbay-init,
 //! no toolchain) so the test needs no network beyond pulling Debian.
 
 use std::fs;
@@ -39,11 +39,7 @@ fn build_test_base(engine: &str) {
         ctx.path().join("Containerfile"),
     )
     .unwrap();
-    fs::copy(
-        repo.join("base/entrypoint.sh"),
-        ctx.path().join("entrypoint.sh"),
-    )
-    .unwrap();
+    fs::copy(repo.join("init/src/main.rs"), ctx.path().join("init.rs")).unwrap();
     fs::copy(
         repo.join("tests/fixtures/test-base/probe-install"),
         ctx.path().join("probe-install"),

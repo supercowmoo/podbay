@@ -298,7 +298,7 @@ or writes into, such as toolchains, since the home directory is wiped after
 every session. Keep mounts of anything your host runs read-only: a
 read-write `~/.bashrc` or `~/.cargo` lets the session plant code that runs
 on your host. The engine creates a missing mount point's parent
-directories as root, and the entrypoint gives them to `dev`.
+directories as root, and podbay-init gives them to `dev`.
 
 **Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
 Each tag is a hash of the script and its parent image's tag, so editing a
@@ -318,7 +318,7 @@ automatically.
   volume.
 - **Privileges**: none. The session runs as `dev` with no capabilities and
   `no-new-privileges`, so setuid binaries and `sudo` don't work. The
-  entrypoint starts with just enough to set up the home directory and fix
+  container's first process, podbay-init, starts with just enough to set up the home directory and fix
   mount ownership, then drops all of it before your command runs. A profile
   can keep specific capabilities with `cap_add` (see below).
 - **Syscalls**: podbay's seccomp filter, the same on Podman and Docker. It
@@ -512,9 +512,10 @@ memory = "8g"                # default: no limit
 cpus = 4                     # default: no limit
 ```
 
-A custom base image must provide a `dev` user, `setpriv`, podbay's
+A custom base image must provide a `dev` user, podbay-init as its
 entrypoint, and a copy of `/home/dev` at `/usr/local/share/podbay/home` to
-seed the home directory from (see `base/Containerfile`). For `path` to
+seed the home directory from (see `base/Containerfile`). podbay-init is a
+static binary built from `init/`, so it needs nothing else from the image. For `path` to
 survive login shells, it also needs the `/etc/profile.d/podbay-path.sh`
 snippet from there.
 
@@ -542,11 +543,12 @@ PODBAY_TEST_BACKEND=podman cargo test
 The end-to-end tests run real containers on Docker (or the engine named by
 `PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available. They
 use a small stand-in for the base image (`tests/fixtures/test-base`) with the
-same entrypoint and a fake installer that records what provisioning saw, so
+same podbay-init and a fake installer that records what provisioning saw, so
 they don't need to build the full toolchain. Two of them play a hostile
 session: one checks that the session report catches it, the other that the
 network allowlist holds. Set `PODBAY_TEST_INTERNET=1` to also check that an
 allowed host is reachable, as CI does.
 
-The relay is its own crate in `relay/`, standard library only; run
-`cargo test --workspace` and `cargo clippy --workspace` to include it.
+The relay and podbay-init are their own crates in `relay/` and `init/`,
+standard library only, since the images build them with plain `rustc`. Run
+`cargo test --workspace` and `cargo clippy --workspace` to include them.

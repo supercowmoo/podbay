@@ -1,7 +1,14 @@
 # Minimal stand-in for the bundled base image: the same dev user layout and
-# entrypoint, without the network-heavy toolchain, and a fake installer that
+# podbay-init, without the network-heavy toolchain, and a fake installer that
 # records what provisioning saw. Used by the end-to-end tests via the
 # `base_image` config setting.
+# podbay-init, the container's first process: a static binary built from
+# init/src/main.rs with plain rustc, so it needs nothing from this image.
+FROM rust:1.90.0-alpine3.22 AS init
+COPY init.rs /src/init.rs
+RUN rustc --edition 2024 -C opt-level=s -C panic=abort \
+    -C target-feature=+crt-static -C strip=symbols -o /podbay-init /src/init.rs
+
 FROM debian:trixie-slim
 RUN useradd -m -u 1000 -U -s /bin/bash dev \
   && mkdir -p /home/dev/workspace \
@@ -14,9 +21,9 @@ RUN printf '%s\n' \
     '  case ":$PATH:" in *":$PODBAY_PATH:"*) ;; *) PATH="$PODBAY_PATH:$PATH" ;; esac' \
     '  export PATH' \
     'fi' > /etc/profile.d/podbay-path.sh
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --from=init /podbay-init /usr/local/bin/podbay-init
 COPY probe-install /usr/local/bin/probe-install
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/probe-install
+RUN chmod +x /usr/local/bin/probe-install
 WORKDIR /home/dev/workspace
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/podbay-init"]
 CMD ["bash", "-l"]

@@ -15,7 +15,7 @@ use crate::hash::sha256_hex_fields;
 use crate::profile::Extension;
 
 const BASE_CONTAINERFILE: &str = include_str!("../base/Containerfile");
-const BASE_ENTRYPOINT: &str = include_str!("../base/entrypoint.sh");
+const INIT_SOURCE: &str = include_str!("../init/src/main.rs");
 const RELAY_CONTAINERFILE: &str = include_str!("../relay/Containerfile");
 const RELAY_SOURCE: &str = include_str!("../relay/src/main.rs");
 
@@ -56,7 +56,7 @@ pub enum LayerSource {
 }
 
 /// Where the base image keeps a copy of `/home/dev`, which is a tmpfs at run
-/// time; the entrypoint seeds the home directory from it.
+/// time; podbay-init seeds the home directory from it.
 const HOME_SKELETON: &str = "/usr/local/share/podbay/home";
 
 /// Computes the layer stack for a profile, bottom first. The last layer is
@@ -64,8 +64,7 @@ const HOME_SKELETON: &str = "/usr/local/share/podbay/home";
 pub fn layers(base: &BaseImage, extensions: &[Extension]) -> Result<Vec<Layer>> {
     let mut stack = vec![match base {
         BaseImage::Bundled => {
-            let hash =
-                sha256_hex_fields(&[BASE_CONTAINERFILE.as_bytes(), BASE_ENTRYPOINT.as_bytes()]);
+            let hash = sha256_hex_fields(&[BASE_CONTAINERFILE.as_bytes(), INIT_SOURCE.as_bytes()]);
             Layer {
                 tag: format!("podbay-base:{}", &hash[..16]),
                 source: LayerSource::Bundled,
@@ -174,7 +173,7 @@ fn build(backend: &dyn Backend, layer: &Layer, force: bool) -> Result<()> {
     match &layer.source {
         LayerSource::Bundled => {
             fs::write(ctx.path().join("Containerfile"), BASE_CONTAINERFILE)?;
-            fs::write(ctx.path().join("entrypoint.sh"), BASE_ENTRYPOINT)?;
+            fs::write(ctx.path().join("init.rs"), INIT_SOURCE)?;
         }
         LayerSource::Relay => {
             fs::write(ctx.path().join("Containerfile"), RELAY_CONTAINERFILE)?;
