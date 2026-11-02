@@ -5,7 +5,6 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::backend::BackendKind;
@@ -80,7 +79,7 @@ impl TryFrom<RawNetwork> for NetworkSetting {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     /// Loopback only.
@@ -88,6 +87,17 @@ pub enum NetworkMode {
     /// The engine's default network: the internet, the LAN, and depending
     /// on the engine, the host.
     Full,
+}
+
+impl std::str::FromStr for NetworkMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "none" => Ok(Self::None),
+            "full" => Ok(Self::Full),
+            _ => Err(()),
+        }
+    }
 }
 
 /// What a session can reach, once config.toml, the profile chain and

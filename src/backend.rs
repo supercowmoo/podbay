@@ -7,17 +7,27 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
 use serde::Deserialize;
 
 /// The uid/gid the image's `dev` user is given inside the container.
 pub const IMAGE_DEV_UID: u32 = 1000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
     Podman,
     Docker,
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s {
+            "podman" => Ok(Self::Podman),
+            "docker" => Ok(Self::Docker),
+            _ => Err(()),
+        }
+    }
 }
 
 impl BackendKind {

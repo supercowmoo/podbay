@@ -19,8 +19,6 @@ mod tempdir;
 
 use std::process::ExitCode;
 
-use clap::Parser;
-
 use crate::cli::{Cli, Command};
 
 fn main() -> ExitCode {
