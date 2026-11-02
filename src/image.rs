@@ -31,7 +31,7 @@ pub enum BaseImage {
 /// The build stage that compiles podbay-init, shared by the bundled base
 /// and adapters. `base/Containerfile` has the same stage.
 const INIT_STAGE: &str = "\
-FROM rust:1.90.0-alpine3.22 AS init
+FROM rust:1.90.0-alpine3.22@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS init
 COPY init.rs /src/init.rs
 RUN rustc --edition 2024 -C opt-level=s -C panic=abort \\
     -C target-feature=+crt-static -C strip=symbols -o /podbay-init /src/init.rs

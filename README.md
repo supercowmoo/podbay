@@ -49,8 +49,12 @@ tells you when that has happened.
 ## Install
 
 ```
-cargo install --path .
+cargo install --locked --path .
 ```
+
+`--locked` builds with the exact dependency versions and checksums in
+`Cargo.lock`. Without it, cargo picks newer versions. The compiler version
+is pinned too (`rust-toolchain.toml`); rustup installs it if needed.
 
 You need Podman or Docker. Podman is preferred when both are installed
 because it is rootless by default. With rootful Docker, a container escape is
@@ -397,6 +401,11 @@ capabilities, `no-new-privileges` (so the image's `sudo` does nothing), a
 read-only root filesystem, podbay's seccomp filter and network policy.
 Docker-in-Docker and other features some images expect from their own
 sandbox aren't available.
+
+A tag can be moved to different content; to pin exactly what runs, add the
+digest, as podbay does for its own images:
+`image = "alpine:3.22@sha256:2e0b81d6…"` (from `docker buildx imagetools
+inspect` or `skopeo inspect`).
 
 A stack of profiles has one image. Two stacked profiles that name different
 images are an error, unless one extends the other. Extensions build on top

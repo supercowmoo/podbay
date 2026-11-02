@@ -1,0 +1,6 @@
+# The exact compiler podbay is built and tested with. rustup installs it
+# from static.rust-lang.org, checking its published hashes.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

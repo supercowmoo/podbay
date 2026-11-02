@@ -8,8 +8,15 @@
 # "task"` instead of `dsh web` answers one task in the terminal.
 #
 # Also copy examples/dsh/cordis.patch.yml to ~/.config/podbay/dsh/: it
-# picks OpenRouter and a model. dsh is a developer preview, so both versions
-# below are pinned; change them deliberately.
+# picks OpenRouter and a model. dsh is a developer preview, so everything
+# below is pinned; change it deliberately:
+# - Node: a fixed version, checked against its published SHA-256.
+# - dsh: a fixed version. Its ~170 npm dependencies resolve only to versions
+#   published before `before`, so a package published later, malicious or
+#   not, is never picked up. npm checks every package's integrity hash.
+# - No install scripts run (--ignore-scripts). On Linux they only pick
+#   prebuilt binaries the packages already ship; installing without them
+#   gives the same files.
 
 path = ["/home/dev/.dsh-tools/node/bin", "/home/dev/.dsh-tools/dsh/bin"]
 
@@ -48,6 +55,7 @@ container = "/home/dev/.dsh/cordis.patch.yml"
 command = """
 node=v24.22.2
 dsh=0.2.1-rc.5
+before=2026-11-02T20:00:00Z
 case "$(uname -m)" in
   x86_64) arch=x64 sum=48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75 ;;
   aarch64) arch=arm64 sum=eb187837a2230d4047161ac0be008584e16b46f726e9c9490ee35dc6b17d9ba8 ;;
@@ -62,6 +70,6 @@ if [ "$("$tools/node/bin/node" --version 2>/dev/null)" != "$node" ]; then
 fi
 export PATH="$tools/node/bin:$PATH"
 if [ "$("$tools/dsh/bin/dsh" --version 2>/dev/null)" != "$dsh" ]; then
-  npm install -g --prefix "$tools/dsh" "@deepseek-ai/dsh@$dsh"
+  npm install -g --ignore-scripts --before="$before" --prefix "$tools/dsh" "@deepseek-ai/dsh@$dsh"
 fi
 """

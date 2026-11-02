@@ -624,12 +624,12 @@ fn sessions_run_on_images_podbay_did_not_build() {
     let (alpine, scratch) = (format!("e2ealpine{id}"), format!("e2escratch{id}"));
     fs::write(
         profiles.join(format!("{alpine}.toml")),
-        "image = \"alpine:3.22\"\ncap_add = [\"NET_RAW\"]\n",
+        "image = \"alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f\"\ncap_add = [\"NET_RAW\"]\n",
     )
     .unwrap();
     fs::write(
         profiles.join(format!("{scratch}.toml")),
-        "image = \"hello-world:latest\"\n",
+        "image = \"hello-world:latest@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef\"\n",
     )
     .unwrap();
 
