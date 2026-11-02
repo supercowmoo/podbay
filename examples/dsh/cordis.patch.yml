@@ -1,0 +1,17 @@
+# dsh settings for podbay sessions: ~/.config/podbay/dsh/cordis.patch.yml.
+# The dsh profile mounts it read-only at $DSH_HOME/cordis.patch.yml.
+
+# OpenRouter, with the key from OPENROUTER_API_KEY (env_from_host in the
+# profile). It's in dsh's built-in catalog, so nothing else is needed.
+- id: llm-pi-ai
+  config:
+    providers:
+      openrouter:
+        apiKeyEnv: OPENROUTER_API_KEY
+
+# The model new sessions start with; any OpenRouter model id works, and the
+# web UI can switch per session.
+- id: agent-default-model
+  config:
+    provider: openrouter
+    model: ~deepseek/deepseek-flash-latest

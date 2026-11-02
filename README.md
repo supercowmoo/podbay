@@ -154,6 +154,19 @@ The agent keeps its login and history across both, because volumes belong
 to the profile that declares them (`podbay-opencode-config`), not to the
 combination.
 
+[`examples/`](examples/) has profiles ready to copy: `rust.toml`, and
+`dsh.toml` for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+with models from OpenRouter, its web UI forwarded to your browser:
+
+```
+cp examples/profiles/*.toml ~/.config/podbay/profiles/
+mkdir -p ~/.config/podbay/dsh && cp examples/dsh/cordis.patch.yml ~/.config/podbay/dsh/
+export OPENROUTER_API_KEY=...
+podbay run -p rust -p dsh ~/src/my-rust-app -- dsh web --no-open
+```
+
+Then open the URL dsh prints; it carries the login token.
+
 ### Everyday commands
 
 ```

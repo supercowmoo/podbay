@@ -1,0 +1,34 @@
+# Rust, with the toolchain the project pins. Stack it with an agent:
+#   podbay run -p rust -p dsh ~/src/my-rust-app
+#
+# rustup is installed into a volume the first time, then installs whatever
+# rust-toolchain.toml asks for. Dependencies are fetched before the session
+# too, so builds work without network.
+
+path = ["/home/dev/.cargo/bin"]
+
+# Only for adding new dependencies during a session; drop these lines to
+# keep the session fully offline.
+network = ["index.crates.io", "static.crates.io"]
+
+[env]
+RUSTUP_HOME = "/home/dev/.rustup"
+CARGO_HOME = "/home/dev/.cargo"
+
+[[volume]]
+name = "rustup"
+container = "/home/dev/.rustup"
+provision = true
+
+[[volume]]
+name = "cargo"
+container = "/home/dev/.cargo"
+provision = true
+
+[provision]
+command = """
+command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+rustup show active-toolchain || rustup toolchain install
+if [ -f Cargo.lock ]; then cargo fetch --locked; fi
+"""
+watch = ["rust-toolchain.toml", "rust-toolchain", "Cargo.lock"]

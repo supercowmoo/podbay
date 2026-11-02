@@ -1,0 +1,67 @@
+# DeepSeek Harness (dsh), a coding agent with a web UI, using models from
+# OpenRouter. Stack it with a language profile:
+#
+#   export OPENROUTER_API_KEY=...
+#   podbay run -p rust -p dsh ~/src/my-rust-app -- dsh web --no-open
+#
+# then open the URL dsh prints; it carries the login token. `dsh headless
+# "task"` instead of `dsh web` answers one task in the terminal.
+#
+# Also copy examples/dsh/cordis.patch.yml to ~/.config/podbay/dsh/: it
+# picks OpenRouter and a model. dsh is a developer preview, so both versions
+# below are pinned; change them deliberately.
+
+path = ["/home/dev/.dsh-tools/node/bin", "/home/dev/.dsh-tools/dsh/bin"]
+
+# The key comes from your shell, for the session only. The session can
+# reach OpenRouter and nothing else, so that's the only place it can go.
+env_from_host = ["OPENROUTER_API_KEY"]
+network = ["openrouter.ai"]
+
+# The web UI. It asks for the token in the URL dsh prints, so other things
+# on your machine can't drive it.
+ports = [3080]
+
+[env]
+DSH_HOME = "/home/dev/.dsh"
+# dsh uploads a session when you send feedback, unless this is set.
+DSH_TELEMETRY_MODE = "DISABLED"
+
+# Node and dsh, installed by [provision] below.
+[[volume]]
+name = "tools"
+container = "/home/dev/.dsh-tools"
+provision = true
+
+# Sessions, settings and the web UI's login secret. Not a provision volume,
+# so none of it shares a container with the network.
+[[volume]]
+name = "home"
+container = "/home/dev/.dsh"
+
+# Provider and model, read-only, so the agent can't change them.
+[[mount]]
+host = "~/.config/podbay/dsh/cordis.patch.yml"
+container = "/home/dev/.dsh/cordis.patch.yml"
+
+[provision]
+command = """
+node=v24.22.2
+dsh=0.2.1-rc.5
+case "$(uname -m)" in
+  x86_64) arch=x64 sum=48cc0e21e048790e54c0cf5749c2725005313d652651c40b7a21feb9697aaf75 ;;
+  aarch64) arch=arm64 sum=eb187837a2230d4047161ac0be008584e16b46f726e9c9490ee35dc6b17d9ba8 ;;
+  *) echo "no Node build for $(uname -m)" >&2; exit 1 ;;
+esac
+tools=$HOME/.dsh-tools
+if [ "$("$tools/node/bin/node" --version 2>/dev/null)" != "$node" ]; then
+  curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/$node/node-$node-linux-$arch.tar.xz"
+  echo "$sum  /tmp/node.tar.xz" | sha256sum -c -
+  rm -rf "$tools/node" && mkdir -p "$tools/node"
+  tar -xJf /tmp/node.tar.xz --strip-components=1 -C "$tools/node"
+fi
+export PATH="$tools/node/bin:$PATH"
+if [ "$("$tools/dsh/bin/dsh" --version 2>/dev/null)" != "$dsh" ]; then
+  npm install -g --prefix "$tools/dsh" "@deepseek-ai/dsh@$dsh"
+fi
+"""

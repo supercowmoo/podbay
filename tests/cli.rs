@@ -168,3 +168,50 @@ fn stacked_profiles_show_together() {
         "{shown}"
     );
 }
+
+/// The example profiles in examples/ stay valid as podbay changes, and
+/// stack the way the README says.
+#[test]
+fn example_profiles_resolve() {
+    let env = Env::new();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::create_dir_all(env.profiles()).unwrap();
+    for entry in fs::read_dir(repo.join("examples/profiles")).unwrap() {
+        let path = entry.unwrap().path();
+        fs::copy(&path, env.profiles().join(path.file_name().unwrap())).unwrap();
+    }
+    // Where dsh.toml expects its settings file, under the test's HOME.
+    let dsh = env.root().join("home/.config/podbay/dsh");
+    fs::create_dir_all(&dsh).unwrap();
+    fs::copy(
+        repo.join("examples/dsh/cordis.patch.yml"),
+        dsh.join("cordis.patch.yml"),
+    )
+    .unwrap();
+
+    let output = env
+        .podbay()
+        .args(["profile", "show", "rust", "dsh"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let shown = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !shown.contains("warning") && err.is_empty(),
+        "{shown}\n{err}"
+    );
+    for expected in [
+        "chain: rust > dsh",
+        "podbay-rust-cargo -> /home/dev/.cargo  (provision, from rust)",
+        "podbay-dsh-tools -> /home/dev/.dsh-tools  (provision, from dsh)",
+        "podbay-dsh-home -> /home/dev/.dsh  (from dsh)",
+        "~/.config/podbay/dsh/cordis.patch.yml -> /home/dev/.dsh/cordis.patch.yml  (ro, from dsh)",
+        "OPENROUTER_API_KEY  (from dsh)",
+        "network: allow index.crates.io, static.crates.io, openrouter.ai",
+        "127.0.0.1:3080 -> session port 3080  (from dsh)",
+    ] {
+        assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
+    }
+}
