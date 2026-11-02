@@ -1,9 +1,10 @@
 # Threat model
 
 This document covers what podbay protects, from whom, and where the
-boundary currently has holes. It describes the code as it is now, at the end
-of stage 4. Later stages close specific gaps, and each gap below names the
-stage that addresses it.
+boundary currently has holes. It describes the code as it is now: stages 1
+to 4 and the seccomp half of stage 5 are done (see the README's Status).
+Later stages close specific gaps, and each gap below names the stage that
+addresses it.
 
 ## What podbay is for
 

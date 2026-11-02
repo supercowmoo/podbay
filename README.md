@@ -25,26 +25,34 @@ its own tools, mounts, network or anything that needs root.
 
 ## Status
 
-Being rebuilt in Rust, in stages:
+Usable for day-to-day work on Linux, with rootless Podman (preferred) or
+Docker; both are tested in CI on every change. macOS isn't tested. podbay is
+pre-1.0: the profile format may still change, and there are no prebuilt
+binaries yet, so you build it from source (below).
 
-1. **Rust port** with real config parsing, Podman and Docker backends, tests
-   and CI. *(done)*
-2. **Threat model**, plus a session report that flags changes to git hooks and
-   config. *(done)*
-3. **Container hardening**: dropped capabilities, `no-new-privileges`,
-   read-only root filesystem, resource limits. *(done)*
-4. Network policy: no network by default, with an allowlist enforced by a
-   filtering proxy. Tool installs move to a separate provisioning step.
+What's in place, as stages the [threat model](THREAT_MODEL.md) refers to:
+
+1. **Rust rewrite**, with Podman and Docker backends, tests and CI. *(done)*
+2. **Session report** that flags changes to git hooks and config after every
+   session. *(done)*
+3. **Container hardening**: no capabilities, `no-new-privileges`, read-only
+   root filesystem, process limits. *(done)*
+4. **Network policy**: none by default, HTTPS to listed hosts through a
+   filtering proxy, and tool installs in a separate provisioning step.
    *(done)*
-5. Landlock and seccomp around processes inside the container. Seccomp:
-   *(done)*. Landlock: next.
+5. **Kernel and file access**: podbay's own seccomp filter on every
+   container *(done)*; Landlock inside the session *(next)*.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
-[THREAT_MODEL.md](THREAT_MODEL.md) covers what is and isn't protected
-today, and which stage closes each gap. The biggest: the project is mounted
-read-write, so code inside can plant git hooks or config that run on your
-host the next time you use git there. The [session report](#session-report)
-tells you when that has happened.
+Also in place: stackable profiles, any container image, forwarded ports,
+API keys passed to the session only, and a small, pinned dependency set
+(eight crates, each one listed and checked in CI).
+
+The biggest remaining gap: the project is mounted read-write, so code
+inside can plant git hooks or config that run on your host the next time
+you use git there. The [session report](#session-report) tells you when
+that has happened. [THREAT_MODEL.md](THREAT_MODEL.md) covers what is and
+isn't protected, and which stage closes each gap.
 
 ## Install
 
@@ -79,8 +87,11 @@ Rust profile and a coding-agent profile, kept separate so you can swap
 either one later.
 
 The language profile invokes rustup, the same way you would on your own
-machine. rustup then installs whatever the project's `rust-toolchain.toml`
-asks for, into a volume that outlives the container:
+machine: a pinned version, checked against its published checksum. rustup
+then installs whatever the project's `rust-toolchain.toml` asks for, into a
+volume that outlives the container. (It's
+[`examples/profiles/rust.toml`](examples/profiles/rust.toml), minus the
+lines that let the session reach crates.io.)
 
 ```toml
 # ~/.config/podbay/profiles/rust.toml
@@ -102,10 +113,22 @@ provision = true
 
 [provision]
 command = """
-command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+rustup=1.29.2
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu sum=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
+  aarch64) target=aarch64-unknown-linux-gnu sum=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
+  *) echo "no rustup build for $(uname -m)" >&2; exit 1 ;;
+esac
+if ! command -v rustup >/dev/null; then
+  curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$rustup/$target/rustup-init"
+  echo "$sum  /tmp/rustup-init" | sha256sum -c -
+  chmod +x /tmp/rustup-init
+  /tmp/rustup-init -y --no-modify-path
+fi
 rustup show active-toolchain || rustup toolchain install
+if [ -f Cargo.lock ]; then cargo fetch --locked; fi
 """
-watch = ["rust-toolchain.toml", "rust-toolchain"]
+watch = ["rust-toolchain.toml", "rust-toolchain", "Cargo.lock"]
 ```
 
 The agent profile installs a terminal coding agent (opencode here) and lets
