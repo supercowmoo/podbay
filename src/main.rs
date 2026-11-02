@@ -15,6 +15,7 @@ mod provision;
 mod repo_key;
 mod report;
 mod seccomp;
+mod settings;
 mod tempdir;
 
 use std::process::ExitCode;

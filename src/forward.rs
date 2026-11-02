@@ -21,38 +21,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 /// Connections beyond this, per port, are closed straight away.
 const MAX_CONNECTIONS: usize = 256;
 
 /// `3080` (the same port on both sides) or `"8080:3080"` (host port, then
 /// the port in the session).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "PortEntry")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Port {
     pub host: u16,
     pub container: u16,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum PortEntry {
-    Number(i64),
-    Text(String),
-}
-
-impl TryFrom<PortEntry> for Port {
-    type Error = anyhow::Error;
-    fn try_from(entry: PortEntry) -> Result<Self> {
-        match entry {
-            PortEntry::Number(n) => Self::parse(&n.to_string()),
-            PortEntry::Text(text) => Self::parse(&text),
-        }
-    }
-}
-
 impl Port {
+    /// A `ports` entry in a profile: a number or a string.
+    pub fn read(value: &crate::settings::Value) -> crate::settings::Result<Self> {
+        let spec = match (value.as_str(), value.as_integer()) {
+            (Some(text), _) => text.to_owned(),
+            (None, Some(n)) => n.to_string(),
+            (None, None) if value.is_integer() => return Err(value.error("invalid port")),
+            (None, None) => {
+                return Err(value.invalid_type("a port number or \"HOST:SESSION\""));
+            }
+        };
+        Self::parse(&spec).map_err(|e| value.error(&e.to_string()))
+    }
+
     pub fn parse(spec: &str) -> Result<Self> {
         let number = |s: &str| {
             s.parse::<u16>()
@@ -307,13 +301,13 @@ mod tests {
 
     #[test]
     fn ports_in_toml() {
-        #[derive(Deserialize)]
-        struct File {
-            ports: Vec<Port>,
-        }
-        let f: File = toml::from_str("ports = [3080, \"8080:3000\"]").unwrap();
+        let read = |text: &str| -> crate::settings::Result<Vec<Port>> {
+            let doc = crate::settings::parse(text).unwrap();
+            let ports = doc.root().get("ports").unwrap().as_array().unwrap();
+            ports.iter().map(Port::read).collect()
+        };
         assert_eq!(
-            f.ports,
+            read("ports = [3080, \"8080:3000\"]").unwrap(),
             [
                 Port {
                     host: 3080,
@@ -325,8 +319,9 @@ mod tests {
                 }
             ]
         );
-        assert!(toml::from_str::<File>("ports = [70000]").is_err());
-        assert!(toml::from_str::<File>("ports = [true]").is_err());
+        assert!(read("ports = [70000]").is_err());
+        let err = read("ports = [true]").unwrap_err().to_string();
+        assert!(err.contains("expected a port number"), "{err}");
     }
 
     #[test]

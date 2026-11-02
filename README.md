@@ -652,6 +652,11 @@ session: one checks that the session report catches it, the other that the
 network allowlist holds. Set `PODBAY_TEST_INTERNET=1` to also check that an
 allowed host is reachable, as CI does.
 
+podbay builds on four crates (`libc`, `anyhow`, and the `toml` parser),
+eight with what they pull in. `tests/dependencies.rs` lists each with its
+exact version, and fails when anything else gets built, so a new
+dependency is always a deliberate, reviewed change.
+
 The relay and podbay-init are their own crates in `relay/` and `init/`,
 standard library only, since the images build them with plain `rustc`. Run
 `cargo test --workspace` and `cargo clippy --workspace` to include them.

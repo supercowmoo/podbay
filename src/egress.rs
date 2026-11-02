@@ -25,7 +25,6 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 use crate::report::printable;
 
@@ -47,8 +46,7 @@ const MAX_LOGGED: usize = 1_000;
 
 /// One allowlist entry: `example.com`, or `*.example.com` for every name
 /// below it, optionally with `:port` (default 443).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPattern {
     /// Lowercase, without the `*.`.
     name: String,
@@ -95,13 +93,6 @@ impl HostPattern {
                     .strip_suffix(&self.name)
                     .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.')),
             }
-    }
-}
-
-impl TryFrom<String> for HostPattern {
-    type Error = anyhow::Error;
-    fn try_from(entry: String) -> Result<Self> {
-        Self::parse(&entry)
     }
 }
 

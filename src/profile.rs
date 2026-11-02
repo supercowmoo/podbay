@@ -40,89 +40,183 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 use crate::config::{Limits, NetworkSetting};
 use crate::forward::{self, Port};
 use crate::paths::Paths;
+use crate::settings;
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 struct ProfileFile {
-    #[serde(default)]
     extends: Vec<String>,
     extension: Option<String>,
-    #[serde(default, rename = "mount")]
     mounts: Vec<MountEntry>,
-    #[serde(default, rename = "volume")]
     volumes: Vec<VolumeEntry>,
     /// Removed along with mise; kept only to explain what replaced it.
-    tools: Option<toml::Value>,
+    tools: bool,
     shell: Option<String>,
-    #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
     path: Vec<String>,
     provision: Option<ProvisionEntry>,
     seccomp: Option<SeccompEntry>,
     /// Capabilities the session keeps, such as "SYS_PTRACE".
-    #[serde(default)]
     cap_add: Vec<String>,
-    #[serde(default)]
     limits: Limits,
     network: Option<NetworkSetting>,
     /// Session ports reachable from the host's loopback.
-    #[serde(default)]
     ports: Vec<Port>,
     /// The image sessions start from, instead of the bundled base.
     image: Option<String>,
     /// Variables the session takes from podbay's own environment, such as
     /// API keys. Never given to provisioning.
-    #[serde(default)]
     env_from_host: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct MountEntry {
     host: String,
     container: String,
-    #[serde(default)]
     mode: Mode,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     #[default]
     Ro,
     Rw,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct VolumeEntry {
     name: String,
     container: String,
-    #[serde(default)]
     provision: bool,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct SeccompEntry {
-    #[serde(default)]
     allow: Vec<String>,
     /// Use the engine's default filter instead of podbay's.
     engine_default: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct ProvisionEntry {
     command: String,
-    #[serde(default)]
     watch: Vec<String>,
+}
+
+impl ProfileFile {
+    /// Reads a profile's text, refusing keys it doesn't know.
+    fn parse(text: &str) -> settings::Result<Self> {
+        let doc = settings::parse(text)?;
+        let t = doc.root();
+        t.only(&[
+            "extends",
+            "extension",
+            "mount",
+            "volume",
+            "tools",
+            "shell",
+            "env",
+            "path",
+            "provision",
+            "seccomp",
+            "cap_add",
+            "limits",
+            "network",
+            "ports",
+            "image",
+            "env_from_host",
+        ])?;
+        let mounts = t
+            .tables("mount")?
+            .into_iter()
+            .map(|m| {
+                m.only(&["host", "container", "mode"])?;
+                let mode = match m.get("mode") {
+                    None => Mode::Ro,
+                    Some(v) => match v.string()?.as_str() {
+                        "ro" => Mode::Ro,
+                        "rw" => Mode::Rw,
+                        other => {
+                            return Err(v.error(&format!(
+                                "unknown variant `{other}`, expected `ro` or `rw`"
+                            )));
+                        }
+                    },
+                };
+                Ok(MountEntry {
+                    host: m.required_string("host")?,
+                    container: m.required_string("container")?,
+                    mode,
+                })
+            })
+            .collect::<settings::Result<_>>()?;
+        let volumes = t
+            .tables("volume")?
+            .into_iter()
+            .map(|v| {
+                v.only(&["name", "container", "provision"])?;
+                Ok(VolumeEntry {
+                    name: v.required_string("name")?,
+                    container: v.required_string("container")?,
+                    provision: v.bool("provision")?.unwrap_or(false),
+                })
+            })
+            .collect::<settings::Result<_>>()?;
+        let provision = t
+            .table("provision")?
+            .map(|p| {
+                p.only(&["command", "watch"])?;
+                Ok(ProvisionEntry {
+                    command: p.required_string("command")?,
+                    watch: p.strings("watch")?,
+                })
+            })
+            .transpose()?;
+        let seccomp = t
+            .table("seccomp")?
+            .map(|s| {
+                s.only(&["allow", "engine_default"])?;
+                Ok(SeccompEntry {
+                    allow: s.strings("allow")?,
+                    engine_default: s.bool("engine_default")?,
+                })
+            })
+            .transpose()?;
+        let ports = match t.get("ports") {
+            None => Vec::new(),
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| v.invalid_type("a sequence"))?
+                .iter()
+                .map(Port::read)
+                .collect::<settings::Result<_>>()?,
+        };
+        Ok(Self {
+            extends: t.strings("extends")?,
+            extension: t.string("extension")?,
+            mounts,
+            volumes,
+            tools: t.has("tools"),
+            shell: t.string("shell")?,
+            env: t.string_map("env")?,
+            path: t.strings("path")?,
+            provision,
+            seccomp,
+            cap_add: t.strings("cap_add")?,
+            limits: t
+                .table("limits")?
+                .map(Limits::read)
+                .transpose()?
+                .unwrap_or_default(),
+            network: t.get("network").map(NetworkSetting::read).transpose()?,
+            ports,
+            image: t.string("image")?,
+            env_from_host: t.strings("env_from_host")?,
+        })
+    }
 }
 
 /// A bind mount from the host.
@@ -450,8 +544,8 @@ fn visit(paths: &Paths, name: &str, stack: &mut Vec<String>, ctx: &mut Resolutio
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
     };
-    let profile: ProfileFile =
-        toml::from_str(&text).with_context(|| format!("invalid profile {}", file.display()))?;
+    let profile =
+        ProfileFile::parse(&text).with_context(|| format!("invalid profile {}", file.display()))?;
 
     stack.push(name.to_owned());
     for parent in &profile.extends {
@@ -623,7 +717,7 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, ctx: &mut Resolution) 
         });
     }
 
-    if profile.tools.is_some() {
+    if profile.tools {
         bail!(
             "[tools] is gone: podbay no longer bundles mise. Install tools with a \
              [provision] command and keep them in a volume with provision = true"
@@ -1294,7 +1388,7 @@ mod tests {
 
     #[test]
     fn template_parses() {
-        let parsed: ProfileFile = toml::from_str(&template("x", &[])).unwrap();
+        let parsed = ProfileFile::parse(&template("x", &[])).unwrap();
         assert!(parsed.extends.is_empty() && parsed.mounts.is_empty());
     }
 }

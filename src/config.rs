@@ -5,20 +5,18 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 use crate::backend::BackendKind;
 use crate::egress::HostPattern;
+use crate::settings::{self, Table, Value};
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 pub struct Config {
     /// Container engine to use when `--backend` is not given.
     pub backend: Option<BackendKind>,
     /// Profiles to use when `--profile` is not given: one name or a list,
     /// stacked in order. Falls back to a profile named `default` if one
     /// exists.
-    #[serde(default, deserialize_with = "one_or_many")]
     pub default_profile: Vec<String>,
     /// Start sessions from this image instead of the bundled base, unless a
     /// profile chooses one.
@@ -27,60 +25,41 @@ pub struct Config {
     /// override it.
     pub network: Option<NetworkSetting>,
     /// Resource limits for every session; profiles can override them.
-    #[serde(default)]
     pub limits: Limits,
-}
-
-/// `"name"` or `["a", "b"]`.
-fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum OneOrMany {
-        One(String),
-        Many(Vec<String>),
-    }
-    Ok(match OneOrMany::deserialize(d)? {
-        OneOrMany::One(name) => vec![name],
-        OneOrMany::Many(names) => names,
-    })
 }
 
 /// A `network` setting from config.toml or a profile: `"none"`, `"full"`,
 /// or a list of hosts the session may connect to.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "RawNetwork")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkSetting {
     Mode(NetworkMode),
     Allow(Vec<HostPattern>),
 }
 
-#[derive(Deserialize)]
-#[serde(
-    untagged,
-    expecting = "\"none\", \"full\", or a list of hosts such as [\"api.example.com\"]"
-)]
-enum RawNetwork {
-    Mode(NetworkMode),
-    Allow(Vec<String>),
-}
-
-impl TryFrom<RawNetwork> for NetworkSetting {
-    type Error = anyhow::Error;
-    fn try_from(raw: RawNetwork) -> Result<Self> {
-        Ok(match raw {
-            RawNetwork::Mode(mode) => Self::Mode(mode),
-            RawNetwork::Allow(hosts) => Self::Allow(
-                hosts
-                    .iter()
-                    .map(|h| HostPattern::parse(h))
-                    .collect::<Result<_>>()?,
-            ),
-        })
+impl NetworkSetting {
+    /// `"none"`, `"full"`, or a list of host names.
+    pub fn read(value: Value) -> settings::Result<Self> {
+        const EXPECTED: &str =
+            "\"none\", \"full\", or a list of hosts such as [\"api.example.com\"]";
+        if let Some(mode) = value.as_str() {
+            return mode
+                .parse()
+                .map(Self::Mode)
+                .map_err(|()| value.error(EXPECTED));
+        }
+        let hosts = value.as_array().ok_or_else(|| value.error(EXPECTED))?;
+        hosts
+            .iter()
+            .map(|host| {
+                let name = host.string()?;
+                HostPattern::parse(&name).map_err(|e| host.error(&e.to_string()))
+            })
+            .collect::<settings::Result<_>>()
+            .map(Self::Allow)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkMode {
     /// Loopback only.
     None,
@@ -149,8 +128,7 @@ pub const DEFAULT_PIDS: u32 = 4096;
 
 /// Resource limits, from `[limits]` in config.toml or a profile. Unset
 /// fields inherit; set ones override.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Limits {
     /// Processes and threads. 0 means no limit.
     pub pids: Option<u32>,
@@ -161,6 +139,16 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// `[limits]`; absent keys stay unset.
+    pub fn read(table: Table) -> settings::Result<Self> {
+        table.only(&["pids", "memory", "cpus"])?;
+        Ok(Self {
+            pids: table.u32("pids")?,
+            memory: table.string("memory")?,
+            cpus: table.f64("cpus")?,
+        })
+    }
+
     /// Applies `other`'s set fields on top of these.
     pub fn merge(&mut self, other: &Limits) {
         if other.pids.is_some() {
@@ -193,12 +181,53 @@ impl Limits {
 }
 
 impl Config {
+    /// Reads config.toml's text.
+    pub fn parse(text: &str) -> settings::Result<Self> {
+        let doc = settings::parse(text)?;
+        let t = doc.root();
+        t.only(&[
+            "backend",
+            "default_profile",
+            "base_image",
+            "network",
+            "limits",
+        ])?;
+        let backend = match t.get("backend") {
+            None => None,
+            Some(v) => Some(v.string()?.parse().map_err(|()| {
+                v.error(&format!(
+                    "unknown variant `{}`, expected `podman` or `docker`",
+                    v.as_str().unwrap_or_default()
+                ))
+            })?),
+        };
+        // One name or a list of names.
+        let default_profile = match t.get("default_profile") {
+            None => Vec::new(),
+            Some(v) if v.as_str().is_some() => vec![v.string()?],
+            Some(v) => v
+                .strings()
+                .map_err(|_| v.error("expected a profile name or a list of names"))?,
+        };
+        Ok(Self {
+            backend,
+            default_profile,
+            base_image: t.string("base_image")?,
+            network: t.get("network").map(NetworkSetting::read).transpose()?,
+            limits: t
+                .table("limits")?
+                .map(Limits::read)
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+
     /// Loads `path`, or returns the defaults if it does not exist.
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(text) => {
-                let config: Self =
-                    toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+                let config =
+                    Self::parse(&text).with_context(|| format!("invalid {}", path.display()))?;
                 config
                     .limits
                     .validate()
@@ -227,28 +256,27 @@ mod tests {
 
     #[test]
     fn parses_fields() {
-        let cfg: Config =
-            toml::from_str("backend = \"docker\"\ndefault_profile = \"ai\"\n").unwrap();
+        let cfg = Config::parse("backend = \"docker\"\ndefault_profile = \"ai\"\n").unwrap();
         assert_eq!(cfg.backend, Some(BackendKind::Docker));
         assert_eq!(cfg.default_profile, ["ai"]);
-        let cfg: Config = toml::from_str("default_profile = [\"rust\", \"dsh\"]\n").unwrap();
+        let cfg = Config::parse("default_profile = [\"rust\", \"dsh\"]\n").unwrap();
         assert_eq!(cfg.default_profile, ["rust", "dsh"]);
         assert_eq!(cfg.network, None);
     }
 
     #[test]
     fn parses_network() {
-        let cfg: Config = toml::from_str("network = \"full\"\n").unwrap();
+        let cfg = Config::parse("network = \"full\"\n").unwrap();
         assert_eq!(cfg.network, Some(NetworkSetting::Mode(NetworkMode::Full)));
-        let cfg: Config = toml::from_str("network = [\"a.example.com\"]\n").unwrap();
+        let cfg = Config::parse("network = [\"a.example.com\"]\n").unwrap();
         assert_eq!(
             cfg.network,
             Some(NetworkSetting::Allow(vec![
                 HostPattern::parse("a.example.com").unwrap()
             ]))
         );
-        assert!(toml::from_str::<Config>("network = \"some\"\n").is_err());
-        let err = toml::from_str::<Config>("network = [\"10.0.0.1\"]\n").unwrap_err();
+        assert!(Config::parse("network = \"some\"\n").is_err());
+        let err = Config::parse("network = [\"10.0.0.1\"]\n").unwrap_err();
         assert!(err.to_string().contains("IP addresses"), "{err}");
     }
 
@@ -276,7 +304,7 @@ mod tests {
 
     #[test]
     fn limits_parse_merge_and_validate() {
-        let cfg: Config = toml::from_str("[limits]\npids = 100\nmemory = \"8g\"\n").unwrap();
+        let cfg = Config::parse("[limits]\npids = 100\nmemory = \"8g\"\n").unwrap();
         cfg.limits.validate().unwrap();
         let mut limits = cfg.limits;
         limits.merge(&Limits {
@@ -294,13 +322,37 @@ mod tests {
             "cpus = 0",
             "cpus = -1",
         ] {
-            let l: Limits = toml::from_str(bad).unwrap();
+            let doc = settings::parse(bad).unwrap();
+            let l = Limits::read(doc.root()).unwrap();
             assert!(l.validate().is_err(), "{bad} accepted");
         }
     }
 
     #[test]
-    fn rejects_unknown_keys() {
-        assert!(toml::from_str::<Config>("bakend = \"docker\"").is_err());
+    fn rejects_unknown_keys_and_bad_values() {
+        for (bad, message) in [
+            ("bakend = \"docker\"", "unknown field `bakend`"),
+            (
+                "backend = \"lxc\"",
+                "unknown variant `lxc`, expected `podman` or `docker`",
+            ),
+            (
+                "default_profile = [\"a\", 3]",
+                "a profile name or a list of names",
+            ),
+            ("network = 5", "\"none\", \"full\", or a list of hosts"),
+            (
+                "[limits]\nmem = \"1g\"",
+                "unknown field `mem`, expected one of `pids`, `memory`, `cpus`",
+            ),
+            (
+                "[limits]\npids = \"x\"",
+                "invalid type: string \"x\", expected u32",
+            ),
+        ] {
+            let err = Config::parse(bad).unwrap_err().to_string();
+            assert!(err.contains(message), "{bad}: {err}");
+            assert!(err.starts_with("TOML parse error at line"), "{bad}: {err}");
+        }
     }
 }

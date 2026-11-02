@@ -7,13 +7,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 
 /// The uid/gid the image's `dev` user is given inside the container.
 pub const IMAGE_DEV_UID: u32 = 1000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Podman,
     Docker,

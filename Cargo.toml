@@ -12,5 +12,5 @@ description = "Disposable, isolated containers around a codebase"
 [dependencies]
 anyhow = "=1.0.104"
 libc = "=0.2.190"
-serde = { version = "=1.0.229", features = ["derive"] }
-toml = "=1.1.8"
+# Only the parser: no serde, no writer.
+toml = { version = "=1.1.8", default-features = false, features = ["std", "parse"] }
