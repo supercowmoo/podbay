@@ -96,8 +96,9 @@ impl Cli {
     pub fn new(kind: BackendKind) -> Self {
         Self {
             kind,
-            host_uid: rustix::process::getuid().as_raw(),
-            host_gid: rustix::process::getgid().as_raw(),
+            // SAFETY: getuid and getgid always succeed and touch no memory.
+            host_uid: unsafe { libc::getuid() },
+            host_gid: unsafe { libc::getgid() },
         }
     }
 
@@ -199,7 +200,7 @@ impl Backend for Cli {
             bail!("creating a container from {image} failed");
         }
         let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        let dir = tempfile::tempdir()?;
+        let dir = crate::tempdir::tempdir()?;
         let dest = dir.path().join("file");
         let copied = self
             .command()
@@ -251,19 +252,14 @@ impl Backend for Cli {
 /// The entrypoint and command from an image's `{{json .Config}}`; either may
 /// be null.
 fn parse_default_command(json: &[u8]) -> Result<Vec<String>> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Config {
-        entrypoint: Option<Vec<String>>,
-        cmd: Option<Vec<String>>,
-    }
-    let config: Config = serde_json::from_slice(json)?;
-    Ok(config
-        .entrypoint
-        .unwrap_or_default()
-        .into_iter()
-        .chain(config.cmd.unwrap_or_default())
-        .collect())
+    let text = std::str::from_utf8(json).context("the engine's output isn't UTF-8")?;
+    let config = crate::json::parse(text).map_err(anyhow::Error::msg)?;
+    let list = |key: &str| {
+        config[key]
+            .as_strings()
+            .with_context(|| format!("{key} isn't a list of strings"))
+    };
+    Ok([list("Entrypoint")?, list("Cmd")?].concat())
 }
 
 /// Parses a JSON array of plain strings, such as `["cpu","memory"]`. `null`

@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn nothing_to_provision() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         fs::write(dir.path().join("rust-toolchain.toml"), "x").unwrap();
         assert_eq!(print(dir.path(), &ResolvedProfile::default()), None);
         assert!(print(dir.path(), &profile(&[])).is_some());
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn follows_watched_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let p = dir.path();
         let prof = profile(&[".tool-versions", "conf.d"]);
         fs::write(p.join(".tool-versions"), "node 22\n").unwrap();
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn never_follows_symlinks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let p = dir.path().join("project");
         let outside = dir.path().join("outside");
         fs::create_dir_all(&p).unwrap();
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn stamps() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let paths = test_paths(dir.path());
         assert!(is_due(&paths, "app-1", false, "abc"));
         record(&paths, "app-1", false, "abc").unwrap();

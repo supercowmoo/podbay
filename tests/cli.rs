@@ -3,15 +3,18 @@
 use std::fs;
 use std::path::Path;
 
-use assert_cmd::Command;
+use std::process::Command;
+
+mod common;
+use common::Run;
 
 struct Env {
-    dir: tempfile::TempDir,
+    dir: common::TempDir,
 }
 
 impl Env {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = common::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("home")).unwrap();
         Self { dir }
     }
@@ -25,7 +28,7 @@ impl Env {
     }
 
     fn podbay(&self) -> Command {
-        let mut cmd = Command::cargo_bin("podbay").unwrap();
+        let mut cmd = common::podbay_command();
         cmd.env("HOME", self.root().join("home"))
             .env("XDG_CONFIG_HOME", self.root().join("config"))
             .env("XDG_CACHE_HOME", self.root().join("cache"));
@@ -34,11 +37,11 @@ impl Env {
 }
 
 fn stdout(cmd: &mut Command) -> String {
-    String::from_utf8(cmd.assert().success().get_output().stdout.clone()).unwrap()
+    String::from_utf8(cmd.run_ok().stdout).unwrap()
 }
 
 fn stderr_of_failure(cmd: &mut Command) -> String {
-    String::from_utf8(cmd.assert().failure().get_output().stderr.clone()).unwrap()
+    String::from_utf8(cmd.run_fails().stderr).unwrap()
 }
 
 #[test]
@@ -192,10 +195,7 @@ fn example_profiles_resolve() {
     let output = env
         .podbay()
         .args(["profile", "show", "rust", "dsh"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let shown = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(

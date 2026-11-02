@@ -117,7 +117,7 @@ struct Listener {
 /// The host side of the forwarded ports, listening from creation until
 /// dropped.
 pub struct Forwarder {
-    dir: tempfile::TempDir,
+    dir: crate::tempdir::TempDir,
     listeners: Vec<Listener>,
     stop: Arc<AtomicBool>,
 }

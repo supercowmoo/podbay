@@ -768,13 +768,13 @@ mod tests {
     use crate::paths::test_paths;
 
     struct Fixture {
-        _dir: tempfile::TempDir,
+        _dir: crate::tempdir::TempDir,
         paths: Paths,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::tempdir::tempdir().unwrap();
             let paths = test_paths(dir.path());
             fs::create_dir_all(paths.profiles_dir()).unwrap();
             fs::create_dir_all(&paths.home).unwrap();

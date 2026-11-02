@@ -235,21 +235,19 @@ struct Shared {
 /// The host side of an allowlisted session: a Unix socket in a private
 /// directory, served by background threads until this is dropped.
 pub struct Server {
-    dir: tempfile::TempDir,
+    dir: crate::tempdir::TempDir,
     shared: Arc<Shared>,
 }
 
 /// A new private directory for Unix sockets shared with the relay.
 /// `$XDG_RUNTIME_DIR` is private to the user; the directory itself is
 /// created 0700 either way. Socket paths are limited to 108 bytes.
-pub fn socket_dir() -> Result<tempfile::TempDir> {
+pub fn socket_dir() -> Result<crate::tempdir::TempDir> {
     let parent = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute() && p.is_dir() && p.as_os_str().len() < 64)
         .unwrap_or_else(std::env::temp_dir);
-    tempfile::Builder::new()
-        .prefix("podbay-")
-        .tempdir_in(&parent)
+    crate::tempdir::TempDir::new_in(&parent, "podbay-")
         .with_context(|| format!("creating a directory in {}", parent.display()))
 }
 

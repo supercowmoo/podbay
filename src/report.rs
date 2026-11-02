@@ -25,8 +25,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
-
 use crate::gitconfig;
 
 /// Files larger than this are compared by size and ctime instead of content.
@@ -445,15 +443,11 @@ fn read_file(path: &Path, meta: &Metadata) -> io::Result<(String, Option<String>
         .open(path)?;
     let mut data = Vec::new();
     file.by_ref().take(MAX_HASHED).read_to_end(&mut data)?;
-    let digest = hex(&Sha256::digest(&data));
+    let digest = crate::hash::sha256_hex(&data);
     let text = (data.len() as u64 <= MAX_TEXT)
         .then(|| String::from_utf8(data).ok())
         .flatten();
     Ok((digest, text))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn text_of(project: &Path, rel: &Path) -> Option<String> {
@@ -788,13 +782,13 @@ mod tests {
     use super::*;
 
     struct Project {
-        _dir: tempfile::TempDir,
+        _dir: crate::tempdir::TempDir,
         root: PathBuf,
     }
 
     impl Project {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::tempdir::tempdir().unwrap();
             let root = dir.path().join("p");
             fs::create_dir_all(root.join(".git/hooks")).unwrap();
             fs::create_dir_all(root.join(".git/info")).unwrap();
@@ -838,7 +832,7 @@ mod tests {
 
     #[test]
     fn not_a_repository_is_clean() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let report = Watch::begin(dir.path(), &[]).finish();
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
     }
@@ -1048,7 +1042,7 @@ mod tests {
     #[test]
     fn rw_mounted_files_are_checked() {
         let p = Project::new();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let gitconfig = dir.path().join(".gitconfig");
         fs::write(&gitconfig, "").unwrap();
         let mut watch = Watch::begin(&p.root, &[gitconfig.clone(), dir.path().into()]);

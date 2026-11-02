@@ -7,6 +7,7 @@ mod forward;
 mod gitconfig;
 mod hash;
 mod image;
+mod json;
 mod paths;
 mod plan;
 mod profile;
@@ -14,6 +15,7 @@ mod provision;
 mod repo_key;
 mod report;
 mod seccomp;
+mod tempdir;
 
 use std::process::ExitCode;
 

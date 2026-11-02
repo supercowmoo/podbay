@@ -228,7 +228,7 @@ pub fn ensure(
 }
 
 fn build(backend: &dyn Backend, layer: &Layer, force: bool) -> Result<()> {
-    let ctx = tempfile::Builder::new().prefix("podbay-build-").tempdir()?;
+    let ctx = crate::tempdir::TempDir::new_in(&std::env::temp_dir(), "podbay-build-")?;
     match &layer.source {
         LayerSource::Bundled => {
             fs::write(ctx.path().join("Containerfile"), BASE_CONTAINERFILE)?;
@@ -314,10 +314,7 @@ fn adapter_containerfile(image: &str, command: &[String]) -> String {
     // back as the command podbay-init runs.
     let cmd = match command.is_empty() {
         true => String::new(),
-        false => format!(
-            "CMD {}\n",
-            serde_json::to_string(command).expect("strings serialize")
-        ),
+        false => format!("CMD {}\n", crate::json::string_array(command)),
     };
     format!(
         "{INIT_STAGE}\n\
@@ -449,7 +446,7 @@ mod tests {
 
     #[test]
     fn tags_chain_through_parents() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let a = ext(dir.path(), "a", "#!/bin/sh\necho a\n");
         let b = ext(dir.path(), "b", "#!/bin/sh\necho b\n");
 
@@ -501,14 +498,14 @@ mod tests {
 
     #[test]
     fn extension_requires_shebang() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let e = ext(dir.path(), "a", "apt-get install x\n");
         assert!(layers(&BaseImage::Bundled, &[e], IMAGE_DEV_UID, IMAGE_DEV_UID).is_err());
     }
 
     #[test]
     fn builds_only_missing_layers_and_everything_above() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let a = ext(dir.path(), "a", "#!/bin/sh\n");
         let b = ext(dir.path(), "b", "#!/bin/sh\n");
         let stack = layers(&BaseImage::Bundled, &[a, b], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
@@ -528,7 +525,7 @@ mod tests {
 
     #[test]
     fn force_rebuilds_uncached_and_pulls_only_registry_bases() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let a = ext(dir.path(), "a", "#!/bin/sh\n");
         let stack = layers(&BaseImage::Bundled, &[a], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
         let backend = FakeBackend::default();

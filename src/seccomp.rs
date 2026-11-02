@@ -18,8 +18,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use crate::json::{self, Value};
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
 
 use crate::hash::sha256_hex;
 use crate::paths::Paths;
@@ -39,7 +39,7 @@ const PTRACE: &[&str] = &["ptrace", "process_vm_readv", "process_vm_writev"];
 /// an earlier rule without argument filters over a later one, so Docker's
 /// `clone3` rule, for one, would otherwise still return `ENOSYS`.
 pub fn profile(allow: &[String]) -> String {
-    let mut doc: Value = serde_json::from_str(MOBY_DEFAULT).expect("vendored profile is valid");
+    let mut doc = json::parse(MOBY_DEFAULT).expect("vendored profile is valid");
     let rules = doc["syscalls"]
         .as_array_mut()
         .expect("vendored profile has syscalls");
@@ -53,9 +53,15 @@ pub fn profile(allow: &[String]) -> String {
     }
     rules.retain(|rule| !rule["names"].as_array().is_some_and(Vec::is_empty));
     if !allow.is_empty() {
-        rules.push(json!({ "names": allow, "action": "SCMP_ACT_ALLOW" }));
+        rules.push(Value::Object(vec![
+            (
+                "names".into(),
+                Value::Array(allow.iter().map(|a| Value::from(a.as_str())).collect()),
+            ),
+            ("action".into(), Value::from("SCMP_ACT_ALLOW")),
+        ]));
     }
-    serde_json::to_string(&doc).expect("JSON values serialize")
+    json::to_string(&doc)
 }
 
 /// A rule that allows its calls to everyone: no capability, architecture or
@@ -76,7 +82,7 @@ fn is_unconditional_allow(rule: &Value) -> bool {
             && empty("args")
             && rule["includes"]
                 .as_object()
-                .is_some_and(|inc| inc.keys().all(|k| k == "minKernel"))
+                .is_some_and(|inc| inc.iter().all(|(k, _)| k == "minKernel"))
 }
 
 /// Where the filter for `json` lives: named by its content, so concurrent
@@ -96,12 +102,15 @@ pub fn write(paths: &Paths, json: &str) -> Result<PathBuf> {
     }
     let dir = file.parent().expect("seccomp files live in a directory");
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Write then rename, so an engine never reads a half-written file.
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .with_context(|| format!("creating a file in {}", dir.display()))?;
-    tmp.write_all(json.as_bytes())?;
-    tmp.persist(&file)
-        .with_context(|| format!("writing {}", file.display()))?;
+    // Write then rename, so an engine never reads a half-written file. The
+    // private directory is removed again afterwards, empty.
+    let tmp = crate::tempdir::TempDir::new_in(dir, ".tmp-")
+        .with_context(|| format!("creating a directory in {}", dir.display()))?;
+    let staged = tmp.path().join("filter.json");
+    fs::File::create_new(&staged)
+        .and_then(|mut f| f.write_all(json.as_bytes()))
+        .with_context(|| format!("writing {}", staged.display()))?;
+    fs::rename(&staged, &file).with_context(|| format!("writing {}", file.display()))?;
     Ok(file)
 }
 
@@ -146,7 +155,7 @@ mod tests {
                 r["action"] == "SCMP_ACT_ALLOW"
                     && r["includes"]["caps"]
                         .as_array()
-                        .is_some_and(|c| c.iter().any(|c| c == cap))
+                        .is_some_and(|c| c.iter().any(|c| *c == cap))
             })
             .flat_map(|r| r["names"].as_array().unwrap().iter())
             .map(|n| n.as_str().unwrap().to_owned())
@@ -156,7 +165,7 @@ mod tests {
     #[test]
     fn upstream_still_looks_as_expected() {
         // If a profile update breaks these, revisit the transformation.
-        let doc: Value = serde_json::from_str(MOBY_DEFAULT).unwrap();
+        let doc: Value = json::parse(MOBY_DEFAULT).unwrap();
         assert_eq!(doc["defaultAction"], "SCMP_ACT_ERRNO");
         let open = unconditional(&doc);
         for name in PTRACE {
@@ -179,7 +188,7 @@ mod tests {
 
     #[test]
     fn ptrace_needs_the_capability() {
-        let doc: Value = serde_json::from_str(&profile(&[])).unwrap();
+        let doc: Value = json::parse(&profile(&[])).unwrap();
         let open = unconditional(&doc);
         assert!(open.iter().any(|n| n == "read"));
         for name in PTRACE {
@@ -197,7 +206,7 @@ mod tests {
         let base = profile(&[]);
         let more = profile(&["ptrace".into(), "io_uring_setup".into()]);
         assert_ne!(base, more);
-        let doc: Value = serde_json::from_str(&more).unwrap();
+        let doc: Value = json::parse(&more).unwrap();
         let open = unconditional(&doc);
         assert!(open.iter().any(|n| n == "ptrace"));
         assert!(open.iter().any(|n| n == "io_uring_setup"));
@@ -209,8 +218,7 @@ mod tests {
     fn allow_overrides_earlier_rules() {
         // Upstream denies clone3 with ENOSYS and filters clone's flags; an
         // allow has to leave the call with no other rule to lose to.
-        let doc: Value =
-            serde_json::from_str(&profile(&["clone3".into(), "clone".into()])).unwrap();
+        let doc: Value = json::parse(&profile(&["clone3".into(), "clone".into()])).unwrap();
         let rules: Vec<&Value> = doc["syscalls"]
             .as_array()
             .unwrap()
@@ -230,14 +238,14 @@ mod tests {
 
     #[test]
     fn files_are_named_by_content() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir::tempdir().unwrap();
         let paths = test_paths(dir.path());
         let a = write(&paths, &profile(&[])).unwrap();
         assert_eq!(write(&paths, &profile(&[])).unwrap(), a);
         let b = write(&paths, &profile(&["ptrace".into()])).unwrap();
         assert_ne!(a, b);
         assert_eq!(a, path(&paths, &profile(&[])));
-        let written: Value = serde_json::from_str(&fs::read_to_string(&a).unwrap()).unwrap();
+        let written: Value = json::parse(&fs::read_to_string(&a).unwrap()).unwrap();
         assert_eq!(written["defaultAction"], "SCMP_ACT_ERRNO");
     }
 

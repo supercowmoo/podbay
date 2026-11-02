@@ -11,11 +11,12 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{Command as StdCommand, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use assert_cmd::Command;
+mod common;
+use common::Run;
 
 const TEST_BASE: &str = "podbay-e2e-base:latest";
 
@@ -37,7 +38,7 @@ fn engine() -> Option<String> {
 
 fn build_test_base(engine: &str) {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let ctx = tempfile::tempdir().unwrap();
+    let ctx = common::tempdir().unwrap();
     fs::copy(
         repo.join("tests/fixtures/test-base/Containerfile"),
         ctx.path().join("Containerfile"),
@@ -61,7 +62,7 @@ fn build_test_base(engine: &str) {
 /// podbay with its config and cache under `root`. HOME and XDG_* are left
 /// alone: rootless podman finds its image store through them.
 fn podbay(root: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("podbay").unwrap();
+    let mut cmd = common::podbay_command();
     cmd.env("PODBAY_CONFIG_DIR", root.join("config"))
         .env("PODBAY_CACHE_DIR", root.join("cache"));
     cmd
@@ -112,7 +113,7 @@ fn session_round_trip() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let home = root.join("home");
     let config = root.join("config");
@@ -182,11 +183,8 @@ touch created-in-container
 
     let built = podbay()
         .args(["build", "--backend", &engine, "-p", &id])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+        .run_ok()
+        .stdout;
     let tag = String::from_utf8(built).unwrap().trim().to_owned();
     // On rootful docker the last layer gives dev the host user's ids.
     assert!(
@@ -203,10 +201,7 @@ touch created-in-container
         .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
         .arg(&project)
         .args(["--", "sh", "-c", script])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
 
@@ -230,7 +225,7 @@ touch created-in-container
     // The point of the identity mapping: files the container creates in the
     // project belong to the host user.
     let created = fs::metadata(project.join("created-in-container")).unwrap();
-    assert_eq!(created.uid(), rustix::process::getuid().as_raw());
+    assert_eq!(created.uid(), fs::metadata(dir.path()).unwrap().uid());
 }
 
 #[test]
@@ -238,7 +233,7 @@ fn session_report_flags_git_changes() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     fs::create_dir_all(project.join(".git/hooks")).unwrap();
@@ -265,10 +260,7 @@ exit 7
         .args(["run", "--backend", &engine, "--local-cache"])
         .arg(&project)
         .args(["--", "sh", "-c", script])
-        .assert()
-        .code(7)
-        .get_output()
-        .clone();
+        .run_code(7);
     let err = String::from_utf8_lossy(&output.stderr);
 
     for expected in [
@@ -289,7 +281,7 @@ fn session_is_hardened() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -313,13 +305,7 @@ fn session_is_hardened() {
         if let Some(p) = profile {
             cmd.args(["-p", p]);
         }
-        let output = cmd
-            .arg(&project)
-            .args(["--", "sh", "-c", script])
-            .assert()
-            .success()
-            .get_output()
-            .clone();
+        let output = cmd.arg(&project).args(["--", "sh", "-c", script]).run_ok();
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -380,7 +366,7 @@ fn seccomp_filter_blocks_namespaces_and_ptrace() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -423,13 +409,7 @@ if unshare --user true 2>/dev/null; then echo userns=allowed; else echo userns=d
         if let Some(p) = profile {
             cmd.args(["-p", &p]);
         }
-        let output = cmd
-            .arg(&project)
-            .args(["--", "sh", "-c", script])
-            .assert()
-            .success()
-            .get_output()
-            .clone();
+        let output = cmd.arg(&project).args(["--", "sh", "-c", script]).run_ok();
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -481,7 +461,7 @@ fn provisioning_runs_profile_commands_and_sessions_are_offline() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -531,13 +511,7 @@ watch = [".tool-versions"]
         if let Some(p) = profile {
             cmd.args(["-p", p]);
         }
-        let output = cmd
-            .arg(&project)
-            .args(["--", "sh", "-c", script])
-            .assert()
-            .success()
-            .get_output()
-            .clone();
+        let output = cmd.arg(&project).args(["--", "sh", "-c", script]).run_ok();
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -614,7 +588,7 @@ echo "installs=$(wc -l < ~/.local/tools/installs)"
 fn sessions_run_on_images_podbay_did_not_build() {
     let Some(engine) = engine() else { return };
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -644,10 +618,7 @@ touch made-in-alpine
         .args(["run", "--backend", &engine, "-p", &alpine])
         .arg(&project)
         .args(["--", "sh", "-c", script])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     for expected in [
@@ -674,10 +645,7 @@ touch made-in-alpine
     let output = podbay(root)
         .args(["run", "--backend", &engine, "-p", &scratch])
         .arg(&project)
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("Hello from Docker!"), "{out}");
 }
@@ -690,7 +658,7 @@ fn env_from_host_reaches_the_session_only() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -715,10 +683,7 @@ fn env_from_host_reaches_the_session_only() {
         .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
         .arg(&project)
         .args(["--", "sh", "-c", "echo session-sees-${E2E_SECRET:-nothing}"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(out.contains("session-sees-s3cret-value"), "{out}\n{err}");
@@ -737,10 +702,7 @@ fn env_from_host_reaches_the_session_only() {
         .env("E2E_SECRET", "s3cret-value")
         .args(["run", "--backend", &engine, "--dry-run", "-p", &id])
         .arg(&project)
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let shown = String::from_utf8_lossy(&output.stdout);
     assert!(shown.contains("--env=E2E_SECRET "), "{shown}");
     assert!(!shown.contains("s3cret"), "{shown}");
@@ -753,7 +715,7 @@ fn stacked_profiles_apply_together() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -786,10 +748,7 @@ fn stacked_profiles_apply_together() {
             "-c",
             "echo \"$LANG_TOOL+$AGENT+$PODBAY_PROFILE\"",
         ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     assert_eq!(out.trim(), format!("rustup+dsh+{lang},{agent}"));
 }
@@ -799,7 +758,7 @@ fn network_can_be_toggled_per_run() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     fs::create_dir_all(&project).unwrap();
@@ -811,10 +770,7 @@ fn network_can_be_toggled_per_run() {
             .args(flags)
             .arg(&project)
             .args(["--", "sh", "-c", "ls /sys/class/net | tr '\\n' ' '"])
-            .assert()
-            .success()
-            .get_output()
-            .clone();
+            .run_ok();
         (
             String::from_utf8_lossy(&output.stdout).trim().to_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -854,7 +810,7 @@ fn allowlisted_session_reaches_only_listed_hosts() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("allowlist-project");
     let profiles = root.join("config/profiles");
@@ -901,10 +857,7 @@ fi
         .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
         .arg(&project)
         .args(["--", "bash", "-c", script])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
 
@@ -956,7 +909,7 @@ fn forwarded_port_reaches_a_server_in_the_session() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("ports-project");
     let profiles = root.join("config/profiles");
@@ -1102,7 +1055,7 @@ fn allowlisted_session_reaches_a_real_host() {
     let Some(engine) = engine() else { return };
     build_test_base(&engine);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = common::tempdir().unwrap();
     let root = dir.path();
     let project = root.join("project");
     let profiles = root.join("config/profiles");
@@ -1130,10 +1083,7 @@ echo "status=${status%$'\r'}"
         .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
         .arg(&project)
         .args(["--", "bash", "-c", script])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
+        .run_ok();
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(
