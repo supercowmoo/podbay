@@ -21,8 +21,11 @@ In rough order of value:
    the main thing to prevent.
 2. **Secrets on the host**: SSH and GPG keys, cloud credentials, browser
    sessions, tokens in your shell environment.
-3. **Secrets you mount in**: whatever your profile shares (a `~/.gitconfig`,
-   an agent's auth volume).
+3. **Secrets you pass in**: whatever your profile shares (a `~/.gitconfig`,
+   an agent's auth volume, API keys from `env_from_host`). The session can
+   read all of them. `env_from_host` keeps keys out of provisioning, out of
+   podbay's output and off its command line, but what the session can
+   reach on the network decides where a key can end up.
 4. **Other projects**, and the state podbay shares between projects
    (provisioned toolchains, profile volumes).
 5. **The project itself.** It's mounted read-write by design. Damage to it is

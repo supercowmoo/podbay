@@ -114,6 +114,10 @@ pub struct RunPlan {
     pub flags: Vec<String>,
     pub mounts: Vec<Mount>,
     pub env: Vec<(String, String)>,
+    /// Variables the engine copies from podbay's environment. Only names
+    /// go on the command line, so values never show in `ps` or
+    /// `--dry-run`.
+    pub env_from_host: Vec<String>,
     pub command: Vec<String>,
 }
 
@@ -269,11 +273,19 @@ impl RunPlan {
             _ => inputs.command,
         };
 
+        let env_from_host = inputs
+            .profile
+            .env_from_host
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+
         Ok(Self {
             image: inputs.image,
             flags,
             mounts,
             env,
+            env_from_host,
             command,
         })
     }
@@ -284,6 +296,7 @@ impl RunPlan {
         args.extend(self.flags.iter().cloned());
         args.extend(self.mounts.iter().map(Mount::to_arg));
         args.extend(self.env.iter().map(|(k, v)| format!("--env={k}={v}")));
+        args.extend(self.env_from_host.iter().map(|k| format!("--env={k}")));
         args.push(self.image.clone());
         args.extend(self.command.iter().cloned());
         args
@@ -656,6 +669,18 @@ mod tests {
             );
         }
         assert!(!args.contains(&"--network=none".to_owned()));
+    }
+
+    #[test]
+    fn env_from_host_passes_names_only() {
+        let profile = ResolvedProfile {
+            env_from_host: vec![("OPENROUTER_API_KEY".into(), "agent".into())],
+            ..Default::default()
+        };
+        let id = identity();
+        let args = RunPlan::build(inputs(&profile, &id)).unwrap().args();
+        let image = args.iter().position(|a| a == "img:1").unwrap();
+        assert_eq!(args[image - 1], "--env=OPENROUTER_API_KEY");
     }
 
     #[test]

@@ -682,6 +682,70 @@ touch made-in-alpine
     assert!(out.contains("Hello from Docker!"), "{out}");
 }
 
+/// env_from_host gives the session a variable from podbay's environment,
+/// by name only: it never reaches provisioning, which has the network,
+/// and its value never shows in podbay's own output.
+#[test]
+fn env_from_host_reaches_the_session_only() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2ehostenv{}", std::process::id());
+    fs::write(
+        profiles.join(format!("{id}.toml")),
+        "env_from_host = [\"E2E_SECRET\", \"E2E_NOT_SET\"]\n\
+         [provision]\ncommand = \"echo provisioning-sees-${E2E_SECRET:-nothing}\"\n",
+    )
+    .unwrap();
+
+    let output = podbay(root)
+        .env("E2E_SECRET", "s3cret-value")
+        .env_remove("E2E_NOT_SET")
+        .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
+        .arg(&project)
+        .args(["--", "sh", "-c", "echo session-sees-${E2E_SECRET:-nothing}"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("session-sees-s3cret-value"), "{out}\n{err}");
+    assert!(out.contains("provisioning-sees-nothing"), "{out}\n{err}");
+    assert!(
+        err.contains("passing E2E_SECRET from your environment to the session"),
+        "{err}"
+    );
+    assert!(
+        err.contains("E2E_NOT_SET isn't set in your environment"),
+        "{err}"
+    );
+    assert!(!err.contains("s3cret"), "{err}");
+
+    let output = podbay(root)
+        .env("E2E_SECRET", "s3cret-value")
+        .args(["run", "--backend", &engine, "--dry-run", "-p", &id])
+        .arg(&project)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(shown.contains("--env=E2E_SECRET "), "{shown}");
+    assert!(!shown.contains("s3cret"), "{shown}");
+}
+
 /// Profiles given together are stacked: each one's environment, volumes
 /// and provisioning apply, as if one profile extended them all.
 #[test]

@@ -294,6 +294,32 @@ host lists add up while `"none"` or `"full"` replaces what came before.
 `ports` lists add up too, and only one `image` can be chosen. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
+**API keys and other secrets** come from your own environment, by name:
+
+```toml
+# ~/.config/podbay/profiles/openrouter.toml
+env_from_host = ["OPENROUTER_API_KEY"]
+network = ["openrouter.ai"]
+```
+
+```
+export OPENROUTER_API_KEY=...       # or however you load it: a password manager, direnv
+podbay run -p rust -p openrouter .
+podbay: passing OPENROUTER_API_KEY from your environment to the session
+```
+
+Only the session gets these, never the provisioning container, which runs
+installers with network access. podbay passes the name to the engine, which
+reads the value itself, so it never appears in podbay's output, `--dry-run`
+or the process list, and podbay doesn't write it anywhere. A name that isn't
+set gets a warning and is left out. Lists add up across stacked profiles; a
+name can't also be in `[env]`. Anything in the session can read the key, and
+send it to any host the session can reach, so pair it with a network
+allowlist that has only the provider on it.
+
+Keys in `[env]` work too, but they sit in the profile file, and `[env]`
+also reaches provisioning.
+
 **Mounts or volumes?** Use mounts for files you own and edit on the host, such
 as shell and git config. Use volumes for directories the container creates
 or writes into, such as toolchains, since the home directory is wiped after

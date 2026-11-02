@@ -370,12 +370,37 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         (Network::Full, false) => Net::Full,
     };
 
+    // Variables from your environment go to the session only, by name: the
+    // engine reads the values, so they never appear in podbay's output.
+    let mut session_profile = profile.clone();
+    session_profile.env_from_host.retain(|(key, from)| {
+        let set = std::env::var_os(key).is_some();
+        if !set {
+            eprintln!(
+                "podbay: warning: {key} isn't set in your environment (env_from_host in \
+                 profile {from}); the session won't have it"
+            );
+        }
+        set
+    });
+    if !session_profile.env_from_host.is_empty() {
+        let names: Vec<&str> = session_profile
+            .env_from_host
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        eprintln!(
+            "podbay: passing {} from your environment to the session",
+            names.join(", ")
+        );
+    }
+
     let plan = RunPlan::build(plan::Inputs {
         image: prep.image.clone(),
         project: prep.project.clone(),
         project_readonly: false,
         repo_key: &prep.key,
-        profile,
+        profile: &session_profile,
         identity: &prep.identity,
         command: args.command,
         tty: is_tty(),
@@ -830,6 +855,11 @@ fn describe(
     out.push_str("\nenv:\n");
     for (k, v) in &p.env {
         out.push_str(&format!("  {k} = {v}\n"));
+    }
+
+    out.push_str("\nenv from your environment (session only):\n");
+    for (k, profile) in &p.env_from_host {
+        out.push_str(&format!("  {k}  (from {profile})\n"));
     }
 
     out.push_str("\npath:\n");

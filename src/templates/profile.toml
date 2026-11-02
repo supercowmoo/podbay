@@ -83,6 +83,11 @@
 # container = "/home/dev/.rustup"
 # provision = true
 
+# Variables the session takes from your own environment, such as API keys.
+# Only the names are written here; provisioning never gets them.
+#
+# env_from_host = ["OPENROUTER_API_KEY"]
+
 # Environment for the session and provisioning. Set PATH with `path` above.
 #
 # [env]

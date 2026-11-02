@@ -16,6 +16,8 @@
 //! ports = [3080, "8080:3000"]     # host 127.0.0.1 port, then the session's
 //! image = "alpine:3.22"           # any image; default: podbay's bundled base
 //!
+//! env_from_host = ["OPENROUTER_API_KEY"]   # from your shell, session only
+//!
 //! [env]
 //! RUSTUP_HOME = "/home/dev/.rustup"
 //!
@@ -74,6 +76,10 @@ struct ProfileFile {
     ports: Vec<Port>,
     /// The image sessions start from, instead of the bundled base.
     image: Option<String>,
+    /// Variables the session takes from podbay's own environment, such as
+    /// API keys. Never given to provisioning.
+    #[serde(default)]
+    env_from_host: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +195,9 @@ pub struct ResolvedProfile {
     pub ports: Vec<(Port, String)>,
     /// The image to start from, and the profile that chose it.
     pub image: Option<(String, String)>,
+    /// Variables passed from the host's environment to the session only,
+    /// each with the profile that asked for it.
+    pub env_from_host: Vec<(String, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
     /// Settings one profile replaced from another it doesn't extend, as
@@ -630,7 +639,20 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, ctx: &mut Resolution) 
 
     for (key, value) in profile.env {
         validate_env_name(&key)?;
+        if let Some((_, from)) = out.env_from_host.iter().find(|(k, _)| *k == key) {
+            bail!("{key} is in [env] here and in env_from_host in {from}; use one of them");
+        }
         out.env.insert(key, value);
+    }
+
+    for key in profile.env_from_host {
+        validate_env_name(&key)?;
+        if out.env.contains_key(&key) {
+            bail!("{key} is in env_from_host here and in [env]; use one of them");
+        }
+        if !out.env_from_host.iter().any(|(k, _)| *k == key) {
+            out.env_from_host.push((key, name.to_owned()));
+        }
     }
 
     // A profile's own directories go in front of inherited ones.
@@ -1123,6 +1145,34 @@ mod tests {
         assert!(err.contains("SYS_EVERYTHING"), "{err}");
         f.profile("lim", "[limits]\ncpus = 0\n");
         assert!(resolve(&f.paths, "lim").is_err());
+    }
+
+    #[test]
+    fn env_from_host_reaches_the_session_only() {
+        let f = Fixture::new();
+        f.profile("a", "env_from_host = [\"OPENROUTER_API_KEY\"]\n")
+            .profile(
+                "b",
+                "env_from_host = [\"OPENROUTER_API_KEY\", \"GH_TOKEN\"]\n",
+            )
+            .profile("clash", "[env]\nGH_TOKEN = \"literal\"\n")
+            .profile("bad", "env_from_host = [\"PODBAY_UID\"]\n");
+        let r = resolve_all(&f.paths, &["a".into(), "b".into()]).unwrap();
+        assert_eq!(
+            r.env_from_host,
+            [
+                ("OPENROUTER_API_KEY".to_owned(), "a".to_owned()),
+                ("GH_TOKEN".to_owned(), "b".to_owned())
+            ]
+        );
+        assert!(r.for_provisioning().env_from_host.is_empty());
+
+        for stack in [["b", "clash"], ["clash", "b"]] {
+            let names: Vec<String> = stack.iter().map(|s| s.to_string()).collect();
+            let err = format!("{:#}", resolve_all(&f.paths, &names).unwrap_err());
+            assert!(err.contains("GH_TOKEN is in"), "{err}");
+        }
+        assert!(resolve(&f.paths, "bad").is_err());
     }
 
     #[test]
