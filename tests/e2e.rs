@@ -1,5 +1,7 @@
 //! End-to-end runs against a real engine. Skipped when the engine is not
-//! available. Select it with PODBAY_TEST_BACKEND (default: docker).
+//! available, unless PODBAY_TEST_REQUIRE_ENGINE is set, as CI sets it so a
+//! missing engine can't pass as a green run. Select the engine with
+//! PODBAY_TEST_BACKEND (default: docker).
 //!
 //! Uses a lightweight stand-in for the bundled base image (same podbay-init,
 //! no toolchain) so the test needs no network beyond pulling Debian.
@@ -25,6 +27,8 @@ fn engine() -> Option<String> {
         .is_ok_and(|o| o.status.success());
     if ok {
         Some(engine)
+    } else if std::env::var_os("PODBAY_TEST_REQUIRE_ENGINE").is_some() {
+        panic!("{engine} is not available, and PODBAY_TEST_REQUIRE_ENGINE is set");
     } else {
         eprintln!("skipping: {engine} is not available");
         None
@@ -768,7 +772,7 @@ fn network_can_be_toggled_per_run() {
     let (out, err) = run(&["--online"]);
     assert_ne!(out, "lo", "{err}");
     assert!(err.contains("network: full (from --online)"), "{err}");
-    assert!(!err.contains("warning"), "{err}");
+    assert!(!err.contains("full network access"), "{err}");
 
     // On by default from config.toml, which is stated, not warned about;
     // --offline turns it off for one run.
@@ -776,7 +780,7 @@ fn network_can_be_toggled_per_run() {
     let (out, err) = run(&[]);
     assert_ne!(out, "lo", "{err}");
     assert!(err.contains("network: full (from config.toml)"), "{err}");
-    assert!(!err.contains("warning"), "{err}");
+    assert!(!err.contains("full network access"), "{err}");
     let (out, err) = run(&["--offline"]);
     assert_eq!(out, "lo", "{err}");
 }

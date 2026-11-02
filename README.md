@@ -594,7 +594,9 @@ PODBAY_TEST_BACKEND=podman cargo test
 ```
 
 The end-to-end tests run real containers on Docker (or the engine named by
-`PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available. They
+`PODBAY_TEST_BACKEND`) and are skipped when that engine isn't available,
+unless `PODBAY_TEST_REQUIRE_ENGINE` is set. CI runs them on Docker and on
+rootless Podman. They
 use a small stand-in for the base image (`tests/fixtures/test-base`) with the
 same podbay-init and a fake installer that records what provisioning saw, so
 they don't need to build the full toolchain. Two of them play a hostile
