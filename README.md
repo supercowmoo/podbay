@@ -9,15 +9,17 @@ everything else is something you declared:
 
 - dotfiles mounted read-only, including your shell config
 - named volumes for state that should outlive the container
-- your own toolchain managers (rustup, uv, nvm, nix, mise, ...), run by a
-  provisioning step into volumes
+- your own toolchain managers (rustup, uv, nvm, nix, mise, ...), which you
+  invoke from a profile and which install into volumes as they normally would
 - the shell you want, environment variables and PATH entries
 - optional root build scripts baked into a derived image
 - network access: none, HTTPS to the hosts you list, or everything
 - ports you forward, so the host can reach a server in the session
 
-Anything that needs root, such as changes to the image, can only come from
-your own config directory, never from the mounted project.
+All of it lives in profiles: small TOML files in your config directory that
+you stack per run, such as one for the language and one for the coding
+agent. Nothing is read from the mounted project, so a project can't choose
+its own tools, mounts, network or anything that needs root.
 
 ## Status
 
@@ -59,10 +61,98 @@ podbay run ~/src/some-project
 ```
 
 The first run builds the bundled base image: Debian slim with git, curl,
-build-essential, bash and a non-root `dev` user. No language toolchains:
-profiles bring those, with whatever manager you already use, and podbay
-[provisions](#provisioning) them before the session starts. The session
-itself has no network unless you give it some.
+build-essential, bash and a non-root `dev` user. No language toolchains and
+no agents: profiles bring those. The session has no network unless you give
+it some.
+
+### Your first profiles
+
+Profiles are TOML files in `~/.config/podbay/profiles/`, one per profile,
+named after it (see [where podbay looks](#where-profiles-live)). Here is a
+Rust profile and a coding-agent profile, kept separate so you can swap
+either one later.
+
+The language profile invokes rustup, the same way you would on your own
+machine. rustup then installs whatever the project's `rust-toolchain.toml`
+asks for, into a volume that outlives the container:
+
+```toml
+# ~/.config/podbay/profiles/rust.toml
+path = ["/home/dev/.cargo/bin"]
+
+[env]
+RUSTUP_HOME = "/home/dev/.rustup"
+CARGO_HOME = "/home/dev/.cargo"
+
+[[volume]]
+name = "rustup"
+container = "/home/dev/.rustup"
+provision = true
+
+[[volume]]
+name = "cargo"
+container = "/home/dev/.cargo"
+provision = true
+
+[provision]
+command = """
+command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+rustup show active-toolchain || rustup toolchain install
+"""
+watch = ["rust-toolchain.toml", "rust-toolchain"]
+```
+
+The agent profile installs a terminal coding agent (opencode here) and lets
+the session reach its API and nothing else:
+
+```toml
+# ~/.config/podbay/profiles/opencode.toml
+network = ["api.anthropic.com"]   # its model provider, and nothing else
+path = ["/home/dev/.opencode/bin"]
+
+# Its login, settings and history, kept between sessions.
+[[volume]]
+name = "config"
+container = "/home/dev/.config/opencode"
+
+[[volume]]
+name = "data"
+container = "/home/dev/.local/share/opencode"
+
+# The agent itself.
+[[volume]]
+name = "bin"
+container = "/home/dev/.opencode"
+provision = true
+
+[provision]
+command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/v2/install | bash"
+```
+
+Stack them and start the agent:
+
+```
+podbay run -p rust -p opencode ~/src/my-rust-app -- opencode
+```
+
+Before the session starts, podbay runs both `[provision]` commands in a
+separate container that has network access (see
+[Provisioning](#provisioning)). The session itself gets only the hosts the
+profiles list.
+
+Switching later is one word, given a `python.toml` or `claude.toml`
+written the same way:
+
+```
+podbay run -p python -p opencode ~/src/scraper    # same agent, another language
+podbay run -p rust -p claude ~/src/my-rust-app    # same language, another agent
+```
+
+The agent keeps its login and history across both, because volumes belong
+to the profile that declares them (`podbay-opencode-config`), not to the
+combination.
+
+### Everyday commands
 
 ```
 podbay run . -- make test     # run a command instead of a shell
@@ -72,7 +162,7 @@ podbay run --offline .        # or take it away, whatever the config says
 podbay run --port 3080 .      # reach a server in the session on 127.0.0.1:3080
 podbay build                  # build any missing images ahead of time
 podbay build --force          # rebuild them all with current packages
-podbay provision .            # run the profile's [provision] commands now
+podbay provision .            # run the profiles' [provision] commands now
 ```
 
 podbay's exit code is the command's (or the shell's) exit code.
@@ -81,6 +171,143 @@ Files the container creates in your project are owned by you on the host. On
 rootless Podman, `dev` is mapped onto your user with `keep-id`. On rootful
 Docker, podbay builds one more small image layer that gives `dev` your uid
 and gid.
+
+## Profiles
+
+A profile is one TOML file that says what a session gets: mounts, volumes,
+environment, network, ports, tools to install. Everything has a profile
+behind it; a run with none gets the bare image.
+
+### Where profiles live
+
+```
+~/.config/podbay/
+  config.toml           # optional settings, see Configuration
+  profiles/
+    base.toml           # your dotfiles: git and shell config
+    rust.toml           # one per language you work in
+    python.toml
+    opencode.toml       # one per coding agent
+    claude.toml
+```
+
+That's `$XDG_CONFIG_HOME/podbay` when `XDG_CONFIG_HOME` is set, and
+`$PODBAY_CONFIG_DIR` when that is. The file name is the profile name
+(lowercase letters, digits, `-` and `_`). The layout above is a
+suggestion: one profile per concern stacks well, but one profile with
+everything in it works just as well.
+
+### Stacking
+
+Profiles given together add up, in order:
+
+```
+podbay run -p base -p rust -p opencode .
+podbay run -p base,rust,opencode .            # the same
+```
+
+That's exactly a profile with `extends = ["base", "rust", "opencode"]`:
+volumes, mounts, provisioning commands, `path`, network hosts and ports
+all combine, a profile both of them extend is applied once, and a later
+profile's `[env]` key, `shell` or mount at the same container path replaces
+an earlier one's. When two stacked profiles set the same thing differently,
+podbay says which one won:
+
+```
+podbay: note: shell from base is replaced by opencode's
+```
+
+A profile replacing what it `extends` is intended and stays quiet.
+
+Without `-p`, podbay uses `default_profile` from `config.toml`, which can be
+a list, else a profile named `default` if one exists:
+
+```toml
+default_profile = ["base", "rust", "opencode"]
+```
+
+### Commands
+
+```
+podbay profile init base              # a new profile from a commented template
+podbay profile init rust --extends base
+podbay profile list
+podbay profile show rust opencode     # what stacking them resolves to
+```
+
+### Reference
+
+```toml
+# ~/.config/podbay/profiles/base.toml
+
+# Bind mounts from the host, read-only unless mode = "rw".
+[[mount]]
+host = "~/.gitconfig"
+container = "/home/dev/.gitconfig"
+
+[[mount]]
+host = "~/.bashrc"
+container = "/home/dev/.bashrc"
+```
+
+```toml
+# ~/.config/podbay/profiles/zsh.toml: for zsh users. bash is the default.
+extends = ["base"]
+extension = "zsh.sh"       # apt-get install -y zsh
+shell = "zsh"              # started as a login shell when no command is given
+
+[[mount]]
+host = "~/.zshrc"
+container = "/home/dev/.zshrc"
+```
+
+```toml
+# ~/.config/podbay/profiles/debug.toml
+extends = ["base"]
+
+# Capabilities the session keeps (none by default). podbay prints them on
+# every run that uses this profile. SYS_PTRACE also lets ptrace through
+# the seccomp filter.
+cap_add = ["SYS_PTRACE"]   # gdb, strace
+
+# Syscalls the seccomp filter blocks that this profile needs. podbay
+# prints them on every run. engine_default = true uses the engine's own
+# filter instead, which on Podman is much looser.
+[seccomp]
+allow = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
+
+# Override the limits from config.toml.
+[limits]
+memory = "16g"
+```
+
+With `extends`, and when profiles are stacked, earlier ones are applied
+first. A later profile's mount or
+volume replaces an inherited one at the same container path, `[env]` keys
+and `shell` override inherited ones, and its `path` entries go in front of
+inherited ones. `[provision]` commands and `watch` lists, `cap_add` and
+`[seccomp] allow` lists are combined, and `engine_default` is inherited
+until a profile sets it. `[limits]` keys override one at a time, and `network`
+host lists add up while `"none"` or `"full"` replaces what came before.
+`ports` lists add up too. Volumes keep the name of the profile that
+declared them, so every profile extending `base` shares `base`'s volumes.
+
+**Mounts or volumes?** Use mounts for files you own and edit on the host, such
+as shell and git config. Use volumes for directories the container creates
+or writes into, such as toolchains, since the home directory is wiped after
+every session. Keep mounts of anything your host runs read-only: a
+read-write `~/.bashrc` or `~/.cargo` lets the session plant code that runs
+on your host. The engine creates a missing mount point's parent
+directories as root, and the entrypoint gives them to `dev`.
+
+**Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
+Each tag is a hash of the script and its parent image's tag, so editing a
+script, or any script below it in the chain, rebuilds exactly what changed.
+What a script downloads isn't part of the hash, and neither is a custom base
+rebuilt under the same tag: run `podbay build --force` to pick those up.
+Extensions run as root at build time, the only time the root filesystem is
+writable. Anything they put in `/home/dev` is copied into the home skeleton
+automatically.
 
 ## What a session can do
 
@@ -211,31 +438,11 @@ has the details.
 podbay doesn't pick a toolchain manager for you. A profile names a command
 that installs tools, and volumes for them to live in:
 
-```toml
-# ~/.config/podbay/profiles/rust.toml
-path = ["/home/dev/.cargo/bin"]
-
-[env]
-RUSTUP_HOME = "/home/dev/.rustup"
-CARGO_HOME = "/home/dev/.cargo"
-
-[[volume]]
-name = "rustup"
-container = "/home/dev/.rustup"
-provision = true
-
-[[volume]]
-name = "cargo"
-container = "/home/dev/.cargo"
-provision = true
-
-[provision]
-command = """
-command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
-rustup show active-toolchain || rustup toolchain install
-"""
-watch = ["rust-toolchain.toml", "rust-toolchain"]
-```
+[`rust.toml` in Quick start](#your-first-profiles) is a full example: it
+installs rustup if it's missing, then lets rustup install the toolchain the
+project pins, exactly as you would by hand. podbay never reads the project to
+decide what to install; the profile names the command, and the tool behaves
+as it normally does.
 
 The command runs with `sh -e` before the session, in a separate short-lived
 container. That container has network access but sees only what installing
@@ -243,8 +450,8 @@ needs: the project, read-only, the volumes marked `provision = true`, and
 the profile's `[env]` and `path`. Bind mounts, other volumes and
 capabilities are left out, so credentials kept there never share a
 container with the network, even when the session itself is offline.
-Commands from every profile in the `extends` chain run in order, ancestors
-first.
+Commands from every profile, stacked or extended, run in order, earlier
+profiles first.
 
 `podbay run` provisions by itself when anything that decides the tools
 changed since the last successful run: the image, the commands, the
@@ -258,8 +465,8 @@ removing a volume, or when tools come from files you don't watch. It
 installs into the same volumes `run` would; pass `--local-cache` to match
 `run --local-cache`.
 
-A toolchain manager itself can come from the provisioning command, as
-above, or from an [extension](#profiles) baked into the image. mise is just
+A toolchain manager itself can come from the provisioning command, as in
+`rust.toml`, or from an [extension](#profiles) baked into the image. mise is just
 one more option: install it in an extension, give it a volume for
 `~/.local/share/mise`, and use `mise install` as the command.
 
@@ -289,132 +496,13 @@ writes branch settings. The settings list makes that easy to tell apart.
 The report detects changes; it doesn't revert them.
 [THREAT_MODEL.md](THREAT_MODEL.md) lists what it covers and its limits.
 
-## Profiles
-
-A profile is a single TOML file in `~/.config/podbay/profiles/`:
-
-```
-podbay profile init base
-podbay profile init ai --extends base
-podbay profile list
-podbay profile show ai        # everything ai resolves to, inheritance merged
-podbay run -p ai .
-```
-
-If you don't pass `-p`, podbay uses `default_profile` from `config.toml`,
-otherwise a profile named `default` if one exists.
-
-```toml
-# ~/.config/podbay/profiles/base.toml
-
-# Bind mounts from the host, read-only unless mode = "rw".
-[[mount]]
-host = "~/.gitconfig"
-container = "/home/dev/.gitconfig"
-
-[[mount]]
-host = "~/.bashrc"
-container = "/home/dev/.bashrc"
-```
-
-```toml
-# ~/.config/podbay/profiles/zsh.toml: for zsh users. bash is the default.
-extends = ["base"]
-extension = "zsh.sh"       # apt-get install -y zsh
-shell = "zsh"              # started as a login shell when no command is given
-
-[[mount]]
-host = "~/.zshrc"
-container = "/home/dev/.zshrc"
-```
-
-```toml
-# ~/.config/podbay/profiles/ai.toml
-extends = ["base"]
-
-# Optional: a root build script for system packages.
-# Relative to the profiles directory; must start with a shebang.
-extension = "ai.sh"
-
-# The agent calls its API, and nothing else.
-network = ["api.anthropic.com"]
-
-# Where the provisioned agent lives (see the last volume).
-path = ["/home/dev/.opencode/bin"]
-
-# Named volumes keep tool state across runs. Stored as podbay-ai-<name>.
-[[volume]]
-name = "opencode-config"
-container = "/home/dev/.config/opencode"
-
-[[volume]]
-name = "opencode-data"
-container = "/home/dev/.local/share/opencode"
-
-# The agent itself, installed into its own volume.
-[[volume]]
-name = "opencode-bin"
-container = "/home/dev/.opencode"
-provision = true
-
-[provision]
-command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/v2/install | bash"
-```
-
-```toml
-# ~/.config/podbay/profiles/debug.toml
-extends = ["base"]
-
-# Capabilities the session keeps (none by default). podbay prints them on
-# every run that uses this profile. SYS_PTRACE also lets ptrace through
-# the seccomp filter.
-cap_add = ["SYS_PTRACE"]   # gdb, strace
-
-# Syscalls the seccomp filter blocks that this profile needs. podbay
-# prints them on every run. engine_default = true uses the engine's own
-# filter instead, which on Podman is much looser.
-[seccomp]
-allow = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
-
-# Override the limits from config.toml.
-[limits]
-memory = "16g"
-```
-
-With `extends`, ancestors are applied first. A later profile's mount or
-volume replaces an inherited one at the same container path, `[env]` keys
-and `shell` override inherited ones, and its `path` entries go in front of
-inherited ones. `[provision]` commands and `watch` lists, `cap_add` and
-`[seccomp] allow` lists are combined, and `engine_default` is inherited
-until a profile sets it. `[limits]` keys override one at a time, and `network`
-host lists add up while `"none"` or `"full"` replaces what came before.
-`ports` lists add up too. Volumes keep the name of the profile that
-declared them, so every profile extending `base` shares `base`'s volumes.
-
-**Mounts or volumes?** Use mounts for files you own and edit on the host, such
-as shell and git config. Use volumes for directories the container creates
-or writes into, such as toolchains, since the home directory is wiped after
-every session. Keep mounts of anything your host runs read-only: a
-read-write `~/.bashrc` or `~/.cargo` lets the session plant code that runs
-on your host. The engine creates a missing mount point's parent
-directories as root, and the entrypoint gives them to `dev`.
-
-**Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
-Each tag is a hash of the script and its parent image's tag, so editing a
-script, or any script below it in the chain, rebuilds exactly what changed.
-What a script downloads isn't part of the hash, and neither is a custom base
-rebuilt under the same tag: run `podbay build --force` to pick those up.
-Extensions run as root at build time, the only time the root filesystem is
-writable. Anything they put in `/home/dev` is copied into the home skeleton
-automatically.
-
 ## Configuration
 
 `~/.config/podbay/config.toml` (all keys optional):
 
 ```toml
 backend = "podman"           # or "docker"; default: podman if installed
-default_profile = "base"
+default_profile = ["base", "rust"]  # or one name; used when -p isn't given
 base_image = "my/image:tag"  # use your own image instead of the bundled one
 network = "none"             # "full", or a host list; --online/--offline override it
 

@@ -33,9 +33,16 @@ pub struct EngineArgs {
     /// Container engine [default: config `backend`, else podman if installed, else docker]
     #[arg(long, value_enum)]
     pub backend: Option<BackendKind>,
-    /// Profile to apply [default: config `default_profile`, else `default` if it exists]
-    #[arg(short, long)]
-    pub profile: Option<String>,
+    /// Profiles to apply, stacked in order: `-p rust -p dsh` or
+    /// `-p rust,dsh` [default: config `default_profile`, else `default` if
+    /// it exists]
+    #[arg(
+        short = 'p',
+        long = "profile",
+        value_name = "NAME",
+        value_delimiter = ','
+    )]
+    pub profiles: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -125,8 +132,12 @@ pub enum ProfileCommand {
     },
     /// List profiles.
     List,
-    /// Show a profile with everything it extends merged in.
-    Show { name: String },
+    /// Show what profiles resolve to, with everything they extend merged
+    /// in. Several are stacked as `run -p` would stack them.
+    Show {
+        #[arg(required = true, value_delimiter = ',')]
+        names: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -146,7 +157,7 @@ mod tests {
         let Command::Run(run) = cli.command else {
             panic!()
         };
-        assert_eq!(run.engine.profile.as_deref(), Some("ai"));
+        assert_eq!(run.engine.profiles, ["ai"]);
         assert_eq!(run.project, Some(PathBuf::from(".")));
         assert_eq!(run.command, ["ls", "-la"]);
         assert_eq!(run.network, None);
@@ -160,6 +171,21 @@ mod tests {
         };
         assert_eq!(run.network, Some(NetworkMode::Full));
         assert!(Cli::try_parse_from(["podbay", "run", "--network", "lan"]).is_err());
+    }
+
+    #[test]
+    fn stacked_profiles() {
+        let cli =
+            Cli::try_parse_from(["podbay", "run", "-p", "rust", "-p", "dsh,base", "."]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!()
+        };
+        assert_eq!(run.engine.profiles, ["rust", "dsh", "base"]);
+        let cli = Cli::try_parse_from(["podbay", "profile", "show", "rust", "dsh"]).unwrap();
+        let Command::Profile(ProfileCommand::Show { names }) = cli.command else {
+            panic!()
+        };
+        assert_eq!(names, ["rust", "dsh"]);
     }
 
     #[test]

@@ -131,3 +131,40 @@ fn run_rejects_unknown_profile() {
     ]));
     assert!(err.contains("profile \"ghost\" not found"), "{err}");
 }
+
+#[test]
+fn stacked_profiles_show_together() {
+    let env = Env::new();
+    fs::create_dir_all(env.profiles()).unwrap();
+    fs::write(
+        env.profiles().join("rust.toml"),
+        "[[volume]]\nname = \"cargo\"\ncontainer = \"/home/dev/.cargo\"\nprovision = true\n\
+         [provision]\ncommand = \"rustup show\"\n",
+    )
+    .unwrap();
+    fs::write(
+        env.profiles().join("agent.toml"),
+        "shell = \"zsh\"\nports = [3080]\n[[volume]]\nname = \"state\"\ncontainer = \"/home/dev/.agent\"\n",
+    )
+    .unwrap();
+    fs::write(env.profiles().join("fishy.toml"), "shell = \"fish\"\n").unwrap();
+
+    for args in [&["rust", "agent"][..], &["rust,agent"]] {
+        let shown = stdout(env.podbay().args(["profile", "show"]).args(args));
+        assert!(shown.starts_with("chain: rust > agent\n"), "{shown}");
+        for expected in [
+            "podbay-rust-cargo -> /home/dev/.cargo  (provision, from rust)",
+            "podbay-agent-state -> /home/dev/.agent  (from agent)",
+            "rustup show  (from rust)",
+            "127.0.0.1:3080 -> session port 3080  (from agent)",
+        ] {
+            assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
+        }
+    }
+
+    let shown = stdout(env.podbay().args(["profile", "show", "agent", "fishy"]));
+    assert!(
+        shown.contains("note: shell from agent is replaced by fishy's"),
+        "{shown}"
+    );
+}

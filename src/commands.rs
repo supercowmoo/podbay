@@ -42,24 +42,23 @@ impl Setup {
     }
 
     /// `--profile`, else the configured default, else `default` if it exists,
-    /// else nothing.
+    /// else nothing. Several are stacked in order.
     fn profile(&self, engine: &EngineArgs) -> Result<ResolvedProfile> {
-        let name = engine
-            .profile
-            .clone()
-            .or_else(|| self.config.default_profile.clone())
-            .or_else(|| {
-                self.paths
-                    .profile_file("default")
-                    .is_file()
-                    .then(|| "default".to_owned())
-            });
-        let resolved = match name {
-            Some(name) => profile::resolve(&self.paths, &name)?,
-            None => ResolvedProfile::default(),
+        let names = if !engine.profiles.is_empty() {
+            engine.profiles.clone()
+        } else if !self.config.default_profile.is_empty() {
+            self.config.default_profile.clone()
+        } else if self.paths.profile_file("default").is_file() {
+            vec!["default".to_owned()]
+        } else {
+            Vec::new()
         };
+        let resolved = profile::resolve_all(&self.paths, &names)?;
         for warning in &resolved.warnings {
             eprintln!("podbay: warning: {warning}");
+        }
+        for note in &resolved.overrides {
+            eprintln!("podbay: note: {note}");
         }
         Ok(resolved)
     }
@@ -738,8 +737,8 @@ pub fn profile(cmd: ProfileCommand) -> Result<()> {
                 println!("{name}");
             }
         }
-        ProfileCommand::Show { name } => {
-            let resolved = profile::resolve(&ctx.paths, &name)?;
+        ProfileCommand::Show { names } => {
+            let resolved = profile::resolve_all(&ctx.paths, &names)?;
             let stack = image::layers(&ctx.base_image(), &resolved.extensions)?;
             let limits = ctx.limits(&resolved);
             let network = ctx.network(&resolved, None);
@@ -869,6 +868,9 @@ fn describe(
 
     for w in &p.warnings {
         out.push_str(&format!("\nwarning: {w}\n"));
+    }
+    for note in &p.overrides {
+        out.push_str(&format!("\nnote: {note}\n"));
     }
     out
 }

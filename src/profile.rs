@@ -31,7 +31,7 @@
 //! allow = ["io_uring_setup"]   # syscalls podbay's filter blocks
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -186,6 +186,9 @@ pub struct ResolvedProfile {
     pub ports: Vec<(Port, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
+    /// Settings one profile replaced from another it doesn't extend, as
+    /// happens when profiles are stacked: `-p rust -p dsh`.
+    pub overrides: Vec<String>,
 }
 
 impl ResolvedProfile {
@@ -381,27 +384,43 @@ pub fn list(paths: &Paths) -> Result<Vec<String>> {
 }
 
 /// Loads `name` and everything it extends.
+#[cfg(test)]
 pub fn resolve(paths: &Paths, name: &str) -> Result<ResolvedProfile> {
-    let mut resolved = ResolvedProfile::default();
-    let mut done = HashSet::new();
-    let mut stack = Vec::new();
-    visit(paths, name, &mut stack, &mut done, &mut resolved)?;
-    Ok(resolved)
+    resolve_all(paths, &[name.to_owned()])
 }
 
-fn visit(
-    paths: &Paths,
-    name: &str,
-    stack: &mut Vec<String>,
-    done: &mut HashSet<String>,
-    out: &mut ResolvedProfile,
-) -> Result<()> {
+/// Loads each of `names` and everything they extend, stacked in order: the
+/// same as one profile with `extends = names`.
+pub fn resolve_all(paths: &Paths, names: &[String]) -> Result<ResolvedProfile> {
+    let mut ctx = Resolution::default();
+    for name in names {
+        let mut stack = Vec::new();
+        visit(paths, name, &mut stack, &mut ctx)?;
+    }
+    Ok(ctx.out)
+}
+
+/// State while resolving: the result so far, and enough to tell an
+/// intended override (a profile replacing what it extends) from a clash
+/// between profiles that were only stacked together.
+#[derive(Default)]
+struct Resolution {
+    out: ResolvedProfile,
+    done: HashSet<String>,
+    /// Every profile each applied profile extends, directly or not.
+    ancestors: HashMap<String, HashSet<String>>,
+    /// Which profile set the shell, and each `[env]` key.
+    shell_from: Option<String>,
+    env_from: HashMap<String, String>,
+}
+
+fn visit(paths: &Paths, name: &str, stack: &mut Vec<String>, ctx: &mut Resolution) -> Result<()> {
     validate_name(name)?;
     if stack.iter().any(|n| n == name) {
         bail!("profile cycle: {} -> {name}", stack.join(" -> "));
     }
     // Diamonds (two parents extending the same profile) apply it once.
-    if done.contains(name) {
+    if ctx.done.contains(name) {
         return Ok(());
     }
 
@@ -422,19 +441,103 @@ fn visit(
 
     stack.push(name.to_owned());
     for parent in &profile.extends {
-        visit(paths, parent, stack, done, out)?;
+        visit(paths, parent, stack, ctx)?;
     }
     stack.pop();
 
-    apply(paths, name, profile, out).with_context(|| format!("in profile {}", file.display()))?;
-    done.insert(name.to_owned());
-    out.chain.push(name.to_owned());
+    let mut ancestors = HashSet::new();
+    for parent in &profile.extends {
+        ancestors.insert(parent.clone());
+        ancestors.extend(ctx.ancestors.get(parent).into_iter().flatten().cloned());
+    }
+    ctx.ancestors.insert(name.to_owned(), ancestors);
+
+    apply(paths, name, profile, ctx).with_context(|| format!("in profile {}", file.display()))?;
+    ctx.done.insert(name.to_owned());
+    ctx.out.chain.push(name.to_owned());
     Ok(())
+}
+
+impl Resolution {
+    /// Records that `name` replaced `what` from `from`, unless `name`
+    /// extends `from`, which is what extending is for.
+    fn replaced(&mut self, name: &str, from: &str, what: String) {
+        let extends = self.ancestors.get(name).is_some_and(|a| a.contains(from));
+        if from != name && !extends {
+            self.out
+                .overrides
+                .push(format!("{what} from {from} is replaced by {name}'s"));
+        }
+    }
 }
 
 /// Merges one profile on top of what its ancestors produced. Entries that
 /// target the same container path replace the inherited one.
-fn apply(paths: &Paths, name: &str, profile: ProfileFile, out: &mut ResolvedProfile) -> Result<()> {
+fn apply(paths: &Paths, name: &str, profile: ProfileFile, ctx: &mut Resolution) -> Result<()> {
+    // Mounts and volumes at a path another profile already uses.
+    let mut taken_paths = Vec::new();
+    for container in profile
+        .mounts
+        .iter()
+        .map(|m| &m.container)
+        .chain(profile.volumes.iter().map(|v| &v.container))
+    {
+        let out = &ctx.out;
+        let from = out
+            .mounts
+            .iter()
+            .find(|m| &m.container == container)
+            .map(|m| m.profile.clone())
+            .or_else(|| {
+                out.volumes
+                    .iter()
+                    .find(|v| &v.container == container)
+                    .map(|v| v.profile.clone())
+            });
+        if let Some(from) = from {
+            taken_paths.push((from, container.clone()));
+        }
+    }
+    for (from, container) in taken_paths {
+        ctx.replaced(name, &from, format!("the mount at {container}"));
+    }
+    if let Some(shell) = &profile.shell
+        && let Some(from) = ctx.shell_from.clone()
+        && ctx.out.shell.as_ref() != Some(shell)
+    {
+        ctx.replaced(name, &from, "shell".into());
+    }
+    for (key, value) in &profile.env {
+        if let Some(from) = ctx.env_from.get(key).cloned()
+            && ctx.out.env.get(key) != Some(value)
+        {
+            ctx.replaced(name, &from, format!("[env] {key}"));
+        }
+    }
+    // "none" and "full" replace everything before them; a host list
+    // replaces an earlier "none" or "full" and adds to earlier lists.
+    let replaced_network: Vec<String> = match (&profile.network, ctx.out.network.last()) {
+        (Some(NetworkSetting::Mode(_)), _) => {
+            let mut from: Vec<String> = ctx.out.network.iter().map(|(_, p)| p.clone()).collect();
+            from.dedup();
+            from
+        }
+        (Some(NetworkSetting::Allow(_)), Some((NetworkSetting::Mode(_), from))) => {
+            vec![from.clone()]
+        }
+        _ => Vec::new(),
+    };
+    for from in replaced_network {
+        ctx.replaced(name, &from, "network".into());
+    }
+    if profile.shell.is_some() {
+        ctx.shell_from = Some(name.to_owned());
+    }
+    for key in profile.env.keys() {
+        ctx.env_from.insert(key.clone(), name.to_owned());
+    }
+
+    let out = &mut ctx.out;
     if let Some(script) = profile.extension {
         let script = paths.resolve_relative(&paths.profiles_dir(), &script);
         if !script.is_file() {
@@ -1000,6 +1103,100 @@ mod tests {
         assert!(err.contains("SYS_EVERYTHING"), "{err}");
         f.profile("lim", "[limits]\ncpus = 0\n");
         assert!(resolve(&f.paths, "lim").is_err());
+    }
+
+    #[test]
+    fn stacked_profiles_add_up() {
+        let f = Fixture::new();
+        f.profile("base", "[env]\nEDITOR = \"vi\"\n")
+            .profile(
+                "rust",
+                r#"
+                extends = ["base"]
+                path = ["/home/dev/.cargo/bin"]
+                network = ["index.crates.io"]
+                [[volume]]
+                name = "cargo"
+                container = "/home/dev/.cargo"
+                provision = true
+                [provision]
+                command = "rustup show"
+                "#,
+            )
+            .profile(
+                "agent",
+                r#"
+                extends = ["base"]
+                path = ["/home/dev/.local/bin"]
+                network = ["openrouter.ai"]
+                ports = [3080]
+                [[volume]]
+                name = "state"
+                container = "/home/dev/.agent"
+                [provision]
+                command = "install-agent"
+                "#,
+            );
+        let r = resolve_all(&f.paths, &["rust".into(), "agent".into()]).unwrap();
+        // base once, then each stacked profile in order.
+        assert_eq!(r.chain, ["base", "rust", "agent"]);
+        let volumes: Vec<&str> = r.volumes.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(volumes, ["podbay-rust-cargo", "podbay-agent-state"]);
+        let steps: Vec<&str> = r.provision.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(steps, ["rustup show", "install-agent"]);
+        assert_eq!(r.path, ["/home/dev/.local/bin", "/home/dev/.cargo/bin"]);
+        assert_eq!(r.network.len(), 2);
+        assert_eq!(r.ports.len(), 1);
+        assert_eq!(r.env["EDITOR"], "vi");
+        assert!(r.overrides.is_empty(), "{:?}", r.overrides);
+
+        // Stacked the other way round, the same pieces come out.
+        let r = resolve_all(&f.paths, &["agent".into(), "rust".into()]).unwrap();
+        assert_eq!(r.chain, ["base", "agent", "rust"]);
+        assert_eq!(r.volumes.len(), 2);
+    }
+
+    #[test]
+    fn clashes_between_stacked_profiles_are_noted() {
+        let f = Fixture::new();
+        f.profile(
+            "base",
+            "shell = \"bash\"\n[env]\nEDITOR = \"vi\"\n[[volume]]\nname = \"cfg\"\ncontainer = \"/home/dev/.config\"\n",
+        )
+        // A profile replacing what it extends is what extends is for.
+        .profile(
+            "child",
+            "extends = [\"base\"]\nshell = \"zsh\"\n[env]\nEDITOR = \"nano\"\n",
+        )
+        .profile(
+            "other",
+            "shell = \"fish\"\nnetwork = \"full\"\n[env]\nEDITOR = \"emacs\"\n\
+             [[volume]]\nname = \"cfg\"\ncontainer = \"/home/dev/.config\"\n",
+        )
+        .profile("lister", "network = [\"a.example.com\"]\n");
+        assert!(resolve(&f.paths, "child").unwrap().overrides.is_empty());
+
+        let r = resolve_all(&f.paths, &["child".into(), "other".into()]).unwrap();
+        assert_eq!(r.shell.as_deref(), Some("fish"));
+        assert_eq!(
+            r.overrides,
+            [
+                "the mount at /home/dev/.config from base is replaced by other's",
+                "shell from child is replaced by other's",
+                "[env] EDITOR from child is replaced by other's",
+            ]
+        );
+
+        let r = resolve_all(&f.paths, &["lister".into(), "other".into()]).unwrap();
+        assert!(
+            r.overrides
+                .contains(&"network from lister is replaced by other's".to_owned()),
+            "{:?}",
+            r.overrides
+        );
+        // The same value twice is no clash.
+        let r = resolve_all(&f.paths, &["other".into(), "other".into()]).unwrap();
+        assert!(r.overrides.is_empty(), "{:?}", r.overrides);
     }
 
     #[test]

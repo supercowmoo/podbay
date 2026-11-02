@@ -607,6 +607,54 @@ echo "installs=$(wc -l < ~/.local/tools/installs)"
     assert_ne!(session_network.trim(), "lo", "{out}");
 }
 
+/// Profiles given together are stacked: each one's environment, volumes
+/// and provisioning apply, as if one profile extended them all.
+#[test]
+fn stacked_profiles_apply_together() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = std::process::id();
+    let (lang, agent) = (format!("e2elang{id}"), format!("e2eagent{id}"));
+    fs::write(
+        profiles.join(format!("{lang}.toml")),
+        "[env]\nLANG_TOOL = \"rustup\"\n",
+    )
+    .unwrap();
+    fs::write(
+        profiles.join(format!("{agent}.toml")),
+        "[env]\nAGENT = \"dsh\"\n",
+    )
+    .unwrap();
+
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "-p", &lang, "-p", &agent])
+        .arg(&project)
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "echo \"$LANG_TOOL+$AGENT+$PODBAY_PROFILE\"",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(out.trim(), format!("rustup+dsh+{lang},{agent}"));
+}
+
 #[test]
 fn network_can_be_toggled_per_run() {
     let Some(engine) = engine() else { return };

@@ -16,9 +16,11 @@ use crate::egress::HostPattern;
 pub struct Config {
     /// Container engine to use when `--backend` is not given.
     pub backend: Option<BackendKind>,
-    /// Profile to use when `--profile` is not given. Falls back to a profile
-    /// named `default` if one exists.
-    pub default_profile: Option<String>,
+    /// Profiles to use when `--profile` is not given: one name or a list,
+    /// stacked in order. Falls back to a profile named `default` if one
+    /// exists.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub default_profile: Vec<String>,
     /// Use this image instead of building the bundled base image.
     pub base_image: Option<String>,
     /// Network access for every session; profiles and `--network` can
@@ -27,6 +29,20 @@ pub struct Config {
     /// Resource limits for every session; profiles can override them.
     #[serde(default)]
     pub limits: Limits,
+}
+
+/// `"name"` or `["a", "b"]`.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(name) => vec![name],
+        OneOrMany::Many(names) => names,
+    })
 }
 
 /// A `network` setting from config.toml or a profile: `"none"`, `"full"`,
@@ -199,7 +215,9 @@ mod tests {
         let cfg: Config =
             toml::from_str("backend = \"docker\"\ndefault_profile = \"ai\"\n").unwrap();
         assert_eq!(cfg.backend, Some(BackendKind::Docker));
-        assert_eq!(cfg.default_profile.as_deref(), Some("ai"));
+        assert_eq!(cfg.default_profile, ["ai"]);
+        let cfg: Config = toml::from_str("default_profile = [\"rust\", \"dsh\"]\n").unwrap();
+        assert_eq!(cfg.default_profile, ["rust", "dsh"]);
         assert_eq!(cfg.network, None);
     }
 
