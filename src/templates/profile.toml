@@ -13,6 +13,11 @@
 # project you mount.
 # extension = "{name}.sh"
 
+# The image sessions start from: any image, such as "alpine:3.22" or
+# "ubuntu:24.04", used as it is. Default: podbay's bundled Debian base.
+# Stacked profiles can choose only one.
+# image = "alpine:3.22"
+
 # Shell for interactive sessions, started as a login shell. The image must
 # have it (see extension). Default: bash.
 # shell = "zsh"

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::backend::{Backend, BackendKind, Identity};
+use crate::backend::{Backend, BackendKind, IMAGE_DEV_UID, Identity};
 use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
 use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
 use crate::egress;
@@ -116,7 +116,12 @@ impl Setup {
         (network, source)
     }
 
-    fn base_image(&self) -> BaseImage {
+    /// The profiles' `image`, else config.toml's `base_image`, else the
+    /// bundled base.
+    fn base_image(&self, profile: &ResolvedProfile) -> BaseImage {
+        if let Some((image, _)) = &profile.image {
+            return BaseImage::Custom(image.clone());
+        }
         match &self.config.base_image {
             Some(image) => BaseImage::Custom(image.clone()),
             None => BaseImage::Bundled,
@@ -168,7 +173,12 @@ impl Prepared {
         for note in &identity.notes {
             eprintln!("podbay: note: {note}");
         }
-        let mut stack = image::layers(&ctx.base_image(), &profile.extensions)?;
+        let mut stack = image::layers(
+            &ctx.base_image(&profile),
+            &profile.extensions,
+            identity.uid,
+            identity.gid,
+        )?;
         image::add_identity(&mut stack, identity.uid, identity.gid);
         let actions = image::ensure(&backend, &stack, false, dry_run)?;
         let image = stack.last().expect("at least the base layer").tag.clone();
@@ -710,7 +720,12 @@ pub fn build(args: BuildArgs) -> Result<()> {
     let backend = ctx.backend(&args.engine)?;
     let profile = ctx.profile(&args.engine)?;
     let identity = backend.identity()?;
-    let mut stack = image::layers(&ctx.base_image(), &profile.extensions)?;
+    let mut stack = image::layers(
+        &ctx.base_image(&profile),
+        &profile.extensions,
+        identity.uid,
+        identity.gid,
+    )?;
     image::add_identity(&mut stack, identity.uid, identity.gid);
     let actions = image::ensure(&backend, &stack, args.force, false)?;
     for (layer, action) in stack.iter().zip(actions) {
@@ -739,7 +754,12 @@ pub fn profile(cmd: ProfileCommand) -> Result<()> {
         }
         ProfileCommand::Show { names } => {
             let resolved = profile::resolve_all(&ctx.paths, &names)?;
-            let stack = image::layers(&ctx.base_image(), &resolved.extensions)?;
+            let stack = image::layers(
+                &ctx.base_image(&resolved),
+                &resolved.extensions,
+                IMAGE_DEV_UID,
+                IMAGE_DEV_UID,
+            )?;
             let limits = ctx.limits(&resolved);
             let network = ctx.network(&resolved, None);
             print!(
@@ -769,7 +789,13 @@ fn describe(
         let source = match &layer.source {
             LayerSource::Bundled => "bundled base".to_owned(),
             LayerSource::Relay => "network relay".to_owned(),
-            LayerSource::Custom => "custom base".to_owned(),
+            LayerSource::Adapter { image, .. } => {
+                let from = match &p.image {
+                    Some((_, profile)) => format!("profile {profile}"),
+                    None => "config.toml".to_owned(),
+                };
+                format!("{image} with podbay-init added, from {from}")
+            }
             LayerSource::Extension { profile, .. } => format!("extension from {profile}"),
             LayerSource::Identity { uid, gid, .. } => format!("dev as {uid}:{gid}"),
         };

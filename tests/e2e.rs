@@ -603,6 +603,81 @@ echo "installs=$(wc -l < ~/.local/tools/installs)"
     assert_ne!(session_network.trim(), "lo", "{out}");
 }
 
+/// Any image works, unmodified: one with a shell and its own users
+/// (Alpine, busybox and musl), and one with nothing but a static binary
+/// (hello-world, from scratch), whose own default command runs.
+#[test]
+fn sessions_run_on_images_podbay_did_not_build() {
+    let Some(engine) = engine() else { return };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    let id = std::process::id();
+    let (alpine, scratch) = (format!("e2ealpine{id}"), format!("e2escratch{id}"));
+    fs::write(
+        profiles.join(format!("{alpine}.toml")),
+        "image = \"alpine:3.22\"\ncap_add = [\"NET_RAW\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        profiles.join(format!("{scratch}.toml")),
+        "image = \"hello-world:latest\"\n",
+    )
+    .unwrap();
+
+    let script = r#"
+id -un
+echo "home=$HOME pwd=$(pwd)"
+grep -E '^(CapEff|CapBnd)' /proc/self/status | tr -d '\t'
+grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status && echo nnp=on
+touch made-in-alpine
+"#;
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "-p", &alpine])
+        .arg(&project)
+        .args(["--", "sh", "-c", script])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "home=/home/dev pwd=/home/dev/workspace/repomount",
+        "CapEff:0000000000002000",
+        "CapBnd:0000000000002000",
+        "nnp=on",
+    ] {
+        assert!(
+            out.contains(expected),
+            "missing {expected:?}\nstdout:\n{out}\nstderr:\n{err}"
+        );
+    }
+    // Running as the host user (dev) unless the engine keeps root as that
+    // user, and either way the file belongs to whoever runs podbay.
+    let me = fs::metadata(root).unwrap().uid();
+    let user = out.lines().next().unwrap_or_default();
+    assert!(user == "dev" || (user == "root" && me == 0), "{out}");
+    assert_eq!(
+        fs::metadata(project.join("made-in-alpine")).unwrap().uid(),
+        me
+    );
+
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "-p", &scratch])
+        .arg(&project)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("Hello from Docker!"), "{out}");
+}
+
 /// Profiles given together are stacked: each one's environment, volumes
 /// and provisioning apply, as if one profile extended them all.
 #[test]

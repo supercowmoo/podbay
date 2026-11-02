@@ -37,8 +37,11 @@ to escalate there) and knows exactly how podbay works.
 
 The following are trusted: you, your podbay config directory
 (`~/.config/podbay`, including profiles and extension scripts), the podbay
-binary, the container engine, the kernel and the base image's upstream
-sources.
+binary, the container engine, the kernel, and the image sessions start
+from: the bundled base's upstream sources, or whoever publishes an image a
+profile names. podbay adds its own init and users file to any image, and
+the session's hardening doesn't depend on the image, but a malicious image
+can still ship malicious tools for the session to run.
 
 ## Trust boundaries
 

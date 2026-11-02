@@ -1,6 +1,6 @@
-//! Image layering: the bundled base image, one derived image per profile
-//! extension script, and on rootful Docker a final layer that gives `dev` the
-//! host user's ids. Every tag is a hash of podbay's inputs to the image (its
+//! Image layering: the bundled base image or an adapter around any other
+//! image, one derived image per profile extension script, and on rootful
+//! Docker a final layer that gives `dev` the host user's ids. Every tag is a hash of podbay's inputs to the image (its
 //! Containerfile, scripts and parent tag), so changing any of them produces a
 //! new tag. What those inputs fetch is not hashed: the `FROM` images by tag,
 //! the packages `apt-get` installs, and a custom base rebuilt under the same
@@ -24,8 +24,41 @@ const RELAY_SOURCE: &str = include_str!("../relay/src/main.rs");
 pub enum BaseImage {
     /// The base image shipped inside this binary.
     Bundled,
-    /// A user-supplied image, used as-is.
+    /// Any other image, such as `alpine:3.22`, which podbay adapts.
     Custom(String),
+}
+
+/// The build stage that compiles podbay-init, shared by the bundled base
+/// and adapters. `base/Containerfile` has the same stage.
+const INIT_STAGE: &str = "\
+FROM rust:1.90.0-alpine3.22 AS init
+COPY init.rs /src/init.rs
+RUN rustc --edition 2024 -C opt-level=s -C panic=abort \\
+    -C target-feature=+crt-static -C strip=symbols -o /podbay-init /src/init.rs
+";
+
+/// Puts the profile's `path` back in front of PATH for login shells, which
+/// reset it from /etc/profile.
+const PATH_SNIPPET: &str = "\
+if [ -n \"${PODBAY_PATH:-}\" ]; then
+  case \":$PATH:\" in *\":$PODBAY_PATH:\"*) ;; *) PATH=\"$PODBAY_PATH:$PATH\" ;; esac
+  export PATH
+fi
+";
+
+/// Image names go into a Containerfile's `FROM` line and engine arguments,
+/// so only the characters image references use are allowed.
+pub fn validate_image_name(name: &str) -> Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with(['-', '.', '/', ':', '@'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/:@".contains(c));
+    if !valid {
+        bail!("invalid image name {name:?}: use a reference such as \"alpine:3.22\"");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +73,14 @@ pub enum LayerSource {
     /// The network relay for allowlisted sessions and forwarded ports, built
     /// from `relay/`.
     Relay,
-    Custom,
+    /// Any image, with podbay-init, a `dev` user with these ids, and the
+    /// login-shell PATH snippet added. Built without running anything in the
+    /// image, so images without a shell work too.
+    Adapter {
+        image: String,
+        uid: u32,
+        gid: u32,
+    },
     Extension {
         parent: String,
         profile: String,
@@ -60,8 +100,14 @@ pub enum LayerSource {
 const HOME_SKELETON: &str = "/usr/local/share/podbay/home";
 
 /// Computes the layer stack for a profile, bottom first. The last layer is
-/// the image to run.
-pub fn layers(base: &BaseImage, extensions: &[Extension]) -> Result<Vec<Layer>> {
+/// the image to run. `uid:gid` is what `dev` runs as (0 for staying root);
+/// an adapter gives `dev` those ids directly.
+pub fn layers(
+    base: &BaseImage,
+    extensions: &[Extension],
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<Layer>> {
     let mut stack = vec![match base {
         BaseImage::Bundled => {
             let hash = sha256_hex_fields(&[BASE_CONTAINERFILE.as_bytes(), INIT_SOURCE.as_bytes()]);
@@ -70,10 +116,28 @@ pub fn layers(base: &BaseImage, extensions: &[Extension]) -> Result<Vec<Layer>> 
                 source: LayerSource::Bundled,
             }
         }
-        BaseImage::Custom(image) => Layer {
-            tag: image.clone(),
-            source: LayerSource::Custom,
-        },
+        BaseImage::Custom(image) => {
+            validate_image_name(image)?;
+            // Staying root still needs a dev user for HOME and the like.
+            let (uid, gid) = match uid {
+                0 => (IMAGE_DEV_UID, IMAGE_DEV_UID),
+                _ => (uid, gid),
+            };
+            let hash = sha256_hex_fields(&[
+                adapter_containerfile(image, &[]).as_bytes(),
+                INIT_SOURCE.as_bytes(),
+                PATH_SNIPPET.as_bytes(),
+                format!("{uid}:{gid}").as_bytes(),
+            ]);
+            Layer {
+                tag: format!("podbay-image:{}", &hash[..16]),
+                source: LayerSource::Adapter {
+                    image: image.clone(),
+                    uid,
+                    gid,
+                },
+            }
+        }
     }];
 
     for ext in extensions {
@@ -104,7 +168,8 @@ pub fn layers(base: &BaseImage, extensions: &[Extension]) -> Result<Vec<Layer>> 
 /// as someone other than the image's dev user (rootful Docker). 0 means the
 /// session stays root and needs no layer.
 pub fn add_identity(stack: &mut Vec<Layer>, uid: u32, gid: u32) {
-    if uid == 0 || (uid, gid) == (IMAGE_DEV_UID, IMAGE_DEV_UID) {
+    let adapted = matches!(stack[0].source, LayerSource::Adapter { .. });
+    if uid == 0 || (uid, gid) == (IMAGE_DEV_UID, IMAGE_DEV_UID) || adapted {
         return;
     }
     let parent = stack.last().expect("stack starts non-empty").tag.clone();
@@ -148,12 +213,6 @@ pub fn ensure(
     let mut rebuild_rest = false;
     for layer in stack {
         let action = match layer.source {
-            LayerSource::Custom => {
-                if !backend.image_exists(&layer.tag)? {
-                    bail!("base image {} not found", layer.tag);
-                }
-                Action::Present
-            }
             _ if force || rebuild_rest || !backend.image_exists(&layer.tag)? => Action::Build,
             _ => Action::Present,
         };
@@ -196,12 +255,38 @@ fn build(backend: &dyn Backend, layer: &Layer, force: bool) -> Result<()> {
                 identity_containerfile(parent, *uid, *gid),
             )?;
         }
-        LayerSource::Custom => unreachable!("custom images are never built"),
+        LayerSource::Adapter { image, uid, gid } => {
+            if !backend.image_exists(image)? {
+                backend.pull_image(image)?;
+            } else if force && backend.pull_image(image).is_err() {
+                eprintln!("podbay: note: couldn't pull {image}; using the local copy");
+            }
+            let passwd = backend.read_file(image, "/etc/passwd")?;
+            let group = backend.read_file(image, "/etc/group")?;
+            let command = backend.default_command(image)?;
+            let text =
+                |bytes: Option<Vec<u8>>| bytes.map(|b| String::from_utf8_lossy(&b).into_owned());
+            fs::write(
+                ctx.path().join("Containerfile"),
+                adapter_containerfile(image, &command),
+            )?;
+            fs::write(ctx.path().join("init.rs"), INIT_SOURCE)?;
+            fs::write(
+                ctx.path().join("passwd"),
+                with_dev_user(text(passwd).as_deref(), *uid, *gid),
+            )?;
+            fs::write(
+                ctx.path().join("group"),
+                with_dev_group(text(group).as_deref(), *gid),
+            )?;
+            fs::write(ctx.path().join("podbay-path.sh"), PATH_SNIPPET)?;
+        }
     }
     let refresh = Refresh {
         no_cache: force,
         // Only these start from a registry image; the others start from a
-        // podbay layer or a custom base, which exist only locally.
+        // podbay layer. An adapted image was pulled above, and may exist
+        // only locally.
         pull: force && matches!(layer.source, LayerSource::Bundled | LayerSource::Relay),
     };
     eprintln!("podbay: building {}", layer.tag);
@@ -219,6 +304,73 @@ fn extension_containerfile(parent: &str, profile: &str) -> String {
          RUN chmod 0755 {dest} && {dest} \\\n  \
          && if [ -d {HOME_SKELETON} ]; then cp -a /home/dev/. {HOME_SKELETON}/; fi\n"
     )
+}
+
+/// podbay's additions to any image. Nothing runs in the image while
+/// building, so it needs no shell or tools: everything is copied in, and
+/// the users file is prepared on the host from the image's own.
+fn adapter_containerfile(image: &str, command: &[String]) -> String {
+    // A new ENTRYPOINT clears the image's CMD, so its default command comes
+    // back as the command podbay-init runs.
+    let cmd = match command.is_empty() {
+        true => String::new(),
+        false => format!(
+            "CMD {}\n",
+            serde_json::to_string(command).expect("strings serialize")
+        ),
+    };
+    format!(
+        "{INIT_STAGE}\n\
+         FROM {image}\n\
+         COPY --from=init /podbay-init /usr/local/bin/podbay-init\n\
+         COPY passwd /etc/passwd\n\
+         COPY group /etc/group\n\
+         COPY podbay-path.sh /etc/profile.d/podbay-path.sh\n\
+         USER 0:0\n\
+         ENTRYPOINT [\"/usr/local/bin/podbay-init\"]\n\
+         {cmd}"
+    )
+}
+
+/// The image's users with `dev` added at `uid:gid`, home `/home/dev`. An
+/// existing `dev` gets those ids. When another user already has the uid
+/// (images often have one at 1000), `dev` goes just before it, so the uid
+/// shows as `dev`; both names keep working.
+fn with_dev_user(passwd: Option<&str>, uid: u32, gid: u32) -> String {
+    let passwd = passwd.unwrap_or("root:x:0:0:root:/root:/bin/sh\n");
+    let dev = format!("dev:x:{uid}:{gid}:podbay:/home/dev:/bin/sh");
+    let mut lines: Vec<String> = passwd
+        .lines()
+        .filter(|l| !l.starts_with("dev:"))
+        .map(str::to_owned)
+        .collect();
+    let same_uid = lines
+        .iter()
+        .position(|l| l.split(':').nth(2) == Some(uid.to_string().as_str()));
+    match same_uid {
+        Some(i) => lines.insert(i, dev),
+        None => lines.push(dev),
+    }
+    lines.join("\n") + "\n"
+}
+
+/// The image's groups with a `dev` group at `gid`, placed like the user.
+fn with_dev_group(group: Option<&str>, gid: u32) -> String {
+    let group = group.unwrap_or("root:x:0:\n");
+    let dev = format!("dev:x:{gid}:");
+    let mut lines: Vec<String> = group
+        .lines()
+        .filter(|l| !l.starts_with("dev:"))
+        .map(str::to_owned)
+        .collect();
+    let same_gid = lines
+        .iter()
+        .position(|l| l.split(':').nth(2) == Some(gid.to_string().as_str()));
+    match same_gid {
+        Some(i) => lines.insert(i, dev),
+        None => lines.push(dev),
+    }
+    lines.join("\n") + "\n"
 }
 
 fn identity_containerfile(parent: &str, uid: u32, gid: u32) -> String {
@@ -249,6 +401,7 @@ mod tests {
     struct FakeBackend {
         images: RefCell<HashSet<String>>,
         built: RefCell<Vec<(String, String, Refresh)>>,
+        pulled: RefCell<Vec<String>>,
     }
 
     impl Backend for FakeBackend {
@@ -265,6 +418,17 @@ mod tests {
                 .push((tag.into(), containerfile, refresh));
             self.images.borrow_mut().insert(tag.into());
             Ok(())
+        }
+        fn pull_image(&self, image: &str) -> Result<()> {
+            self.pulled.borrow_mut().push(image.into());
+            self.images.borrow_mut().insert(image.into());
+            Ok(())
+        }
+        fn default_command(&self, _image: &str) -> Result<Vec<String>> {
+            Ok(vec!["/bin/sh".into()])
+        }
+        fn read_file(&self, _image: &str, path: &str) -> Result<Option<Vec<u8>>> {
+            Ok((path == "/etc/passwd").then(|| b"root:x:0:0::/root:/bin/sh\n".to_vec()))
         }
         fn identity(&self) -> Result<Identity> {
             unreachable!()
@@ -289,7 +453,13 @@ mod tests {
         let a = ext(dir.path(), "a", "#!/bin/sh\necho a\n");
         let b = ext(dir.path(), "b", "#!/bin/sh\necho b\n");
 
-        let stack = layers(&BaseImage::Bundled, &[a.clone(), b.clone()]).unwrap();
+        let stack = layers(
+            &BaseImage::Bundled,
+            &[a.clone(), b.clone()],
+            IMAGE_DEV_UID,
+            IMAGE_DEV_UID,
+        )
+        .unwrap();
         assert_eq!(stack.len(), 3);
         assert!(stack[0].tag.starts_with("podbay-base:"));
         assert!(stack[1].tag.starts_with("podbay-a:"));
@@ -297,7 +467,7 @@ mod tests {
 
         // Changing a lower layer changes every tag above it.
         fs::write(&a.script, "#!/bin/sh\necho changed\n").unwrap();
-        let changed = layers(&BaseImage::Bundled, &[a, b]).unwrap();
+        let changed = layers(&BaseImage::Bundled, &[a, b], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
         assert_eq!(stack[0].tag, changed[0].tag);
         assert_ne!(stack[1].tag, changed[1].tag);
         assert_ne!(stack[2].tag, changed[2].tag);
@@ -305,7 +475,7 @@ mod tests {
 
     #[test]
     fn identity_layer_only_when_ids_differ() {
-        let mut stack = layers(&BaseImage::Bundled, &[]).unwrap();
+        let mut stack = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
         add_identity(&mut stack, 0, 0);
         add_identity(&mut stack, IMAGE_DEV_UID, IMAGE_DEV_UID);
         assert_eq!(stack.len(), 1);
@@ -333,7 +503,7 @@ mod tests {
     fn extension_requires_shebang() {
         let dir = tempfile::tempdir().unwrap();
         let e = ext(dir.path(), "a", "apt-get install x\n");
-        assert!(layers(&BaseImage::Bundled, &[e]).is_err());
+        assert!(layers(&BaseImage::Bundled, &[e], IMAGE_DEV_UID, IMAGE_DEV_UID).is_err());
     }
 
     #[test]
@@ -341,7 +511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = ext(dir.path(), "a", "#!/bin/sh\n");
         let b = ext(dir.path(), "b", "#!/bin/sh\n");
-        let stack = layers(&BaseImage::Bundled, &[a, b]).unwrap();
+        let stack = layers(&BaseImage::Bundled, &[a, b], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
 
         let backend = FakeBackend::default();
         backend.images.borrow_mut().insert(stack[0].tag.clone());
@@ -360,7 +530,7 @@ mod tests {
     fn force_rebuilds_uncached_and_pulls_only_registry_bases() {
         let dir = tempfile::tempdir().unwrap();
         let a = ext(dir.path(), "a", "#!/bin/sh\n");
-        let stack = layers(&BaseImage::Bundled, &[a]).unwrap();
+        let stack = layers(&BaseImage::Bundled, &[a], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
         let backend = FakeBackend::default();
         for layer in &stack {
             backend.images.borrow_mut().insert(layer.tag.clone());
@@ -395,7 +565,7 @@ mod tests {
 
     #[test]
     fn dry_run_builds_nothing() {
-        let stack = layers(&BaseImage::Bundled, &[]).unwrap();
+        let stack = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
         let backend = FakeBackend::default();
         let actions = ensure(&backend, &stack, false, true).unwrap();
         assert_eq!(actions, [Action::Build]);
@@ -403,15 +573,138 @@ mod tests {
     }
 
     #[test]
-    fn custom_base_must_exist_and_is_never_built() {
-        let stack = layers(&BaseImage::Custom("mine:1".into()), &[]).unwrap();
-        let backend = FakeBackend::default();
-        assert!(ensure(&backend, &stack, true, false).is_err());
-        backend.images.borrow_mut().insert("mine:1".into());
+    fn base_containerfile_builds_init_the_same_way() {
+        assert!(
+            BASE_CONTAINERFILE.contains(INIT_STAGE),
+            "{BASE_CONTAINERFILE}"
+        );
+    }
+
+    #[test]
+    fn image_names() {
+        for ok in [
+            "alpine",
+            "alpine:3.22",
+            "docker.io/library/debian:trixie-slim",
+            "ghcr.io/o/r@sha256:abc123",
+            "localhost:5000/x",
+        ] {
+            validate_image_name(ok).unwrap();
+        }
+        for bad in ["", "-x", "a b", "a\nRUN rm -rf /", "a;b", "$(x)", "/abs"] {
+            assert!(validate_image_name(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn any_image_gets_an_adapter_with_dev_at_the_session_ids() {
+        let stack = layers(&BaseImage::Custom("alpine:3.22".into()), &[], 1500, 1600).unwrap();
+        assert!(
+            stack[0].tag.starts_with("podbay-image:"),
+            "{}",
+            stack[0].tag
+        );
         assert_eq!(
-            ensure(&backend, &stack, true, false).unwrap(),
+            stack[0].source,
+            LayerSource::Adapter {
+                image: "alpine:3.22".into(),
+                uid: 1500,
+                gid: 1600
+            }
+        );
+        // The adapter already has the right ids, so no identity layer.
+        let mut with_identity = stack.clone();
+        add_identity(&mut with_identity, 1500, 1600);
+        assert_eq!(with_identity, stack);
+        // Staying root still gets a dev user, at the image default.
+        let root = layers(&BaseImage::Custom("alpine:3.22".into()), &[], 0, 0).unwrap();
+        assert!(matches!(
+            root[0].source,
+            LayerSource::Adapter {
+                uid: 1000,
+                gid: 1000,
+                ..
+            }
+        ));
+        // Different images and ids get different tags.
+        let other = layers(&BaseImage::Custom("debian".into()), &[], 1500, 1600).unwrap();
+        assert_ne!(other[0].tag, stack[0].tag);
+        assert_ne!(root[0].tag, stack[0].tag);
+        assert!(layers(&BaseImage::Custom("a b".into()), &[], 0, 0).is_err());
+    }
+
+    #[test]
+    fn adapter_containerfile_runs_nothing_in_the_image() {
+        let file = adapter_containerfile(
+            "sbx/claude-image:latest",
+            &["tini".into(), "--".into(), "claude".into()],
+        );
+        assert!(file.contains("FROM sbx/claude-image:latest\n"), "{file}");
+        let after_from = &file[file.find("FROM sbx/claude-image").unwrap()..];
+        assert!(!after_from.contains("RUN"), "{file}");
+        assert!(
+            file.contains("ENTRYPOINT [\"/usr/local/bin/podbay-init\"]\n"),
+            "{file}"
+        );
+        assert!(
+            file.ends_with("CMD [\"tini\",\"--\",\"claude\"]\n"),
+            "{file}"
+        );
+        assert!(!adapter_containerfile("x", &[]).contains("CMD"));
+    }
+
+    #[test]
+    fn dev_user_is_added_to_the_image_users() {
+        let image = "root:x:0:0:root:/root:/bin/bash\nagent:x:1000:1000::/home/agent:/bin/bash\n";
+        assert_eq!(
+            with_dev_user(Some(image), 1000, 1000),
+            "root:x:0:0:root:/root:/bin/bash\n\
+             dev:x:1000:1000:podbay:/home/dev:/bin/sh\n\
+             agent:x:1000:1000::/home/agent:/bin/bash\n"
+        );
+        assert_eq!(
+            with_dev_user(Some(image), 1500, 1500),
+            format!("{image}dev:x:1500:1500:podbay:/home/dev:/bin/sh\n")
+        );
+        // An existing dev takes the session's ids.
+        let has_dev = "root:x:0:0::/root:/bin/sh\ndev:x:1000:1000::/home/dev:/bin/bash\n";
+        assert_eq!(
+            with_dev_user(Some(has_dev), 1500, 1500),
+            "root:x:0:0::/root:/bin/sh\ndev:x:1500:1500:podbay:/home/dev:/bin/sh\n"
+        );
+        // Images without users at all, like scratch.
+        assert_eq!(
+            with_dev_user(None, 1000, 1000),
+            "root:x:0:0:root:/root:/bin/sh\ndev:x:1000:1000:podbay:/home/dev:/bin/sh\n"
+        );
+        assert_eq!(
+            with_dev_group(Some("root:x:0:\nagent:x:1000:\n"), 1000),
+            "root:x:0:\ndev:x:1000:\nagent:x:1000:\n"
+        );
+        assert_eq!(with_dev_group(None, 1000), "root:x:0:\ndev:x:1000:\n");
+    }
+
+    #[test]
+    fn adapter_build_reads_the_image_and_pulls_it_when_missing() {
+        let stack = layers(&BaseImage::Custom("alpine:3.22".into()), &[], 1000, 1000).unwrap();
+        let backend = FakeBackend::default();
+        assert_eq!(
+            ensure(&backend, &stack, false, false).unwrap(),
+            [Action::Build]
+        );
+        assert_eq!(*backend.pulled.borrow(), ["alpine:3.22"]);
+        let built = backend.built.borrow();
+        assert!(built[0].1.contains("FROM alpine:3.22\n"), "{}", built[0].1);
+        assert!(built[0].1.contains("CMD [\"/bin/sh\"]"), "{}", built[0].1);
+        // Never --pull: the image may exist only locally.
+        assert!(!built[0].2.pull);
+        drop(built);
+
+        // Present now, and nothing is pulled again.
+        assert_eq!(
+            ensure(&backend, &stack, false, false).unwrap(),
             [Action::Present]
         );
-        assert!(backend.built.borrow().is_empty());
+        assert_eq!(backend.pulled.borrow().len(), 1);
     }
 }

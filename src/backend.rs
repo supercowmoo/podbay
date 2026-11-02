@@ -72,6 +72,12 @@ pub trait Backend {
     fn image_exists(&self, image: &str) -> Result<bool>;
     /// Builds `tag` from the `Containerfile` in `context`.
     fn build_image(&self, tag: &str, context: &Path, refresh: Refresh) -> Result<()>;
+    /// Pulls `image` from its registry.
+    fn pull_image(&self, image: &str) -> Result<()>;
+    /// What `image` runs by default: its entrypoint followed by its command.
+    fn default_command(&self, image: &str) -> Result<Vec<String>>;
+    /// The file at `path` in `image`, or `None` if it has none there.
+    fn read_file(&self, image: &str, path: &str) -> Result<Option<Vec<u8>>>;
     fn identity(&self) -> Result<Identity>;
     /// cgroup controllers the engine can use for this user, such as
     /// `memory` and `pids`. `None` when the engine can't say, in which case
@@ -153,6 +159,72 @@ impl Backend for Cli {
         Ok(())
     }
 
+    fn pull_image(&self, image: &str) -> Result<()> {
+        let status = self
+            .command()
+            .args(["pull", image])
+            .stdout(Stdio::from(std::io::stderr()))
+            .status()
+            .with_context(|| format!("running `{} pull`", self.kind.program()))?;
+        if !status.success() {
+            bail!("pulling {image} failed");
+        }
+        Ok(())
+    }
+
+    fn default_command(&self, image: &str) -> Result<Vec<String>> {
+        let out = self
+            .command()
+            .args(["image", "inspect", "--format", "{{json .Config}}", image])
+            .stderr(Stdio::inherit())
+            .output()
+            .with_context(|| format!("running `{} image inspect`", self.kind.program()))?;
+        if !out.status.success() {
+            bail!("inspecting {image} failed");
+        }
+        parse_default_command(&out.stdout)
+            .with_context(|| format!("reading the configuration of {image}"))
+    }
+
+    fn read_file(&self, image: &str, path: &str) -> Result<Option<Vec<u8>>> {
+        // A stopped container is enough to copy from; the command is never
+        // run, and images without one need something to create it with.
+        let out = self
+            .command()
+            .args(["create", image, "/podbay-never-run"])
+            .stderr(Stdio::inherit())
+            .output()
+            .with_context(|| format!("running `{} create`", self.kind.program()))?;
+        if !out.status.success() {
+            bail!("creating a container from {image} failed");
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let dir = tempfile::tempdir()?;
+        let dest = dir.path().join("file");
+        let copied = self
+            .command()
+            .arg("cp")
+            .arg(format!("{id}:{path}"))
+            .arg(&dest)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = self
+            .command()
+            .args(["rm", "--force", &id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match copied {
+            // A symbolic link copies as a link; only a regular file counts.
+            Ok(status) if status.success() && dest.symlink_metadata()?.is_file() => {
+                Ok(Some(std::fs::read(&dest)?))
+            }
+            Ok(_) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("running `{} cp`", self.kind.program())),
+        }
+    }
+
     fn identity(&self) -> Result<Identity> {
         identity_for(self.kind, self.host_uid, self.host_gid, || {
             self.docker_is_rootless()
@@ -174,6 +246,24 @@ impl Backend for Cli {
         }
         Ok(parse_json_strings(&String::from_utf8_lossy(&out.stdout)))
     }
+}
+
+/// The entrypoint and command from an image's `{{json .Config}}`; either may
+/// be null.
+fn parse_default_command(json: &[u8]) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Config {
+        entrypoint: Option<Vec<String>>,
+        cmd: Option<Vec<String>>,
+    }
+    let config: Config = serde_json::from_slice(json)?;
+    Ok(config
+        .entrypoint
+        .unwrap_or_default()
+        .into_iter()
+        .chain(config.cmd.unwrap_or_default())
+        .collect())
 }
 
 /// Parses a JSON array of plain strings, such as `["cpu","memory"]`. `null`
@@ -252,6 +342,18 @@ fn identity_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_commands() {
+        let cmd = |json: &str| parse_default_command(json.as_bytes()).unwrap();
+        assert_eq!(
+            cmd(r#"{"Entrypoint":["tini","--"],"Cmd":["claude"],"Env":["A=b"]}"#),
+            ["tini", "--", "claude"]
+        );
+        assert_eq!(cmd(r#"{"Entrypoint":null,"Cmd":["/hello"]}"#), ["/hello"]);
+        assert!(cmd(r#"{"Entrypoint":null,"Cmd":null}"#).is_empty());
+        assert!(cmd("{}").is_empty());
+    }
 
     fn never() -> Result<bool> {
         panic!("should not query docker")

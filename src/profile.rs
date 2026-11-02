@@ -14,6 +14,7 @@
 //! path = ["/home/dev/.cargo/bin"] # prepended to PATH
 //! network = ["api.example.com"]   # or "full"; default "none"
 //! ports = [3080, "8080:3000"]     # host 127.0.0.1 port, then the session's
+//! image = "alpine:3.22"           # any image; default: podbay's bundled base
 //!
 //! [env]
 //! RUSTUP_HOME = "/home/dev/.rustup"
@@ -71,6 +72,8 @@ struct ProfileFile {
     /// Session ports reachable from the host's loopback.
     #[serde(default)]
     ports: Vec<Port>,
+    /// The image sessions start from, instead of the bundled base.
+    image: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +187,8 @@ pub struct ResolvedProfile {
     /// Forwarded ports down the chain, ancestors first, each with the
     /// profile that added it.
     pub ports: Vec<(Port, String)>,
+    /// The image to start from, and the profile that chose it.
+    pub image: Option<(String, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
     /// Settings one profile replaced from another it doesn't extend, as
@@ -532,6 +537,21 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, ctx: &mut Resolution) 
     }
     if profile.shell.is_some() {
         ctx.shell_from = Some(name.to_owned());
+    }
+    if let Some(image) = &profile.image {
+        crate::image::validate_image_name(image)?;
+        if let Some((current, from)) = &ctx.out.image
+            && current != image
+        {
+            let extends = ctx.ancestors.get(name).is_some_and(|a| a.contains(from));
+            if !extends {
+                bail!(
+                    "profiles {from} and {name} both choose an image ({current} and \
+                     {image}); a session has one, so stack only one of them"
+                );
+            }
+        }
+        ctx.out.image = Some((image.clone(), name.to_owned()));
     }
     for key in profile.env.keys() {
         ctx.env_from.insert(key.clone(), name.to_owned());

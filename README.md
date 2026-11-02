@@ -12,6 +12,8 @@ everything else is something you declared:
 - your own toolchain managers (rustup, uv, nvm, nix, mise, ...), which you
   invoke from a profile and which install into volumes as they normally would
 - the shell you want, environment variables and PATH entries
+- the image you like, such as `alpine`, `ubuntu` or an agent's own image,
+  unmodified, or podbay's small Debian base
 - optional root build scripts baked into a derived image
 - network access: none, HTTPS to the hosts you list, or everything
 - ports you forward, so the host can reach a server in the session
@@ -61,9 +63,9 @@ podbay run ~/src/some-project
 ```
 
 The first run builds the bundled base image: Debian slim with git, curl,
-build-essential, bash and a non-root `dev` user. No language toolchains and
-no agents: profiles bring those. The session has no network unless you give
-it some.
+build-essential and bash. No language toolchains and no agents: profiles
+bring those. Any other image works too; see [Images](#images). The session
+has no network unless you give it some.
 
 ### Your first profiles
 
@@ -289,7 +291,7 @@ inherited ones. `[provision]` commands and `watch` lists, `cap_add` and
 `[seccomp] allow` lists are combined, and `engine_default` is inherited
 until a profile sets it. `[limits]` keys override one at a time, and `network`
 host lists add up while `"none"` or `"full"` replaces what came before.
-`ports` lists add up too. Volumes keep the name of the profile that
+`ports` lists add up too, and only one `image` can be chosen. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
 **Mounts or volumes?** Use mounts for files you own and edit on the host, such
@@ -308,6 +310,61 @@ rebuilt under the same tag: run `podbay build --force` to pick those up.
 Extensions run as root at build time, the only time the root filesystem is
 writable. Anything they put in `/home/dev` is copied into the home skeleton
 automatically.
+
+## Images
+
+Sessions start from podbay's bundled base unless a profile, or
+`base_image` in `config.toml`, names another image. Any image works as it
+is, from a registry or built locally:
+
+```toml
+# ~/.config/podbay/profiles/alpine.toml
+image = "alpine:3.22"
+```
+
+```toml
+# ~/.config/podbay/profiles/claude-image.toml: Docker's Claude Code image
+image = "sbx/claude-image:latest"
+network = ["api.anthropic.com"]
+
+[env]
+DISABLE_AUTOUPDATER = "1"   # the image is read-only in a session
+
+[[volume]]                   # login and settings, kept between sessions
+name = "claude"
+container = "/home/dev/.claude"
+```
+
+podbay pulls the image if it's missing and builds one small layer on top
+(`podbay-image:<hash>`) that adds:
+
+- podbay-init, a static binary that sets up the session and drops to the
+  `dev` user. It's the container's first process.
+- a `dev` user and group in the image's own `/etc/passwd` and
+  `/etc/group`, with the ids the session runs as. When the image already
+  has a user with that uid, such as `agent` or `ubuntu` at 1000, `dev`
+  shares it, and the image's files stay readable.
+- the snippet that keeps the profile's `path` for login shells.
+
+Nothing runs inside the image to do this, so images without a shell or
+package manager work too (distroless, `scratch`). The image's own
+`ENTRYPOINT` and `CMD` stay its default command: `podbay run -p
+claude-image .` starts Claude Code, and `--` runs something else. Its
+environment, such as `PATH`, is kept. Its `USER` is not: every session runs
+as `dev` with `/home/dev` as its home, so profiles work on any image.
+
+The session is as locked down on any image as on the bundled one: no
+capabilities, `no-new-privileges` (so the image's `sudo` does nothing), a
+read-only root filesystem, podbay's seccomp filter and network policy.
+Docker-in-Docker and other features some images expect from their own
+sandbox aren't available.
+
+A stack of profiles has one image. Two stacked profiles that name different
+images are an error, unless one extends the other. Extensions build on top
+of the chosen image, so they need a shell in it, and provisioning commands
+need whatever tools they call (Alpine has `wget`, not `curl`). Using an
+image means trusting whoever publishes it. podbay doesn't follow a tag to a
+new version by itself: `podbay build --force` pulls the image again.
 
 ## What a session can do
 
@@ -503,7 +560,7 @@ The report detects changes; it doesn't revert them.
 ```toml
 backend = "podman"           # or "docker"; default: podman if installed
 default_profile = ["base", "rust"]  # or one name; used when -p isn't given
-base_image = "my/image:tag"  # use your own image instead of the bundled one
+base_image = "alpine:3.22"   # start from any image; profiles' `image` wins
 network = "none"             # "full", or a host list; --online/--offline override it
 
 [limits]                     # profiles can override each key
@@ -512,12 +569,8 @@ memory = "8g"                # default: no limit
 cpus = 4                     # default: no limit
 ```
 
-A custom base image must provide a `dev` user, podbay-init as its
-entrypoint, and a copy of `/home/dev` at `/usr/local/share/podbay/home` to
-seed the home directory from (see `base/Containerfile`). podbay-init is a
-static binary built from `init/`, so it needs nothing else from the image. For `path` to
-survive login shells, it also needs the `/etc/profile.d/podbay-path.sh`
-snippet from there.
+`base_image` takes any image, as `image` in a profile does; see
+[Images](#images).
 
 `PODBAY_CONFIG_DIR` and `PODBAY_CACHE_DIR` move podbay's config and cache
 directories without touching `HOME` or `XDG_*`. Rootless Podman uses those to

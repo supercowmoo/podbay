@@ -139,7 +139,10 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let Some((program, rest)) = args.split_first() else {
-        return fail("podbay-init: no command to run");
+        return fail(
+            "the image has no default command; give one after --, such as \
+             `podbay run . -- sh`",
+        );
     };
     let workspace = env::var_os("PODBAY_WORKSPACE").unwrap_or_else(|| DEFAULT_WORKSPACE.into());
     let mut command = Command::new(program);

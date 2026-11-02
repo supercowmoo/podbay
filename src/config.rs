@@ -21,7 +21,8 @@ pub struct Config {
     /// exists.
     #[serde(default, deserialize_with = "one_or_many")]
     pub default_profile: Vec<String>,
-    /// Use this image instead of building the bundled base image.
+    /// Start sessions from this image instead of the bundled base, unless a
+    /// profile chooses one.
     pub base_image: Option<String>,
     /// Network access for every session; profiles and `--network` can
     /// override it.
@@ -192,6 +193,10 @@ impl Config {
                     .limits
                     .validate()
                     .with_context(|| format!("invalid {}", path.display()))?;
+                if let Some(image) = &config.base_image {
+                    crate::image::validate_image_name(image)
+                        .with_context(|| format!("invalid {}", path.display()))?;
+                }
                 Ok(config)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
