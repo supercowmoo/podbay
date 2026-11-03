@@ -2,8 +2,10 @@
 name = "podbay-init"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 description = "Sets up a podbay session and drops to the dev user before running its command"
 publish = false
 
-# Standard library only: the base image builds this file with plain rustc.
+# Standard library only: podbay builds this file with plain rustc into
+# every image it runs (the adapter layer in src/image.rs).
 [dependencies]

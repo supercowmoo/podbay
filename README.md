@@ -802,3 +802,9 @@ dependency is always a deliberate, reviewed change.
 The relay and podbay-init are their own crates in `relay/` and `init/`,
 standard library only, since the images build them with plain `rustc`. Run
 `cargo test --workspace` and `cargo clippy --workspace` to include them.
+
+## License
+
+MIT; see [LICENSE](LICENSE). The seccomp profile podbay compiles in,
+`src/seccomp/moby-default.json`, is Docker's, under the Apache License 2.0
+([its license](src/seccomp/LICENSE)), and release downloads include both.

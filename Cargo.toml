@@ -5,6 +5,10 @@ members = ["relay", "init"]
 name = "podbay"
 version = "0.1.0"
 edition = "2024"
+# podbay's own code is MIT; the seccomp profile it compiles in
+# (src/seccomp/moby-default.json) is Docker's, under Apache-2.0.
+license = "MIT AND Apache-2.0"
+repository = "https://github.com/supercowmoo/podbay"
 description = "Disposable, isolated containers around a codebase"
 
 # Exact versions, and Cargo.lock pins the rest with checksums. Build with
