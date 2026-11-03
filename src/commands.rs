@@ -8,7 +8,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Backend, BackendKind, IMAGE_DEV_UID, Identity};
-use crate::cli::{BuildArgs, DoctorArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
+use crate::cli::{
+    BuildArgs, CleanArgs, DoctorArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs,
+};
 use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
 use crate::egress;
 use crate::forward::{self, Forwarder, Port};
@@ -182,13 +184,12 @@ impl Prepared {
         for note in &identity.notes {
             eprintln!("podbay: note: {note}");
         }
-        let mut stack = image::layers(
+        let stack = image::layers(
             &ctx.base_image(&profile),
             &profile.extensions,
             identity.uid,
             identity.gid,
         )?;
-        image::add_identity(&mut stack, identity.uid, identity.gid);
         let actions = image::ensure(&backend, &stack, false, dry_run)?;
         let image = stack.last().expect("at least the base layer").tag.clone();
 
@@ -803,13 +804,12 @@ pub fn build(args: BuildArgs) -> Result<()> {
     let current = std::env::current_dir().and_then(fs::canonicalize).ok();
     let profile = ctx.profile(&args.engine, current.as_deref())?;
     let identity = backend.identity()?;
-    let mut stack = image::layers(
+    let stack = image::layers(
         &ctx.base_image(&profile),
         &profile.extensions,
         identity.uid,
         identity.gid,
     )?;
-    image::add_identity(&mut stack, identity.uid, identity.gid);
     let actions = image::ensure(&backend, &stack, args.force, false)?;
     for (layer, action) in stack.iter().zip(actions) {
         let state = match action {
@@ -820,6 +820,100 @@ pub fn build(args: BuildArgs) -> Result<()> {
     }
     println!("{}", stack.last().expect("at least the base layer").tag);
     Ok(())
+}
+
+/// `podbay clean`: see [`crate::clean`].
+pub fn clean(args: CleanArgs) -> Result<ExitCode> {
+    let ctx = Setup::load()?;
+    let backend = ctx.backend(&EngineArgs {
+        backend: args.backend,
+        profiles: Vec::new(),
+    })?;
+    let program = backend.kind().program();
+    let would = if args.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    let mut failed = false;
+
+    // Relay containers whose podbay is gone.
+    for (name, _running) in backend.list_containers("podbay-relay-")? {
+        let alive = crate::clean::relay_owner(&name)
+            .is_some_and(|pid| crate::clean::owner_alive(Path::new("/proc"), pid));
+        if alive {
+            continue;
+        }
+        if !args.dry_run
+            && let Err(e) = backend.remove_container(&name)
+        {
+            eprintln!("podbay: couldn't remove container {name}: {e:#}");
+            failed = true;
+            continue;
+        }
+        println!("{would} container {name} (its podbay process is gone)");
+    }
+
+    // Images, except what this podbay would otherwise rebuild from scratch.
+    let keep = [image::bundled_base_tag(), image::relay_layer().tag];
+    let images = backend.list_images()?;
+    let mut removed = 0;
+    for image in crate::clean::images_to_remove(&images, &keep) {
+        if !args.dry_run && backend.remove_image(&image).is_err() {
+            println!("kept image {image} (in use)");
+            continue;
+        }
+        println!("{would} image {image}");
+        removed += 1;
+    }
+    let kept: Vec<&String> = images
+        .iter()
+        .filter(|i| {
+            let bare = i.strip_prefix("localhost/").unwrap_or(i);
+            keep.iter().any(|k| k == bare)
+        })
+        .collect();
+    for image in kept {
+        println!("kept image {image} (this podbay's base or relay)");
+    }
+
+    // Seccomp filters, written again when a session needs one.
+    let seccomp = ctx.paths.cache_dir.join("seccomp");
+    let filters = fs::read_dir(&seccomp)
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0);
+    if filters > 0 {
+        if !args.dry_run {
+            fs::remove_dir_all(&seccomp)
+                .with_context(|| format!("removing {}", seccomp.display()))?;
+        }
+        println!("{would} {filters} cached seccomp filters");
+    }
+
+    let volumes: Vec<String> = backend
+        .list_volumes()?
+        .into_iter()
+        .filter(|v| v.starts_with("podbay-"))
+        .collect();
+    if !volumes.is_empty() {
+        println!(
+            "\nkept {} volumes, which podbay never removes (they hold logins, history and \
+             installed tools):",
+            volumes.len()
+        );
+        for v in &volumes {
+            println!("  {v}");
+        }
+        println!("remove one you no longer need with `{program} volume rm NAME`");
+    }
+    if removed == 0 && filters == 0 && !args.dry_run {
+        println!("nothing to remove");
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// `podbay doctor`: the engine, this machine, config.toml and every
@@ -964,15 +1058,17 @@ fn describe(
         let source = match &layer.source {
             LayerSource::Bundled => "bundled base".to_owned(),
             LayerSource::Relay => "network relay".to_owned(),
+            LayerSource::Adapter { local: true, .. } => {
+                "podbay-init and the dev user added".to_owned()
+            }
             LayerSource::Adapter { image, .. } => {
                 let from = match &p.image {
                     Some((_, profile)) => format!("profile {profile}"),
                     None => "config.toml".to_owned(),
                 };
-                format!("{image} with podbay-init added, from {from}")
+                format!("{image} with podbay-init and the dev user added, from {from}")
             }
             LayerSource::Extension { profile, .. } => format!("extension from {profile}"),
-            LayerSource::Identity { uid, gid, .. } => format!("dev as {uid}:{gid}"),
         };
         out.push_str(&format!("  {}  ({source})\n", layer.tag));
     }

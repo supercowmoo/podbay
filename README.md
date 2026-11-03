@@ -242,14 +242,15 @@ podbay build                  # build any missing images ahead of time
 podbay build --force          # rebuild them all with current packages
 podbay provision .            # run the profiles' [provision] commands now
 podbay doctor                 # check this machine, config and profiles
+podbay clean                  # remove old images and leftover containers
 ```
 
 podbay's exit code is the command's (or the shell's) exit code.
 
 Files the container creates in your project are owned by you on the host. On
 rootless Podman, `dev` is mapped onto your user with `keep-id`. On rootful
-Docker, podbay builds one more small image layer that gives `dev` your uid
-and gid.
+Docker, `dev` gets your uid and gid in the users file podbay adds to every
+image (see [Images](#images)).
 
 ## Profiles
 
@@ -484,6 +485,13 @@ of the chosen image, so they need a shell in it, and provisioning commands
 need whatever tools they call (Alpine has `wget`, not `curl`). Using an
 image means trusting whoever publishes it. podbay doesn't follow a tag to a
 new version by itself: `podbay build --force` pulls the image again.
+
+Every change to an image, an extension or podbay itself leaves the old
+images behind. `podbay clean` removes them, except the bundled base and
+relay this podbay uses, along with relay containers left by a podbay that
+was killed and cached seccomp filters; whatever it removes is rebuilt when
+needed. `--dry-run` shows what it would do. It never removes volumes,
+which hold logins, history and installed tools; it lists them instead.
 
 ## What a session can do
 
@@ -780,7 +788,7 @@ The end-to-end tests run real containers on Docker (or the engine named by
 unless `PODBAY_TEST_REQUIRE_ENGINE` is set. CI runs them on Docker and on
 rootless Podman. They
 use a small stand-in for the base image (`tests/fixtures/test-base`) with the
-same podbay-init and a fake installer that records what provisioning saw, so
+same dev user and a fake installer that records what provisioning saw, so
 they don't need to build the full toolchain. Two of them play a hostile
 session: one checks that the session report catches it, the other that the
 network allowlist holds. Set `PODBAY_TEST_INTERNET=1` to also check that an

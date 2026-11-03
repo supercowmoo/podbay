@@ -58,7 +58,7 @@ pub struct Identity {
     /// The uid/gid the entrypoint gives `dev` before dropping root. Files
     /// `dev` creates in bind mounts must end up owned by the host user.
     /// 0 means the container's root already is the unprivileged host user
-    /// (rootless engines without keep-id), so the entrypoint stays root.
+    /// (rootless engines without keep-id), so podbay-init stays root.
     pub uid: u32,
     pub gid: u32,
     /// Things the user should know, such as running a rootful daemon.
@@ -86,6 +86,15 @@ pub trait Backend {
     fn default_command(&self, image: &str) -> Result<Vec<String>>;
     /// The file at `path` in `image`, or `None` if it has none there.
     fn read_file(&self, image: &str, path: &str) -> Result<Option<Vec<u8>>>;
+    /// Every image's `name:tag`.
+    fn list_images(&self) -> Result<Vec<String>>;
+    /// Removes an image; fails if a container uses it.
+    fn remove_image(&self, image: &str) -> Result<()>;
+    /// Containers whose names start with `prefix`, with whether each runs.
+    fn list_containers(&self, prefix: &str) -> Result<Vec<(String, bool)>>;
+    fn remove_container(&self, name: &str) -> Result<()>;
+    /// Every volume's name.
+    fn list_volumes(&self) -> Result<Vec<String>>;
     fn identity(&self) -> Result<Identity>;
     /// cgroup controllers the engine can use for this user, such as
     /// `memory` and `pids`. `None` when the engine can't say, in which case
@@ -112,6 +121,40 @@ impl Cli {
 
     fn command(&self) -> Command {
         Command::new(self.kind.program())
+    }
+
+    /// Runs the engine and returns its stdout's non-empty lines.
+    fn lines(&self, args: &[&str]) -> Result<Vec<String>> {
+        let out = self
+            .command()
+            .args(args)
+            .stderr(Stdio::inherit())
+            .output()
+            .with_context(|| format!("running `{} {}`", self.kind.program(), args[0]))?;
+        if !out.status.success() {
+            bail!("`{} {}` failed", self.kind.program(), args.join(" "));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Runs the engine with its output hidden; fails if it does.
+    fn quiet(&self, args: &[&str]) -> Result<()> {
+        let status = self
+            .command()
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("running `{} {}`", self.kind.program(), args[0]))?;
+        if !status.success() {
+            bail!("`{} {}` failed", self.kind.program(), args.join(" "));
+        }
+        Ok(())
     }
 
     fn docker_is_rootless(&self) -> Result<bool> {
@@ -234,6 +277,51 @@ impl Backend for Cli {
         }
     }
 
+    fn list_images(&self) -> Result<Vec<String>> {
+        Ok(self
+            .lines(&["images", "--format", "{{.Repository}}:{{.Tag}}"])?
+            .into_iter()
+            .filter(|l| !l.contains("<none>"))
+            .collect())
+    }
+
+    fn remove_image(&self, image: &str) -> Result<()> {
+        self.quiet(&["rmi", image])
+    }
+
+    fn list_containers(&self, prefix: &str) -> Result<Vec<(String, bool)>> {
+        let filter = format!("name={prefix}");
+        Ok(self
+            .lines(&[
+                "ps",
+                "--all",
+                "--filter",
+                &filter,
+                "--format",
+                "{{.Names}}\t{{.State}}",
+            ])?
+            .into_iter()
+            .filter_map(|line| {
+                let (name, state) = line.split_once('\t')?;
+                // The filter matches anywhere in the name; keep prefixes.
+                name.starts_with(prefix).then(|| {
+                    (
+                        name.to_owned(),
+                        state.trim().eq_ignore_ascii_case("running"),
+                    )
+                })
+            })
+            .collect())
+    }
+
+    fn remove_container(&self, name: &str) -> Result<()> {
+        self.quiet(&["rm", "--force", name])
+    }
+
+    fn list_volumes(&self) -> Result<Vec<String>> {
+        self.lines(&["volume", "ls", "--format", "{{.Name}}"])
+    }
+
     fn identity(&self) -> Result<Identity> {
         identity_for(self.kind, self.host_uid, self.host_gid, || {
             self.docker_is_rootless()
@@ -312,7 +400,7 @@ fn identity_for(
         // keep-id maps the host user onto the image's dev uid, so files dev
         // writes in bind mounts are owned by the host user and no remapping
         // is needed. The container still starts as (namespaced) root so the
-        // entrypoint can fix volume ownership before dropping privileges.
+        // podbay-init can fix volume ownership before dropping privileges.
         BackendKind::Podman => Identity {
             flags: vec![
                 format!("--userns=keep-id:uid={IMAGE_DEV_UID},gid={IMAGE_DEV_UID}"),

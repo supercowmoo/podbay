@@ -1,4 +1,5 @@
 mod backend;
+mod clean;
 mod cli;
 mod commands;
 mod config;
@@ -32,6 +33,7 @@ fn main() -> ExitCode {
         Command::Provision(args) => commands::provision(args),
         Command::Profile(cmd) => commands::profile(cmd).map(|()| ExitCode::SUCCESS),
         Command::Doctor(args) => commands::doctor(args),
+        Command::Clean(args) => commands::clean(args),
     };
     match result {
         Ok(code) => code,

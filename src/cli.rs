@@ -26,6 +26,13 @@ pub enum Command {
     Provision(ProvisionArgs),
     Profile(ProfileCommand),
     Doctor(DoctorArgs),
+    Clean(CleanArgs),
+}
+
+#[derive(Debug, Default)]
+pub struct CleanArgs {
+    pub backend: Option<BackendKind>,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +124,7 @@ Commands:
   provision  Run the profile's [provision] commands now, with network access. `run` does this by itself when what they depend on changed
   profile    Manage profiles
   doctor     Check that this machine can run sessions, and what to change if not
+  clean      Remove podbay's old images and leftover containers; volumes are kept
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -259,7 +267,65 @@ const PROFILE_SHOW: Usage = Usage {
     line: "podbay profile show <NAMES>...",
 };
 
-const COMMANDS: &[&str] = &["run", "build", "provision", "profile", "doctor", "help"];
+const COMMANDS: &[&str] = &[
+    "run",
+    "build",
+    "provision",
+    "profile",
+    "doctor",
+    "clean",
+    "help",
+];
+
+const CLEAN_HELP: &str = "\
+Remove podbay's old images and leftover containers; volumes are kept
+
+Removes relay containers whose podbay process is gone, podbay's images
+except the bundled base and relay this podbay uses (the rest are rebuilt
+when needed), and cached seccomp filters. Lists podbay's volumes, which it
+never removes: they hold logins, history and installed tools.
+
+Usage: podbay clean [OPTIONS]
+
+Options:
+      --backend <BACKEND>  Container engine [default: config `backend`, else podman if installed, else docker] [possible values: podman, docker]
+      --dry-run            Show what would be removed, and remove nothing
+  -h, --help               Print help
+";
+
+const CLEAN: Usage = Usage {
+    line: "podbay clean [OPTIONS]",
+};
+
+fn parse_clean(items: Vec<OsString>) -> Result<CleanArgs, Exit> {
+    let mut args = Args::new(items, CLEAN);
+    let mut engine = EngineArgs::default();
+    let mut out = CleanArgs::default();
+    loop {
+        let item = args.next()?;
+        if is_help(&item) {
+            return Err(Exit::Print(CLEAN_HELP.to_owned()));
+        }
+        match item {
+            Item::End => break,
+            Item::Long(ref name, _) if name == "backend" => {
+                engine_option(&mut args, &mut engine, &item)?;
+            }
+            Item::Long(name, value) if name == "dry-run" => {
+                out.dry_run = flag(&mut args, "--dry-run", &value)?;
+            }
+            Item::Long(name, _) => {
+                return Err(args.unknown_long(&name, &["backend", "dry-run", "help"]));
+            }
+            Item::Short(c, _) => return Err(args.unexpected(&format!("-{c}"))),
+            Item::Positional(p) => args.positionals.push(p),
+        }
+    }
+    args.positionals(0)?;
+    reject_rest(&args)?;
+    out.backend = engine.backend;
+    Ok(out)
+}
 
 const DOCTOR_HELP: &str = "\
 Check that this machine can run sessions, and what to change if not
@@ -782,6 +848,7 @@ fn help_for(prefix: &[String], named: &[OsString]) -> Exit {
         ["build"] => Exit::Print(build_help()),
         ["provision"] => Exit::Print(provision_help()),
         ["doctor"] => Exit::Print(DOCTOR_HELP.to_owned()),
+        ["clean"] => Exit::Print(CLEAN_HELP.to_owned()),
         ["profile"] => Exit::Print(PROFILE_HELP.to_owned()),
         ["profile", "init"] => Exit::Print(PROFILE_INIT_HELP.to_owned()),
         ["profile", "list"] => Exit::Print(PROFILE_LIST_HELP.to_owned()),
@@ -830,6 +897,7 @@ impl Cli {
             "provision" => Command::Provision(parse_provision(args)?),
             "profile" => Command::Profile(parse_profile(args)?),
             "doctor" => Command::Doctor(parse_doctor(args)?),
+            "clean" => Command::Clean(parse_clean(args)?),
             other if other.starts_with('-') => {
                 return Err(usage_error(
                     format!("unexpected argument '{other}' found"),
@@ -1037,6 +1105,19 @@ mod tests {
         assert!(usage(&["doctor", "-p", "x"]).contains("unexpected argument '-p'"));
         assert!(matches!(parse(&["doctor", "--help"]), Err(Exit::Print(_))));
         assert!(usage(&["docter"]).contains("a similar subcommand exists: 'doctor'"));
+    }
+
+    #[test]
+    fn clean() {
+        let Command::Clean(c) = parse(&["clean", "--dry-run", "--backend=docker"])
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(c.dry_run);
+        assert_eq!(c.backend, Some(BackendKind::Docker));
+        assert!(usage(&["clean", "--all"]).contains("unexpected argument '--all'"));
     }
 
     #[test]

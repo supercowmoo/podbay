@@ -16,7 +16,7 @@ use crate::profile::{ResolvedProfile, validate_container_path};
 pub const HOME: &str = "/home/dev";
 pub const WORKSPACE: &str = "/home/dev/workspace/repomount";
 
-/// What the entrypoint needs as root: set up the home directory, fix
+/// What podbay-init needs as root: set up the home directory, fix
 /// ownership of mount points, then drop to dev and shed its capabilities
 /// (SETPCAP, for the bounding set). The session itself gets none of these.
 pub const ENTRYPOINT_CAPS: &[&str] = &[
@@ -29,7 +29,7 @@ pub const ENTRYPOINT_CAPS: &[&str] = &[
 ];
 
 /// Writable scratch space on the otherwise read-only root filesystem. The
-/// home directory is seeded from the image by the entrypoint.
+/// home directory is seeded from the image by podbay-init.
 const TMPFS: &[(&str, &str)] = &[
     (HOME, "rw,exec,nosuid,nodev,mode=0755"),
     ("/tmp", "rw,exec,nosuid,nodev,mode=1777"),
@@ -169,7 +169,7 @@ impl RunPlan {
             }
         }
 
-        // Directories the entrypoint must make writable for dev: engines may
+        // Directories podbay-init must make writable for dev: engines may
         // create volume mount points (and their parents) as root.
         let writable: Vec<&str> = mounts
             .iter()
@@ -237,7 +237,7 @@ impl RunPlan {
             ("PODBAY_PROFILE".into(), inputs.profile.chain.join(",")),
         ];
         if !inputs.profile.path.is_empty() {
-            // The entrypoint and login shells put this in front of PATH, so
+            // podbay-init and login shells put this in front of PATH, so
             // the image's own PATH is kept whatever it is.
             env.push(("PODBAY_PATH".into(), inputs.profile.path.join(":")));
         }

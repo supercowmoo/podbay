@@ -3,7 +3,7 @@
 //! missing engine can't pass as a green run. Select the engine with
 //! PODBAY_TEST_BACKEND (default: docker).
 //!
-//! Uses a lightweight stand-in for the bundled base image (same podbay-init,
+//! Uses a lightweight stand-in for the bundled base image (same dev user,
 //! no toolchain) so the test needs no network beyond pulling Debian.
 
 use std::fs;
@@ -44,7 +44,6 @@ fn build_test_base(engine: &str) {
         ctx.path().join("Containerfile"),
     )
     .unwrap();
-    fs::copy(repo.join("init/src/main.rs"), ctx.path().join("init.rs")).unwrap();
     fs::copy(
         repo.join("tests/fixtures/test-base/probe-install"),
         ctx.path().join("probe-install"),
@@ -424,6 +423,44 @@ try rename-src 'mv src src2'
         "x\n"
     );
     assert!(project.join("target/debug/out").exists());
+}
+
+/// `clean` finds relay containers whose podbay is gone. Only a dry run:
+/// other tests use podbay's images at the same time.
+#[test]
+fn clean_finds_orphaned_relays() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+    // A relay left by a podbay that no longer runs: no process has this id.
+    let name = format!("podbay-relay-cleantest{}-4000000000", std::process::id());
+    let _gone = Cleanup {
+        engine: &engine,
+        kind: "container",
+        name: name.clone(),
+    };
+    let created = StdCommand::new(&engine)
+        .args(["create", "--name", &name, TEST_BASE, "true"])
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+
+    let dir = common::tempdir().unwrap();
+    let output = podbay(dir.path())
+        .args(["clean", "--backend", &engine, "--dry-run"])
+        .run_ok();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        out.contains(&format!(
+            "would remove container {name} (its podbay process is gone)"
+        )),
+        "{out}"
+    );
+    // A dry run removes nothing.
+    let still = StdCommand::new(&engine)
+        .args(["container", "inspect", &name])
+        .output()
+        .unwrap();
+    assert!(still.status.success());
 }
 
 #[test]

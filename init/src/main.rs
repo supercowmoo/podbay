@@ -292,12 +292,12 @@ fn check_dev(passwd: &str, uid: u32, gid: u32) -> io::Result<()> {
 }
 
 /// Copies what the image put in the home directory into the fresh tmpfs,
-/// owned by dev. Files the engine already placed there (bind-mounted
-/// dotfiles) are left alone.
+/// owned by dev, as `useradd` copies `/etc/skel`. Files the engine already
+/// placed there (bind-mounted dotfiles) are left alone.
 fn seed_home(skeleton: &Path, home: &Path, uid: u32, gid: u32) -> io::Result<()> {
     let context = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", home.display()));
     if skeleton.is_dir() {
-        copy_missing(skeleton, home)?;
+        copy_missing(skeleton, home, (uid, gid))?;
         // The home directory itself takes the skeleton's mode and times
         // (usually 0700), as `cp -a skeleton/. home` would give it.
         let meta = fs::metadata(skeleton).map_err(context)?;
@@ -314,10 +314,10 @@ fn seed_home(skeleton: &Path, home: &Path, uid: u32, gid: u32) -> io::Result<()>
     chown(home, Some(uid), Some(gid)).map_err(context)
 }
 
-/// Copies the tree under `from` into `to`, keeping modes, owners and
-/// modification times, and never replacing anything already in `to`.
+/// Copies the tree under `from` into `to`, keeping modes and modification
+/// times, owned by `owner`, and never replacing anything already in `to`.
 /// Symbolic links are copied as links, never followed.
-fn copy_missing(from: &Path, to: &Path) -> io::Result<()> {
+fn copy_missing(from: &Path, to: &Path, owner: (u32, u32)) -> io::Result<()> {
     let context = |path: &Path| {
         let path = path.to_owned();
         move |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", path.display()))
@@ -334,29 +334,30 @@ fn copy_missing(from: &Path, to: &Path) -> io::Result<()> {
                 Some(_) => continue,
                 None => fs::create_dir(&dst).map_err(context(&dst))?,
             }
-            copy_missing(&src, &dst)?;
+            copy_missing(&src, &dst, owner)?;
             if existing.is_none() {
-                finish(&dst, &meta).map_err(context(&dst))?;
+                finish(&dst, &meta, owner).map_err(context(&dst))?;
             }
         } else if existing.is_some() {
             continue;
         } else if ft.is_symlink() {
             symlink(fs::read_link(&src)?, &dst).map_err(context(&dst))?;
-            lchown(&dst, Some(meta.uid()), Some(meta.gid())).map_err(context(&dst))?;
+            lchown(&dst, Some(owner.0), Some(owner.1)).map_err(context(&dst))?;
         } else if ft.is_file() {
             fs::copy(&src, &dst).map_err(context(&dst))?;
-            finish(&dst, &meta).map_err(context(&dst))?;
+            finish(&dst, &meta, owner).map_err(context(&dst))?;
         }
         // Sockets, fifos and devices have no place in a home skeleton.
     }
     Ok(())
 }
 
-/// Gives a copied file or directory the source's owner, mode and times.
-fn finish(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
-    lchown(path, Some(meta.uid()), Some(meta.gid()))?;
-    // After chown, which clears setuid and setgid bits.
-    fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+/// Gives a copied file or directory `owner`, and the source's mode and
+/// times. Setuid, setgid and sticky bits are dropped: nothing in a home
+/// directory needs them.
+fn finish(path: &Path, meta: &fs::Metadata, owner: (u32, u32)) -> io::Result<()> {
+    lchown(path, Some(owner.0), Some(owner.1))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() & 0o777))?;
     let times = FileTimes::new()
         .set_accessed(meta.accessed()?)
         .set_modified(meta.modified()?);
@@ -607,6 +608,35 @@ mod tests {
         );
         // Seeding again changes nothing.
         seed_home(&skel, &home, me.uid(), me.gid()).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Copies belong to the session's user, whoever owned the skeleton, and
+    /// lose setuid bits. Needs root to give files away; skipped otherwise.
+    #[test]
+    fn seeded_home_belongs_to_the_user() {
+        // SAFETY: no arguments.
+        if unsafe { sys::geteuid() } != 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("podbay-init-own-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (skel, home) = (dir.join("skel"), dir.join("home"));
+        fs::create_dir_all(skel.join(".config")).unwrap();
+        fs::write(skel.join(".config/x"), "").unwrap();
+        fs::set_permissions(skel.join(".config/x"), fs::Permissions::from_mode(0o4755)).unwrap();
+        symlink("x", skel.join(".config/link")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        seed_home(&skel, &home, 4242, 4343).unwrap();
+        for path in [".config", ".config/x", ".config/link"] {
+            let meta = fs::symlink_metadata(home.join(path)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (4242, 4343), "{path}");
+        }
+        let mode = fs::metadata(home.join(".config/x"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
         let _ = fs::remove_dir_all(&dir);
     }
 

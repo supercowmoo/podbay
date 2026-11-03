@@ -80,18 +80,14 @@ pub enum LayerSource {
         image: String,
         uid: u32,
         gid: u32,
+        /// Built by podbay just below it (the bundled base), so it's never
+        /// pulled.
+        local: bool,
     },
     Extension {
         parent: String,
         profile: String,
         script: Vec<u8>,
-    },
-    /// Renumbers `dev`, which the read-only root filesystem rules out at run
-    /// time.
-    Identity {
-        parent: String,
-        uid: u32,
-        gid: u32,
     },
 }
 
@@ -108,37 +104,43 @@ pub fn layers(
     uid: u32,
     gid: u32,
 ) -> Result<Vec<Layer>> {
-    let mut stack = vec![match base {
+    let mut stack = Vec::new();
+    let (image, local) = match base {
         BaseImage::Bundled => {
-            let hash = sha256_hex_fields(&[BASE_CONTAINERFILE.as_bytes(), INIT_SOURCE.as_bytes()]);
-            Layer {
-                tag: format!("podbay-base:{}", &hash[..16]),
+            let tag = bundled_base_tag();
+            stack.push(Layer {
+                tag: tag.clone(),
                 source: LayerSource::Bundled,
-            }
+            });
+            (tag, true)
         }
         BaseImage::Custom(image) => {
             validate_image_name(image)?;
-            // Staying root still needs a dev user for HOME and the like.
-            let (uid, gid) = match uid {
-                0 => (IMAGE_DEV_UID, IMAGE_DEV_UID),
-                _ => (uid, gid),
-            };
-            let hash = sha256_hex_fields(&[
-                adapter_containerfile(image, &[]).as_bytes(),
-                INIT_SOURCE.as_bytes(),
-                PATH_SNIPPET.as_bytes(),
-                format!("{uid}:{gid}").as_bytes(),
-            ]);
-            Layer {
-                tag: format!("podbay-image:{}", &hash[..16]),
-                source: LayerSource::Adapter {
-                    image: image.clone(),
-                    uid,
-                    gid,
-                },
-            }
+            (image.clone(), false)
         }
-    }];
+    };
+    // Every image, the bundled one too, gets podbay-init and a dev user
+    // with the session's ids the same way. Staying root still needs a dev
+    // user for HOME and the like.
+    let (uid, gid) = match uid {
+        0 => (IMAGE_DEV_UID, IMAGE_DEV_UID),
+        _ => (uid, gid),
+    };
+    let hash = sha256_hex_fields(&[
+        adapter_containerfile(&image, &[]).as_bytes(),
+        INIT_SOURCE.as_bytes(),
+        PATH_SNIPPET.as_bytes(),
+        format!("{uid}:{gid}").as_bytes(),
+    ]);
+    stack.push(Layer {
+        tag: format!("podbay-image:{}", &hash[..16]),
+        source: LayerSource::Adapter {
+            image,
+            uid,
+            gid,
+            local,
+        },
+    });
 
     for ext in extensions {
         let script = fs::read(&ext.script)
@@ -164,21 +166,10 @@ pub fn layers(
     Ok(stack)
 }
 
-/// Adds the layer that gives `dev` the ids `uid:gid`, when the session runs
-/// as someone other than the image's dev user (rootful Docker). 0 means the
-/// session stays root and needs no layer.
-pub fn add_identity(stack: &mut Vec<Layer>, uid: u32, gid: u32) {
-    let adapted = matches!(stack[0].source, LayerSource::Adapter { .. });
-    if uid == 0 || (uid, gid) == (IMAGE_DEV_UID, IMAGE_DEV_UID) || adapted {
-        return;
-    }
-    let parent = stack.last().expect("stack starts non-empty").tag.clone();
-    let containerfile = identity_containerfile(&parent, uid, gid);
-    let hash = sha256_hex_fields(&[containerfile.as_bytes()]);
-    stack.push(Layer {
-        tag: format!("podbay-uid{uid}:{}", &hash[..16]),
-        source: LayerSource::Identity { parent, uid, gid },
-    });
+/// The bundled base's tag for this podbay.
+pub fn bundled_base_tag() -> String {
+    let hash = sha256_hex_fields(&[BASE_CONTAINERFILE.as_bytes()]);
+    format!("podbay-base:{}", &hash[..16])
 }
 
 /// The relay image that sessions with an allowlist or forwarded ports share
@@ -249,14 +240,17 @@ fn build(backend: &dyn Backend, layer: &Layer, force: bool) -> Result<()> {
             )?;
             fs::write(ctx.path().join("extension.sh"), script)?;
         }
-        LayerSource::Identity { parent, uid, gid } => {
-            fs::write(
-                ctx.path().join("Containerfile"),
-                identity_containerfile(parent, *uid, *gid),
-            )?;
-        }
-        LayerSource::Adapter { image, uid, gid } => {
-            if !backend.image_exists(image)? {
+        LayerSource::Adapter {
+            image,
+            uid,
+            gid,
+            local,
+        } => {
+            if *local {
+                if !backend.image_exists(image)? {
+                    bail!("{image} should have been built first");
+                }
+            } else if !backend.image_exists(image)? {
                 backend.pull_image(image)?;
             } else if force && backend.pull_image(image).is_err() {
                 eprintln!("podbay: note: couldn't pull {image}; using the local copy");
@@ -370,21 +364,6 @@ fn with_dev_group(group: Option<&str>, gid: u32) -> String {
     lines.join("\n") + "\n"
 }
 
-fn identity_containerfile(parent: &str, uid: u32, gid: u32) -> String {
-    format!(
-        "FROM {parent}\n\
-         USER root\n\
-         RUN old_uid=$(id -u dev) && old_gid=$(id -g dev) \\\n  \
-         && sed -i \"s/^dev:x:$old_uid:$old_gid:/dev:x:{uid}:{gid}:/\" /etc/passwd \\\n  \
-         && sed -i \"s/^dev:x:$old_gid:/dev:x:{gid}:/\" /etc/group \\\n  \
-         && for dir in /home/dev {HOME_SKELETON}; do \\\n    \
-         if [ -d \"$dir\" ]; then \\\n      \
-         find \"$dir\" \\( -uid \"$old_uid\" -o -gid \"$old_gid\" \\) -exec chown -h {uid}:{gid} {{}} +; \\\n    \
-         fi; \\\n  \
-         done\n"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -433,6 +412,21 @@ mod tests {
         fn cgroup_controllers(&self) -> Result<Option<Vec<String>>> {
             unreachable!()
         }
+        fn list_images(&self) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        fn remove_image(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn list_containers(&self, _: &str) -> Result<Vec<(String, bool)>> {
+            unreachable!()
+        }
+        fn remove_container(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        fn list_volumes(&self) -> Result<Vec<String>> {
+            unreachable!()
+        }
     }
 
     fn ext(dir: &Path, profile: &str, body: &str) -> Extension {
@@ -457,43 +451,57 @@ mod tests {
             IMAGE_DEV_UID,
         )
         .unwrap();
-        assert_eq!(stack.len(), 3);
+        assert_eq!(stack.len(), 4);
         assert!(stack[0].tag.starts_with("podbay-base:"));
-        assert!(stack[1].tag.starts_with("podbay-a:"));
-        assert!(stack[2].tag.starts_with("podbay-b:"));
+        assert!(stack[1].tag.starts_with("podbay-image:"));
+        assert!(stack[2].tag.starts_with("podbay-a:"));
+        assert!(stack[3].tag.starts_with("podbay-b:"));
 
         // Changing a lower layer changes every tag above it.
         fs::write(&a.script, "#!/bin/sh\necho changed\n").unwrap();
         let changed = layers(&BaseImage::Bundled, &[a, b], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
-        assert_eq!(stack[0].tag, changed[0].tag);
-        assert_ne!(stack[1].tag, changed[1].tag);
+        assert_eq!(stack[1].tag, changed[1].tag);
         assert_ne!(stack[2].tag, changed[2].tag);
+        assert_ne!(stack[3].tag, changed[3].tag);
     }
 
     #[test]
-    fn identity_layer_only_when_ids_differ() {
-        let mut stack = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
-        add_identity(&mut stack, 0, 0);
-        add_identity(&mut stack, IMAGE_DEV_UID, IMAGE_DEV_UID);
-        assert_eq!(stack.len(), 1);
-
-        add_identity(&mut stack, 1234, 5678);
+    fn the_bundled_base_is_adapted_like_any_image() {
+        let stack = layers(&BaseImage::Bundled, &[], 1234, 5678).unwrap();
         assert_eq!(stack.len(), 2);
+        assert_eq!(
+            stack[1].source,
+            LayerSource::Adapter {
+                image: stack[0].tag.clone(),
+                uid: 1234,
+                gid: 5678,
+                local: true,
+            }
+        );
+        // Different ids, different adapter; the base stays the same.
+        let other = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
+        assert_eq!(other[0].tag, stack[0].tag);
+        assert_ne!(other[1].tag, stack[1].tag);
+        // The base no longer carries podbay-init itself: the adapter adds it.
+        assert!(!BASE_CONTAINERFILE.contains("COPY --from=init"));
+        assert!(!BASE_CONTAINERFILE.contains("ENTRYPOINT"));
+    }
+
+    #[test]
+    fn a_local_base_is_never_pulled() {
+        let stack = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
+        let backend = FakeBackend::default();
+        ensure(&backend, &stack, true, false).unwrap();
+        assert!(backend.pulled.borrow().is_empty());
+        let built = backend.built.borrow();
         assert!(
-            stack[1].tag.starts_with("podbay-uid1234:"),
+            built[1].1.contains(&format!("FROM {}\n", stack[0].tag)),
             "{}",
-            stack[1].tag
+            built[1].1
         );
-        let LayerSource::Identity { parent, .. } = &stack[1].source else {
-            panic!("{:?}", stack[1].source)
-        };
-        let file = identity_containerfile(parent, 1234, 5678);
-        assert!(
-            file.starts_with(&format!("FROM {}\n", stack[0].tag)),
-            "{file}"
-        );
-        assert!(file.contains("dev:x:1234:5678:"), "{file}");
-        assert!(file.contains("-exec chown -h 1234:5678 {} +"), "{file}");
+        // Without the base there's nothing to adapt.
+        let backend = FakeBackend::default();
+        assert!(ensure(&backend, &stack[1..], false, false).is_err());
     }
 
     #[test]
@@ -512,14 +520,23 @@ mod tests {
 
         let backend = FakeBackend::default();
         backend.images.borrow_mut().insert(stack[0].tag.clone());
-        backend.images.borrow_mut().insert(stack[2].tag.clone());
+        backend.images.borrow_mut().insert(stack[1].tag.clone());
+        backend.images.borrow_mut().insert(stack[3].tag.clone());
 
         let actions = ensure(&backend, &stack, false, false).unwrap();
-        assert_eq!(actions, [Action::Present, Action::Build, Action::Build]);
+        assert_eq!(
+            actions,
+            [
+                Action::Present,
+                Action::Present,
+                Action::Build,
+                Action::Build
+            ]
+        );
         let built = backend.built.borrow();
         assert_eq!(built.len(), 2);
-        assert!(built[0].1.starts_with(&format!("FROM {}\n", stack[0].tag)));
-        assert!(built[1].1.starts_with(&format!("FROM {}\n", stack[1].tag)));
+        assert!(built[0].1.starts_with(&format!("FROM {}\n", stack[1].tag)));
+        assert!(built[1].1.starts_with(&format!("FROM {}\n", stack[2].tag)));
         assert!(built.iter().all(|b| b.2 == Refresh::default()));
     }
 
@@ -534,20 +551,22 @@ mod tests {
         }
 
         let actions = ensure(&backend, &stack, true, false).unwrap();
-        assert_eq!(actions, [Action::Build, Action::Build]);
+        assert_eq!(actions, [Action::Build, Action::Build, Action::Build]);
         let built = backend.built.borrow();
         let full = Refresh {
             no_cache: true,
             pull: true,
         };
         assert_eq!(built[0].2, full);
-        assert_eq!(
-            built[1].2,
-            Refresh {
-                pull: false,
-                ..full
-            }
-        );
+        for layer in &built[1..] {
+            assert_eq!(
+                layer.2,
+                Refresh {
+                    pull: false,
+                    ..full
+                }
+            );
+        }
     }
 
     #[test]
@@ -565,16 +584,8 @@ mod tests {
         let stack = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
         let backend = FakeBackend::default();
         let actions = ensure(&backend, &stack, false, true).unwrap();
-        assert_eq!(actions, [Action::Build]);
+        assert_eq!(actions, [Action::Build, Action::Build]);
         assert!(backend.built.borrow().is_empty());
-    }
-
-    #[test]
-    fn base_containerfile_builds_init_the_same_way() {
-        assert!(
-            BASE_CONTAINERFILE.contains(INIT_STAGE),
-            "{BASE_CONTAINERFILE}"
-        );
     }
 
     #[test]
@@ -606,13 +617,10 @@ mod tests {
             LayerSource::Adapter {
                 image: "alpine:3.22".into(),
                 uid: 1500,
-                gid: 1600
+                gid: 1600,
+                local: false,
             }
         );
-        // The adapter already has the right ids, so no identity layer.
-        let mut with_identity = stack.clone();
-        add_identity(&mut with_identity, 1500, 1600);
-        assert_eq!(with_identity, stack);
         // Staying root still gets a dev user, at the image default.
         let root = layers(&BaseImage::Custom("alpine:3.22".into()), &[], 0, 0).unwrap();
         assert!(matches!(
