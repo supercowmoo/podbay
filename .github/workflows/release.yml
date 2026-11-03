@@ -1,0 +1,64 @@
+# Pushing a tag such as v0.2.0 builds podbay for Linux on x86_64 and arm64
+# and publishes them as a GitHub release, with checksums and signed build
+# provenance.
+#
+# The binaries are static (musl), built with --locked from the pinned
+# toolchain, both on one runner: Rust's own linker cross-links arm64, so no
+# cross toolchain is installed. Actions are pinned to commits, as in CI.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write     # create the release
+      id-token: write     # sign the provenance
+      attestations: write # publish it
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup show active-toolchain || rustup toolchain install
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: The tag matches Cargo.toml's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "tag $GITHUB_REF_NAME doesn't match version $version in Cargo.toml" >&2
+            exit 1
+          }
+
+      - name: Test
+        run: cargo test --locked --workspace --bins --test cli --test dependencies
+
+      - name: Build
+        run: |
+          mkdir dist
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cargo build --locked --release --target "$target" -p podbay
+            cp "target/$target/release/podbay" "dist/podbay-$GITHUB_REF_NAME-$target"
+          done
+          cd dist && sha256sum podbay-* > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/podbay-*
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "podbay $GITHUB_REF_NAME" \
+            --notes "Static Linux binaries. Check them before use; see Install in README.md."

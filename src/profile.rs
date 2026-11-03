@@ -70,6 +70,10 @@ struct ProfileFile {
     /// Variables the session takes from podbay's own environment, such as
     /// API keys. Never given to provisioning.
     env_from_host: Vec<String>,
+    /// Whether the project's git hooks and config are read-only in the
+    /// session; unset leaves it to profiles below, and podbay's default
+    /// is yes.
+    protect_git: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -128,6 +132,7 @@ impl ProfileFile {
             "ports",
             "image",
             "env_from_host",
+            "protect_git",
         ])?;
         let mounts = t
             .tables("mount")?
@@ -215,6 +220,7 @@ impl ProfileFile {
             ports,
             image: t.string("image")?,
             env_from_host: t.strings("env_from_host")?,
+            protect_git: t.bool("protect_git")?,
         })
     }
 }
@@ -292,6 +298,9 @@ pub struct ResolvedProfile {
     /// Variables passed from the host's environment to the session only,
     /// each with the profile that asked for it.
     pub env_from_host: Vec<(String, String)>,
+    /// `protect_git` as the last profile that set it chose, and that
+    /// profile; unset means protected.
+    pub protect_git: Option<(bool, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
     /// Settings one profile replaced from another it doesn't extend, as
@@ -640,6 +649,14 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, ctx: &mut Resolution) 
     }
     if profile.shell.is_some() {
         ctx.shell_from = Some(name.to_owned());
+    }
+    if let Some(protect) = profile.protect_git {
+        if let Some((current, from)) = ctx.out.protect_git.clone()
+            && current != protect
+        {
+            ctx.replaced(name, &from, "protect_git".into());
+        }
+        ctx.out.protect_git = Some((protect, name.to_owned()));
     }
     if let Some(image) = &profile.image {
         crate::image::validate_image_name(image)?;

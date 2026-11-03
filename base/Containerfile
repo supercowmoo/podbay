@@ -7,7 +7,18 @@ RUN rustc --edition 2024 -C opt-level=s -C panic=abort \
 
 FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 
-RUN apt-get update \
+# Packages come from the Debian archive as it was when the image above was
+# built (its snapshot date, recorded in the image's own sources), so every
+# build installs the same versions. apt still checks Debian's signatures;
+# only the expiry date on the snapshot's index is ignored, since snapshots
+# are old by design.
+ARG DEBIAN_SNAPSHOT=20261027T000000Z
+RUN sed -i \
+    -e "s|^URIs: http://deb.debian.org/debian-security\$|URIs: http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}|" \
+    -e "s|^URIs: http://deb.debian.org/debian\$|URIs: http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}|" \
+    /etc/apt/sources.list.d/debian.sources \
+  && test "$(grep -c '^URIs: http://snapshot.debian.org/' /etc/apt/sources.list.d/debian.sources)" = 2 \
+  && apt-get -o Acquire::Check-Valid-Until=false update \
   && apt-get install -y --no-install-recommends \
     ca-certificates git curl unzip xz-utils tar build-essential \
   && rm -rf /var/lib/apt/lists/*

@@ -26,6 +26,10 @@ pub struct Config {
     pub network: Option<NetworkSetting>,
     /// Resource limits for every session; profiles can override them.
     pub limits: Limits,
+    /// Profiles for projects under a directory, used when `--profile` is
+    /// not given: `"~/src/app" = ["rust", "dsh"]`. Paths as written,
+    /// absolute or starting with `~`.
+    pub projects: Vec<(String, Vec<String>)>,
 }
 
 /// A `network` setting from config.toml or a profile: `"none"`, `"full"`,
@@ -191,6 +195,7 @@ impl Config {
             "base_image",
             "network",
             "limits",
+            "projects",
         ])?;
         let backend = match t.get("backend") {
             None => None,
@@ -202,13 +207,30 @@ impl Config {
             })?),
         };
         // One name or a list of names.
-        let default_profile = match t.get("default_profile") {
-            None => Vec::new(),
-            Some(v) if v.as_str().is_some() => vec![v.string()?],
-            Some(v) => v
-                .strings()
-                .map_err(|_| v.error("expected a profile name or a list of names"))?,
+        let names = |v: Value| -> settings::Result<Vec<String>> {
+            match v.as_str() {
+                Some(name) => Ok(vec![name.to_owned()]),
+                None => v
+                    .strings()
+                    .map_err(|_| v.error("expected a profile name or a list of names")),
+            }
         };
+        let default_profile = t
+            .get("default_profile")
+            .map(names)
+            .transpose()?
+            .unwrap_or_default();
+        let mut projects = Vec::new();
+        if let Some(table) = t.table("projects")? {
+            for (dir, value) in table.entries() {
+                if !(dir.starts_with('/') || dir == "~" || dir.starts_with("~/")) {
+                    return Err(value.error(&format!(
+                        "project directory {dir:?} must be absolute or start with ~"
+                    )));
+                }
+                projects.push((dir, names(value)?));
+            }
+        }
         Ok(Self {
             backend,
             default_profile,
@@ -219,7 +241,28 @@ impl Config {
                 .map(Limits::read)
                 .transpose()?
                 .unwrap_or_default(),
+            projects,
         })
+    }
+
+    /// The `[projects]` entry for `project` (canonical), with the directory
+    /// it was listed under: the deepest listed directory containing it.
+    pub fn project_profiles(
+        &self,
+        paths: &crate::paths::Paths,
+        project: &Path,
+    ) -> Option<(&str, &[String])> {
+        self.projects
+            .iter()
+            .filter_map(|(dir, names)| {
+                let listed = paths.expand_tilde(dir);
+                let listed = std::fs::canonicalize(&listed).unwrap_or(listed);
+                project
+                    .starts_with(&listed)
+                    .then(|| (listed.components().count(), dir.as_str(), names.as_slice()))
+            })
+            .max_by_key(|(depth, _, _)| *depth)
+            .map(|(_, dir, names)| (dir, names))
     }
 
     /// Loads `path`, or returns the defaults if it does not exist.
@@ -326,6 +369,48 @@ mod tests {
             let l = Limits::read(doc.root()).unwrap();
             assert!(l.validate().is_err(), "{bad} accepted");
         }
+    }
+
+    #[test]
+    fn projects_choose_profiles_by_directory() {
+        let dir = crate::tempdir::tempdir().unwrap();
+        let paths = crate::paths::test_paths(dir.path());
+        let home = paths.home.clone();
+        for sub in ["src/app/sub", "src/other", "work"] {
+            fs::create_dir_all(home.join(sub)).unwrap();
+        }
+        let cfg = Config::parse(&format!(
+            "[projects]\n\"~/src\" = \"base\"\n\"~/src/app\" = [\"rust\", \"dsh\"]\n\
+             \"{}\" = \"python\"\n",
+            home.join("work").display()
+        ))
+        .unwrap();
+        let pick = |rel: &str| {
+            let project = fs::canonicalize(home.join(rel)).unwrap();
+            cfg.project_profiles(&paths, &project)
+                .map(|(dir, names)| (dir.to_owned(), names.to_vec()))
+        };
+        // The deepest listed directory wins, and lists and single names work.
+        assert_eq!(
+            pick("src/app/sub"),
+            Some(("~/src/app".into(), vec!["rust".into(), "dsh".into()]))
+        );
+        assert_eq!(
+            pick("src/other"),
+            Some(("~/src".into(), vec!["base".into()]))
+        );
+        assert_eq!(pick("work").unwrap().1, ["python"]);
+        assert_eq!(pick(""), None);
+        // A longer name isn't inside: ~/src/app doesn't contain ~/src/application.
+        fs::create_dir_all(home.join("src/application")).unwrap();
+        assert_eq!(pick("src/application").unwrap().0, "~/src");
+
+        let err = Config::parse("[projects]\n\"src/x\" = \"a\"\n").unwrap_err();
+        assert!(
+            err.to_string().contains("must be absolute or start with ~"),
+            "{err}"
+        );
+        assert!(Config::parse("[projects]\n\"/x\" = 3\n").is_err());
     }
 
     #[test]

@@ -43,6 +43,13 @@
 #
 # ports = [3080]
 
+# The project's git hooks and config are read-only in sessions, so nothing
+# can plant a hook or setting that your host's git would run. false allows
+# writing them (podbay says so on every run); git config writes, such as
+# `git remote add`, need that.
+#
+# protect_git = true
+
 # Capabilities the session keeps. None by default; each one weakens the
 # boundary, and podbay prints them on every run.
 #

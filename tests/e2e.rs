@@ -239,10 +239,18 @@ fn session_report_flags_git_changes() {
     fs::create_dir_all(project.join(".git/hooks")).unwrap();
     fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::write(project.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
-    fs::create_dir_all(root.join("config")).unwrap();
+    fs::create_dir_all(root.join("config/profiles")).unwrap();
     fs::write(
         root.join("config/config.toml"),
         format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    // The report is the second line of defence; turn off the first (the
+    // read-only hooks and config) to see it work on its own.
+    let id = format!("e2eunprotected{}", std::process::id());
+    fs::write(
+        root.join(format!("config/profiles/{id}.toml")),
+        "protect_git = false\n",
     )
     .unwrap();
 
@@ -257,13 +265,14 @@ printf '[core]\n\tpager = pwned\n' > vendor/lib/.git/config
 exit 7
 "#;
     let output = podbay(root)
-        .args(["run", "--backend", &engine, "--local-cache"])
+        .args(["run", "--backend", &engine, "--local-cache", "-p", &id])
         .arg(&project)
         .args(["--", "sh", "-c", script])
         .run_code(7);
     let err = String::from_utf8_lossy(&output.stderr);
 
     for expected in [
+        "the session can change git hooks and config (protect_git = false",
         "session report: 3 warnings",
         ".git/hooks/post-checkout: added, an executable file",
         "+ core.fsmonitor = sh -c pwned   [can run commands]",
@@ -274,6 +283,74 @@ exit 7
             "missing {expected:?}\nstderr:\n{err}"
         );
     }
+}
+
+/// By default a session can't touch git hooks or config, or move or remove
+/// the git directories holding them, but can still write everything else
+/// git needs.
+#[test]
+fn git_hooks_and_config_are_read_only() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = common::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git/objects")).unwrap();
+    fs::create_dir_all(project.join(".git/modules/lib/hooks")).unwrap();
+    fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(project.join(".git/config"), "[core]\n\tbare = false\n").unwrap();
+    fs::write(project.join(".git/modules/lib/config"), "[core]\n").unwrap();
+    // No .git/hooks yet: podbay creates it, so the session can't.
+    fs::create_dir_all(root.join("config")).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+
+    let script = r##"
+try() { if sh -c "$2" 2>/dev/null; then echo "$1=allowed"; else echo "$1=refused"; fi; }
+try objects 'touch .git/objects/probe'
+try head 'echo "ref: refs/heads/other" > .git/HEAD'
+try hook 'printf "#!/bin/sh\n" > .git/hooks/post-checkout'
+try config 'echo "[core] fsmonitor = x" >> .git/config'
+try submodule-hook 'touch .git/modules/lib/hooks/pre-commit'
+try submodule-config 'echo x >> .git/modules/lib/config'
+try rename-git 'mv .git .git-old'
+try rename-modules 'mv .git/modules .git/modules-old'
+try remove-hooks 'rmdir .git/hooks'
+# Last: it deletes what isn't protected (objects, refs), not what is.
+try remove-git 'rm -rf .git'
+"##;
+    let output = podbay(root)
+        .args(["run", "--backend", &engine])
+        .arg(&project)
+        .args(["--", "sh", "-c", script])
+        .run_ok();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "hook=refused",
+        "config=refused",
+        "submodule-hook=refused",
+        "submodule-config=refused",
+        "rename-git=refused",
+        "rename-modules=refused",
+        "remove-git=refused",
+        "remove-hooks=refused",
+        "objects=allowed",
+        "head=allowed",
+    ] {
+        assert!(out.contains(expected), "missing {expected}\n{out}\n{err}");
+    }
+    assert!(err.contains("git hooks and config are read-only"), "{err}");
+    assert!(project.join(".git/hooks").is_dir());
+    assert!(!project.join(".git/hooks/post-checkout").exists());
+    assert_eq!(
+        fs::read_to_string(project.join(".git/config")).unwrap(),
+        "[core]\n\tbare = false\n"
+    );
 }
 
 #[test]
@@ -706,6 +783,62 @@ fn env_from_host_reaches_the_session_only() {
     let shown = String::from_utf8_lossy(&output.stdout);
     assert!(shown.contains("--env=E2E_SECRET "), "{shown}");
     assert!(!shown.contains("s3cret"), "{shown}");
+}
+
+/// `[projects]` in config.toml picks the profiles for a project's
+/// directory when -p isn't given, and -p still overrides it.
+#[test]
+fn projects_pick_profiles_by_directory() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = common::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("src/app");
+    let profiles = root.join("config/profiles");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&profiles).unwrap();
+    let id = std::process::id();
+    let (listed, other) = (format!("e2elisted{id}"), format!("e2eother{id}"));
+    fs::write(
+        profiles.join(format!("{listed}.toml")),
+        "[env]\nPICKED = \"listed\"\n",
+    )
+    .unwrap();
+    fs::write(
+        profiles.join(format!("{other}.toml")),
+        "[env]\nPICKED = \"other\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!(
+            "base_image = {TEST_BASE:?}\n[projects]\n{:?} = [{listed:?}]\n",
+            root.join("src").display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let run = |extra: &[&str]| {
+        let output = podbay(root)
+            .args(["run", "--backend", &engine])
+            .args(extra)
+            .arg(&project)
+            .args(["--", "sh", "-c", "echo picked=$PICKED"])
+            .run_ok();
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (out, err) = run(&[]);
+    assert!(out.contains("picked=listed"), "{out}\n{err}");
+    assert!(
+        err.contains(&format!("profiles {listed} for projects in")),
+        "{err}"
+    );
+    let (out, _) = run(&["-p", &other]);
+    assert!(out.contains("picked=other"), "{out}");
 }
 
 /// Profiles given together are stacked: each one's environment, volumes

@@ -5,6 +5,7 @@ mod config;
 mod egress;
 mod forward;
 mod gitconfig;
+mod gitguard;
 mod hash;
 mod image;
 mod json;

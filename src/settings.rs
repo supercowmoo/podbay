@@ -292,6 +292,22 @@ impl<'a, 'i> Table<'a, 'i> {
             .collect()
     }
 
+    /// Every key with its value, in file order.
+    pub fn entries(&self) -> Vec<(String, Value<'a, 'i>)> {
+        self.table
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.get_ref().to_string(),
+                    Value {
+                        text: self.text,
+                        value: v,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// A table of strings, such as `[env]`; absent is empty.
     pub fn string_map(&self, key: &str) -> Result<BTreeMap<String, String>> {
         let Some(table) = self.table(key)? else {

@@ -106,6 +106,17 @@ pub struct Inputs<'a> {
     pub network: Net,
     /// podbay's seccomp filter, or `None` for the engine's default.
     pub seccomp: Option<PathBuf>,
+    /// Mounts inside the project, over it, such as `.git/hooks`
+    /// read-only.
+    pub protected: &'a [InnerMount],
+}
+
+/// A bind mount of a path inside the project, over the project mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InnerMount {
+    pub source: PathBuf,
+    pub target: String,
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +177,37 @@ impl RunPlan {
             .map(Mount::target)
             .collect();
 
+        // Read-only mounts inside the project. They exist on the host
+        // already, so nothing needs creating or chowning for them, and
+        // they're left out of PODBAY_MOUNT_PATHS: podbay-init never touches
+        // the ownership of anything in a project's .git.
+        let protected: Vec<Mount> = inputs
+            .protected
+            .iter()
+            .map(|m| Mount::Bind {
+                source: m.source.clone(),
+                target: m.target.clone(),
+                readonly: m.readonly,
+            })
+            .collect();
+        for m in &protected {
+            validate_container_path(m.target())?;
+            if let Mount::Bind { source, .. } = m
+                && source.to_string_lossy().contains([',', '\n'])
+            {
+                bail!(
+                    "host path {} must not contain ',' or newlines",
+                    source.display()
+                );
+            }
+            if !m.target().starts_with(&format!("{WORKSPACE}/")) {
+                bail!("{} is not inside the project", m.target());
+            }
+            if mounts.iter().any(|other| other.target() == m.target()) {
+                bail!("{} is mounted more than once", m.target());
+            }
+        }
+
         let mut env = vec![
             ("PODBAY_UID".into(), inputs.identity.uid.to_string()),
             ("PODBAY_GID".into(), inputs.identity.gid.to_string()),
@@ -213,6 +255,8 @@ impl RunPlan {
             // Node's built-in fetch ignores the variables above without it.
             env.push(("NODE_USE_ENV_PROXY".into(), "1".into()));
         }
+
+        mounts.extend(protected);
 
         let mut flags = vec!["--rm".into(), "--interactive".into()];
         if inputs.tty {
@@ -469,6 +513,7 @@ mod tests {
             limits: &NO_LIMITS,
             network: Net::None,
             seccomp: None,
+            protected: &[],
         }
     }
 
@@ -669,6 +714,72 @@ mod tests {
             );
         }
         assert!(!args.contains(&"--network=none".to_owned()));
+    }
+
+    #[test]
+    fn protected_paths_are_read_only_and_left_alone() {
+        let profile = ResolvedProfile::default();
+        let id = identity();
+        let inner = |source: &str, target: &str, readonly| InnerMount {
+            source: source.into(),
+            target: format!("{WORKSPACE}/{target}"),
+            readonly,
+        };
+        let protected = [
+            inner("/src/app/.git", ".git", false),
+            inner("/src/app/.git/hooks", ".git/hooks", true),
+            inner("/src/app/.git/config", ".git/config", true),
+        ];
+        let plan = RunPlan::build(Inputs {
+            protected: &protected,
+            ..inputs(&profile, &id)
+        })
+        .unwrap();
+        let args = plan.args();
+        let project = args
+            .iter()
+            .position(|a| {
+                a.contains("target=/home/dev/workspace/repomount,")
+                    || a.ends_with("target=/home/dev/workspace/repomount")
+            })
+            .unwrap();
+        let hooks = args
+            .iter()
+            .position(|a| {
+                a == "--mount=type=bind,source=/src/app/.git/hooks,target=/home/dev/workspace/repomount/.git/hooks,readonly"
+            })
+            .unwrap();
+        assert!(hooks > project, "{args:?}");
+        assert!(args.contains(
+            &"--mount=type=bind,source=/src/app/.git/config,target=/home/dev/workspace/repomount/.git/config,readonly"
+                .to_owned()
+        ));
+        // podbay-init doesn't chown anything for them.
+        let mount_paths = plan
+            .env
+            .iter()
+            .find(|(k, _)| k == "PODBAY_MOUNT_PATHS")
+            .unwrap();
+        assert!(!mount_paths.1.contains(".git"), "{mount_paths:?}");
+
+        assert!(
+            args.contains(
+                &"--mount=type=bind,source=/src/app/.git,target=/home/dev/workspace/repomount/.git"
+                    .to_owned()
+            )
+        );
+        let outside = [InnerMount {
+            source: "/x".into(),
+            target: "/home/dev/.bashrc".into(),
+            readonly: true,
+        }];
+        assert!(
+            RunPlan::build(Inputs {
+                protected: &outside,
+                ..inputs(&profile, &id)
+            })
+            .is_err()
+        );
     }
 
     #[test]

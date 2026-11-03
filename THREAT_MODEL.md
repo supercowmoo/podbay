@@ -86,6 +86,31 @@ the host directly, but it can write files there that the host later runs:
 git's `safe.directory` check does not help: files the container writes are
 owned by you on the host.
 
+### Read-only hooks and config
+
+The first line of defence. In a session, `.git/hooks` and `.git/config`,
+and the same in every git directory under `.git/modules`, are mounted
+read-only over the project, so the session can't add a hook or a
+setting that names a program. Each git directory, and every directory
+between `.git` and a submodule's, is also mounted onto itself: a mount
+point can't be renamed or removed, so the session can't move the
+protected files aside and build a writable `.git` in their place. A
+missing `.git/hooks` is created on the host before the session starts.
+`protect_git = false` in a profile turns this off, which podbay states on
+every run.
+
+What it doesn't cover, and the report below does:
+
+- Other files in the git directory that change what host git does:
+  `commondir` (which points git at another directory for config and hooks),
+  `info/attributes`, linked-worktree files. The `.git` entry can't be
+  replaced, but these can be written.
+- A `.git` that is a file (a linked worktree or submodule checkout): its
+  git directory is elsewhere, and the session can rewrite the file itself.
+- New nested repositories the session creates further down the tree.
+- The contents of the repository: a session can still rewrite history or
+  delete objects, which is damage to the project, not a way onto the host.
+
 ### The session report
 
 After every `podbay run`, podbay reports changes to the files above:

@@ -14,3 +14,7 @@ anyhow = "=1.0.104"
 libc = "=0.2.190"
 # Only the parser: no serde, no writer.
 toml = { version = "=1.1.8", default-features = false, features = ["std", "parse"] }
+
+# Release binaries carry no debug symbols.
+[profile.release]
+strip = true

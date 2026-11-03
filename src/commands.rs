@@ -12,6 +12,7 @@ use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
 use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
 use crate::egress;
 use crate::forward::{self, Forwarder, Port};
+use crate::gitguard;
 use crate::image::{self, Action, BaseImage, LayerSource};
 use crate::paths::Paths;
 use crate::plan::{self, Net, RunPlan};
@@ -41,11 +42,19 @@ impl Setup {
         Ok(crate::backend::Cli::new(kind))
     }
 
-    /// `--profile`, else the configured default, else `default` if it exists,
-    /// else nothing. Several are stacked in order.
-    fn profile(&self, engine: &EngineArgs) -> Result<ResolvedProfile> {
+    /// `--profile`, else the `[projects]` entry for `project`, else the
+    /// configured default, else `default` if it exists, else nothing.
+    /// Several are stacked in order.
+    fn profile(&self, engine: &EngineArgs, project: Option<&Path>) -> Result<ResolvedProfile> {
+        let listed = project.and_then(|p| self.config.project_profiles(&self.paths, p));
         let names = if !engine.profiles.is_empty() {
             engine.profiles.clone()
+        } else if let Some((dir, names)) = listed {
+            eprintln!(
+                "podbay: profiles {} for projects in {dir} (config.toml)",
+                names.join(", ")
+            );
+            names.to_vec()
         } else if !self.config.default_profile.is_empty() {
             self.config.default_profile.clone()
         } else if self.paths.profile_file("default").is_file() {
@@ -165,7 +174,7 @@ impl Prepared {
         }
         let key = repo_key(&project);
 
-        let mut profile = ctx.profile(engine)?;
+        let mut profile = ctx.profile(engine, Some(&project))?;
         if local_cache {
             profile.localize_provision_volumes(&key);
         }
@@ -237,6 +246,8 @@ impl Prepared {
             limits: &self.limits,
             network: Net::Full,
             seccomp: self.seccomp.clone(),
+            // The whole project is read-only here already.
+            protected: &[],
         })
     }
 
@@ -395,6 +406,24 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         );
     }
 
+    // Git hooks and config, read-only unless a profile says otherwise.
+    let guard = match &profile.protect_git {
+        Some((false, from)) => {
+            eprintln!(
+                "podbay: note: the session can change git hooks and config (protect_git = false \
+                 from profile {from}); check the session report before using git here"
+            );
+            gitguard::Guard::default()
+        }
+        _ => gitguard::guard(&prep.project, !args.dry_run),
+    };
+    for warning in &guard.warnings {
+        eprintln!("podbay: warning: {warning}");
+    }
+    if guard.protects() {
+        eprintln!("podbay: git hooks and config are read-only in the session (protect_git)");
+    }
+
     let plan = RunPlan::build(plan::Inputs {
         image: prep.image.clone(),
         project: prep.project.clone(),
@@ -408,6 +437,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         limits: &prep.limits,
         network: net,
         seccomp: prep.seccomp.clone(),
+        protected: &guard.mounts,
     })?;
     let program = prep.program();
     let argv = plan.args();
@@ -743,7 +773,8 @@ pub fn provision(args: ProvisionArgs) -> Result<ExitCode> {
 pub fn build(args: BuildArgs) -> Result<()> {
     let ctx = Setup::load()?;
     let backend = ctx.backend(&args.engine)?;
-    let profile = ctx.profile(&args.engine)?;
+    let current = std::env::current_dir().and_then(fs::canonicalize).ok();
+    let profile = ctx.profile(&args.engine, current.as_deref())?;
     let identity = backend.identity()?;
     let mut stack = image::layers(
         &ctx.base_image(&profile),
@@ -856,6 +887,12 @@ fn describe(
     for (k, v) in &p.env {
         out.push_str(&format!("  {k} = {v}\n"));
     }
+
+    out.push_str(&match &p.protect_git {
+        Some((false, from)) => format!("\ngit hooks and config: writable  (from {from})\n"),
+        Some((true, from)) => format!("\ngit hooks and config: read-only  (from {from})\n"),
+        None => "\ngit hooks and config: read-only\n".to_owned(),
+    });
 
     out.push_str("\nenv from your environment (session only):\n");
     for (k, profile) in &p.env_from_host {

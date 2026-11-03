@@ -48,13 +48,34 @@ Also in place: stackable profiles, any container image, forwarded ports,
 API keys passed to the session only, and a small, pinned dependency set
 (eight crates, each one listed and checked in CI).
 
-The biggest remaining gap: the project is mounted read-write, so code
-inside can plant git hooks or config that run on your host the next time
-you use git there. The [session report](#session-report) tells you when
-that has happened. [THREAT_MODEL.md](THREAT_MODEL.md) covers what is and
-isn't protected, and which stage closes each gap.
+The project is mounted read-write, so what a session leaves there is the
+main way back to your host. Git hooks and config, which your host's git
+runs, are [read-only in sessions](#git-hooks-and-config); for the rest,
+such as a `Makefile` you later run yourself, the
+[session report](#session-report) tells you what changed.
+[THREAT_MODEL.md](THREAT_MODEL.md) covers what is and isn't protected, and
+which stage closes each gap.
 
 ## Install
+
+Releases have static Linux binaries for x86_64 and arm64, with checksums
+and signed build provenance. For x86_64 (use `aarch64` for arm64, and the
+latest version from the releases page):
+
+```
+v=v0.1.0 t=x86_64-unknown-linux-musl
+curl -fsSLO "https://github.com/supercowmoo/podbay/releases/download/$v/podbay-$v-$t"
+curl -fsSLO "https://github.com/supercowmoo/podbay/releases/download/$v/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify "podbay-$v-$t" --repo supercowmoo/podbay
+install -m 0755 "podbay-$v-$t" ~/.local/bin/podbay
+```
+
+The checksum shows the download is intact. The attestation, checked with
+the GitHub CLI, shows the binary was built by this repository's release
+workflow from the tagged commit, not uploaded by hand.
+
+Or build it yourself:
 
 ```
 cargo install --locked --path .
@@ -261,12 +282,23 @@ podbay: note: shell from base is replaced by opencode's
 
 A profile replacing what it `extends` is intended and stays quiet.
 
-Without `-p`, podbay uses `default_profile` from `config.toml`, which can be
-a list, else a profile named `default` if one exists:
+Without `-p`, podbay uses what `config.toml` lists for the project's
+directory, else `default_profile`, else a profile named `default` if one
+exists:
 
 ```toml
-default_profile = ["base", "rust", "opencode"]
+default_profile = ["base", "opencode"]
+
+[projects]                            # the deepest listed directory wins
+"~/src/my-rust-app" = ["base", "rust", "opencode"]
+"~/src/scraper" = ["base", "python", "opencode"]
+"~/work" = "work"
 ```
+
+So `podbay run ~/src/my-rust-app` picks its own stack, and `-p` still
+overrides it for one run. These live in your config, never in the project:
+a project can't choose its own profiles, since profiles decide its
+network, mounts and capabilities.
 
 ### Commands
 
@@ -456,6 +488,9 @@ new version by itself: `podbay build --force` pulls the image again.
   Podman's own default allows namespaces, mounts, keyrings and `ptrace`. A profile can allow specific
   calls back (see below), and `cap_add` brings back the calls that go with
   a capability, as with Docker.
+- **Git**: commits, branches and the rest work as usual, but the project's
+  git hooks and config are read-only; see
+  [Git hooks and config](#git-hooks-and-config).
 - **Network**: none. The session has only a loopback interface, so it
   can't reach the internet, your LAN or the host. A profile can allow HTTPS
   to specific hosts (see [Network allowlist](#network-allowlist)), or turn
@@ -598,6 +633,35 @@ A toolchain manager itself can come from the provisioning command, as in
 one more option: install it in an extension, give it a volume for
 `~/.local/share/mise`, and use `mise install` as the command.
 
+## Git hooks and config
+
+Git on your host runs the project's hooks, and programs its config names
+(`core.fsmonitor`, `core.hooksPath`, filters, aliases), the next time you
+use it there. So in a session, `.git/hooks` and `.git/config` are
+read-only, and so are the same in submodules' git directories:
+
+```
+podbay: git hooks and config are read-only in the session (protect_git)
+```
+
+Committing, branching, diffs, rebases and fetches from existing remotes
+work as usual. What fails is anything that writes git config: `git config`,
+`git remote add`, `git checkout --track` (git reports "Device or resource
+busy" for the config file). Set your identity with `GIT_AUTHOR_NAME` and
+friends in `[env]`, or mount a `~/.gitconfig`, which is outside the
+project. The git directories themselves can't be renamed or removed in a
+session either, so they can't be swapped for writable copies. A missing
+`.git/hooks` is created, empty, before the session starts.
+
+To allow it for a profile, at your own risk:
+
+```toml
+protect_git = false
+```
+
+podbay then says so on every run, and the [session report](#session-report)
+is what's left to tell you about planted hooks.
+
 ## Session report
 
 When the container exits, podbay reports anything it changed that the host
@@ -634,6 +698,9 @@ default_profile = ["base", "rust"]  # or one name; used when -p isn't given
 base_image = "alpine:3.22"   # start from any image; profiles' `image` wins
 network = "none"             # "full", or a host list; --online/--offline override it
 
+[projects]                   # profiles by project directory; see Stacking
+"~/src/app" = ["rust", "dsh"]
+
 [limits]                     # profiles can override each key
 pids = 4096                  # processes and threads; 0 for no limit
 memory = "8g"                # default: no limit
@@ -658,6 +725,10 @@ code you don't trust, `--local-cache` gives that project its own copies of
 the provision volumes (`podbay-<profile>-<name>-<repo-key>`).
 
 ## Development
+
+Releases: set `version` in `Cargo.toml`, commit, and push a matching tag
+(`v0.2.0`). The release workflow checks the tag matches, runs the tests,
+builds both binaries and publishes them.
 
 ```
 cargo test                          # unit, CLI and end-to-end tests
