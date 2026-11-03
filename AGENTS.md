@@ -6,6 +6,16 @@ what it doesn't. Read both before changing behaviour, and keep both true:
 a change to what a session can do, see or reach updates them in the same
 change.
 
+Both have Simplified Chinese translations, `README.zh-CN.md` and
+`THREAT_MODEL.zh-CN.md`, and they are kept true the same way: a change to
+the English updates the translation in the same change. Each translation
+names the SHA-256 of the English it matches, and `tests/translations.rs`
+fails until that marker is updated, which is only done after the
+translated text has been. Code blocks stay the English ones verbatim, since
+they show podbay's own (English) output; translation-only notes go between
+`<!-- zh-only -->` and `<!-- /zh-only -->`. Say in the handover if the
+translation was done by an agent and not checked by a Chinese reader.
+
 ## How the maintainer works
 
 - **Never push, and never open pull requests.** Hand over the work as a

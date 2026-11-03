@@ -1,5 +1,7 @@
 # Podbay
 
+**English** · [简体中文](README.zh-CN.md)
+
 Disposable containers for working in a codebase, including running AI coding
 agents and code you don't fully trust, without handing them your machine.
 
@@ -802,6 +804,13 @@ dependency is always a deliberate, reviewed change.
 The relay and podbay-init are their own crates in `relay/` and `init/`,
 standard library only, since the images build them with plain `rustc`. Run
 `cargo test --workspace` and `cargo clippy --workspace` to include them.
+
+README.md and THREAT_MODEL.md have Simplified Chinese translations
+(`README.zh-CN.md`, `THREAT_MODEL.zh-CN.md`). Each records the SHA-256 of
+the English file it was translated from, and `tests/translations.rs` fails
+when the English changes until the translation catches up. It also checks
+that their code blocks are the English ones verbatim and that their links
+resolve.
 
 ## License
 

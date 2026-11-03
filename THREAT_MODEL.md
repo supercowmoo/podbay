@@ -1,5 +1,7 @@
 # Threat model
 
+**English** · [简体中文](THREAT_MODEL.zh-CN.md)
+
 This document covers what podbay protects, from whom, and where the
 boundary currently has holes. It describes the code as it is now: stages 1
 to 4 and the seccomp half of stage 5 are done (see the README's Status).
