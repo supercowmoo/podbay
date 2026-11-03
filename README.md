@@ -230,7 +230,7 @@ podbay run -p rust -p dsh ~/src/my-rust-app -- dsh web --no-open
 
 Then open the URL dsh prints; it carries the login token.
 
-### Everyday commands
+### Basic commands
 
 ```
 podbay run . -- make test     # run a command instead of a shell
