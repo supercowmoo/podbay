@@ -41,7 +41,10 @@ What's in place, as stages the [threat model](THREAT_MODEL.md) refers to:
    filtering proxy, and tool installs in a separate provisioning step.
    *(done)*
 5. **Kernel and file access**: podbay's own seccomp filter on every
-   container *(done)*; Landlock inside the session *(next)*.
+   container, read-only git hooks and config, and `writable` to keep the
+   rest of a project read-only *(done)*. Landlock isn't planned: inside
+   podbay's container it would duplicate the read-only root filesystem
+   and network namespace, and it can't make single files read-only.
 6. A native rootless runtime, with Podman and Docker kept as fallbacks.
 
 Also in place: stackable profiles, any container image, forwarded ports,
@@ -88,6 +91,18 @@ is pinned too (`rust-toolchain.toml`); rustup installs it if needed.
 You need Podman or Docker. Podman is preferred when both are installed
 because it is rootless by default. With rootful Docker, a container escape is
 root on the host, and podbay says so on every run.
+
+Then check the machine:
+
+```
+podbay doctor
+```
+
+It checks the engine and whether it's rootless, which resource limits it
+can apply, what rootless Podman needs (subuid and subgid ranges, user
+namespaces, `/dev/net/tun`), seccomp, the runtime directory for podbay's
+sockets, and that `config.toml` and every profile load. Each problem
+comes with what to change, and it exits non-zero if sessions won't work.
 
 ## Quick start
 
@@ -226,6 +241,7 @@ podbay run --port 3080 .      # reach a server in the session on 127.0.0.1:3080
 podbay build                  # build any missing images ahead of time
 podbay build --force          # rebuild them all with current packages
 podbay provision .            # run the profiles' [provision] commands now
+podbay doctor                 # check this machine, config and profiles
 ```
 
 podbay's exit code is the command's (or the shell's) exit code.
@@ -661,6 +677,30 @@ protect_git = false
 
 podbay then says so on every run, and the [session report](#session-report)
 is what's left to tell you about planted hooks.
+
+## Limiting where a session writes
+
+Git hooks and config aren't the only files your host acts on: a
+`Makefile`, `package.json` scripts, `.envrc` or `.vscode/` tasks run when
+you later build or open the project. To keep a session out of those, list
+where it may write, and the rest of the project is read-only:
+
+```toml
+writable = ["src", "tests", "target"]
+```
+
+```
+podbay: the project is read-only in the session except src, tests, target
+```
+
+Missing paths are created as directories before the session. Lists add up
+across stacked profiles. Paths must be plain and relative, and podbay
+refuses one that is, or passes through, a symbolic link, since a mount
+would follow it out of the project. Git keeps working: with
+[`protect_git`](#git-hooks-and-config) on, `.git` stays writable except
+for its hooks and config. A listed file can be edited in place but not
+replaced, so tools that save by renaming need its directory listed
+instead.
 
 ## Session report
 

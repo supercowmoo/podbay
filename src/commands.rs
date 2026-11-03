@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Backend, BackendKind, IMAGE_DEV_UID, Identity};
-use crate::cli::{BuildArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
+use crate::cli::{BuildArgs, DoctorArgs, EngineArgs, ProfileCommand, ProvisionArgs, RunArgs};
 use crate::config::{Config, DEFAULT_PIDS, Limits, Network, NetworkMode, NetworkSetting};
 use crate::egress;
 use crate::forward::{self, Forwarder, Port};
@@ -424,10 +424,37 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         eprintln!("podbay: git hooks and config are read-only in the session (protect_git)");
     }
 
+    // With `writable`, the project is read-only apart from those paths.
+    let writable = gitguard::writable(&prep.project, &profile.writable, !args.dry_run)?;
+    let project_readonly = !profile.writable.is_empty();
+    if project_readonly {
+        let listed: Vec<&str> = profile.writable.iter().map(|(p, _)| p.as_str()).collect();
+        eprintln!(
+            "podbay: the project is read-only in the session except {}",
+            listed.join(", ")
+        );
+        if !guard.mounts.iter().any(|m| m.target.ends_with("/.git"))
+            && prep.project.join(".git").is_dir()
+            && !listed.contains(&".git")
+        {
+            eprintln!(
+                "podbay: note: .git is read-only too, so git can't commit; add \".git\" to \
+                 writable to allow it"
+            );
+        }
+    }
+    // Git protection's mounts go over the writable ones: `.git` listed
+    // in `writable` is already mounted writable by it.
+    let mut inner: Vec<plan::InnerMount> = writable
+        .into_iter()
+        .filter(|w| !guard.mounts.iter().any(|g| g.target == w.target))
+        .collect();
+    inner.extend(guard.mounts.iter().cloned());
+
     let plan = RunPlan::build(plan::Inputs {
         image: prep.image.clone(),
         project: prep.project.clone(),
-        project_readonly: false,
+        project_readonly,
         repo_key: &prep.key,
         profile: &session_profile,
         identity: &prep.identity,
@@ -437,7 +464,7 @@ pub fn run(args: RunArgs) -> Result<ExitCode> {
         limits: &prep.limits,
         network: net,
         seccomp: prep.seccomp.clone(),
-        protected: &guard.mounts,
+        protected: &inner,
     })?;
     let program = prep.program();
     let argv = plan.args();
@@ -795,6 +822,98 @@ pub fn build(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
+/// `podbay doctor`: the engine, this machine, config.toml and every
+/// profile. Exit status 1 if anything would stop sessions from working.
+pub fn doctor(args: DoctorArgs) -> Result<ExitCode> {
+    use crate::doctor::{self, Check, Level};
+    let paths = Paths::from_env()?;
+    let mut checks: Vec<Check> = Vec::new();
+    let config = match Config::load(&paths.config_file()) {
+        Ok(config) => config,
+        Err(e) => {
+            checks.push(Check {
+                level: Level::Fail,
+                what: "config",
+                detail: format!("{e:#}"),
+                hint: None,
+            });
+            Config::default()
+        }
+    };
+
+    let (kind, source) = match (args.backend, config.backend) {
+        (Some(kind), _) => (Some(kind), "--backend"),
+        (None, Some(kind)) => (Some(kind), "config.toml"),
+        (None, None) => (BackendKind::detect().ok(), "detected"),
+    };
+    match kind {
+        Some(kind) => {
+            checks.extend(doctor::engine(&crate::backend::Cli::new(kind), source));
+            checks.extend(doctor::host(kind));
+        }
+        None => checks.push(Check {
+            level: Level::Fail,
+            what: "engine",
+            detail: "neither podman nor docker is on PATH".into(),
+            hint: Some("install Podman (preferred, rootless by default) or Docker".into()),
+        }),
+    }
+
+    if !checks.iter().any(|c| c.what == "config") {
+        checks.push(Check {
+            level: Level::Ok,
+            what: "config",
+            detail: match paths.config_file().is_file() {
+                true => format!("{} loads", paths.config_file().display()),
+                false => format!("no {} (all defaults)", paths.config_file().display()),
+            },
+            hint: None,
+        });
+    }
+    let names = profile::list(&paths)?;
+    let mut broken = 0;
+    for name in &names {
+        match profile::resolve_all(&paths, std::slice::from_ref(name)) {
+            Ok(resolved) => {
+                for warning in resolved.warnings {
+                    checks.push(Check {
+                        level: Level::Warn,
+                        what: "profile",
+                        detail: warning,
+                        hint: None,
+                    });
+                }
+            }
+            Err(e) => {
+                broken += 1;
+                checks.push(Check {
+                    level: Level::Fail,
+                    what: "profile",
+                    detail: format!("{name}: {e:#}"),
+                    hint: None,
+                });
+            }
+        }
+    }
+    if broken == 0 {
+        checks.push(Check {
+            level: Level::Ok,
+            what: "profiles",
+            detail: match names.len() {
+                0 => format!("none yet in {}", paths.profiles_dir().display()),
+                n => format!("{n} load: {}", names.join(", ")),
+            },
+            hint: None,
+        });
+    }
+
+    print!("{}", doctor::render(&checks));
+    Ok(match checks.iter().any(|c| c.level == Level::Fail) {
+        true => ExitCode::FAILURE,
+        false => ExitCode::SUCCESS,
+    })
+}
+
 pub fn profile(cmd: ProfileCommand) -> Result<()> {
     let ctx = Setup::load()?;
     match cmd {
@@ -893,6 +1012,13 @@ fn describe(
         Some((true, from)) => format!("\ngit hooks and config: read-only  (from {from})\n"),
         None => "\ngit hooks and config: read-only\n".to_owned(),
     });
+
+    if !p.writable.is_empty() {
+        out.push_str("\nproject writable only at:\n");
+        for (path, profile) in &p.writable {
+            out.push_str(&format!("  {path}  (from {profile})\n"));
+        }
+    }
 
     out.push_str("\nenv from your environment (session only):\n");
     for (k, profile) in &p.env_from_host {

@@ -50,6 +50,12 @@
 #
 # protect_git = true
 
+# Where in the project the session may write; the rest is read-only, so it
+# can't plant a Makefile, package.json script or .envrc that your host runs
+# later. Unset: all of the project. Missing paths are created.
+#
+# writable = ["src", "tests", "target"]
+
 # Capabilities the session keeps. None by default; each one weakens the
 # boundary, and podbay prints them on every run.
 #

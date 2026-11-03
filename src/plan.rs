@@ -203,7 +203,11 @@ impl RunPlan {
             if !m.target().starts_with(&format!("{WORKSPACE}/")) {
                 bail!("{} is not inside the project", m.target());
             }
-            if mounts.iter().any(|other| other.target() == m.target()) {
+            let again = mounts
+                .iter()
+                .chain(&protected)
+                .filter(|o| o.target() == m.target());
+            if again.count() > usize::from(protected.iter().any(|o| o.target() == m.target())) {
                 bail!("{} is mounted more than once", m.target());
             }
         }

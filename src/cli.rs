@@ -25,6 +25,12 @@ pub enum Command {
     Build(BuildArgs),
     Provision(ProvisionArgs),
     Profile(ProfileCommand),
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Default)]
+pub struct DoctorArgs {
+    pub backend: Option<BackendKind>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +116,7 @@ Commands:
   build      Build (or rebuild) the images a profile needs
   provision  Run the profile's [provision] commands now, with network access. `run` does this by itself when what they depend on changed
   profile    Manage profiles
+  doctor     Check that this machine can run sessions, and what to change if not
   help       Print this message or the help of the given subcommand(s)
 
 Options:
@@ -252,7 +259,46 @@ const PROFILE_SHOW: Usage = Usage {
     line: "podbay profile show <NAMES>...",
 };
 
-const COMMANDS: &[&str] = &["run", "build", "provision", "profile", "help"];
+const COMMANDS: &[&str] = &["run", "build", "provision", "profile", "doctor", "help"];
+
+const DOCTOR_HELP: &str = "\
+Check that this machine can run sessions, and what to change if not
+
+Usage: podbay doctor [OPTIONS]
+
+Options:
+      --backend <BACKEND>  Container engine to check [default: config `backend`, else podman if installed, else docker] [possible values: podman, docker]
+  -h, --help               Print help
+";
+
+const DOCTOR: Usage = Usage {
+    line: "podbay doctor [OPTIONS]",
+};
+
+fn parse_doctor(items: Vec<OsString>) -> Result<DoctorArgs, Exit> {
+    let mut args = Args::new(items, DOCTOR);
+    let mut engine = EngineArgs::default();
+    loop {
+        let item = args.next()?;
+        if is_help(&item) {
+            return Err(Exit::Print(DOCTOR_HELP.to_owned()));
+        }
+        match item {
+            Item::End => break,
+            Item::Long(ref name, _) if name == "backend" => {
+                engine_option(&mut args, &mut engine, &item)?;
+            }
+            Item::Long(name, _) => return Err(args.unknown_long(&name, &["backend", "help"])),
+            Item::Short(c, _) => return Err(args.unexpected(&format!("-{c}"))),
+            Item::Positional(p) => args.positionals.push(p),
+        }
+    }
+    args.positionals(0)?;
+    reject_rest(&args)?;
+    Ok(DoctorArgs {
+        backend: engine.backend,
+    })
+}
 const PROFILE_COMMANDS: &[&str] = &["init", "list", "show", "help"];
 
 fn usage_error(message: String, usage: Option<&str>) -> Exit {
@@ -735,6 +781,7 @@ fn help_for(prefix: &[String], named: &[OsString]) -> Exit {
         ["run"] => Exit::Print(run_help()),
         ["build"] => Exit::Print(build_help()),
         ["provision"] => Exit::Print(provision_help()),
+        ["doctor"] => Exit::Print(DOCTOR_HELP.to_owned()),
         ["profile"] => Exit::Print(PROFILE_HELP.to_owned()),
         ["profile", "init"] => Exit::Print(PROFILE_INIT_HELP.to_owned()),
         ["profile", "list"] => Exit::Print(PROFILE_LIST_HELP.to_owned()),
@@ -782,6 +829,7 @@ impl Cli {
             "build" => Command::Build(parse_build(args)?),
             "provision" => Command::Provision(parse_provision(args)?),
             "profile" => Command::Profile(parse_profile(args)?),
+            "doctor" => Command::Doctor(parse_doctor(args)?),
             other if other.starts_with('-') => {
                 return Err(usage_error(
                     format!("unexpected argument '{other}' found"),
@@ -974,6 +1022,21 @@ mod tests {
             parse(&["profile"]).unwrap_err(),
             Exit::Usage(PROFILE_HELP.into())
         );
+    }
+
+    #[test]
+    fn doctor() {
+        let Command::Doctor(d) = parse(&["doctor", "--backend", "podman"]).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(d.backend, Some(BackendKind::Podman));
+        assert!(matches!(
+            parse(&["doctor"]).unwrap().command,
+            Command::Doctor(_)
+        ));
+        assert!(usage(&["doctor", "-p", "x"]).contains("unexpected argument '-p'"));
+        assert!(matches!(parse(&["doctor", "--help"]), Err(Exit::Print(_))));
+        assert!(usage(&["docter"]).contains("a similar subcommand exists: 'doctor'"));
     }
 
     #[test]

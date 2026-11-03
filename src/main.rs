@@ -2,6 +2,7 @@ mod backend;
 mod cli;
 mod commands;
 mod config;
+mod doctor;
 mod egress;
 mod forward;
 mod gitconfig;
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
         Command::Build(args) => commands::build(args).map(|()| ExitCode::SUCCESS),
         Command::Provision(args) => commands::provision(args),
         Command::Profile(cmd) => commands::profile(cmd).map(|()| ExitCode::SUCCESS),
+        Command::Doctor(args) => commands::doctor(args),
     };
     match result {
         Ok(code) => code,

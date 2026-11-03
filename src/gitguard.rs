@@ -155,6 +155,54 @@ fn mount(out: &mut Guard, host: PathBuf, rel: &Path, readonly: bool) {
     });
 }
 
+/// The `writable` paths of a project whose rest is read-only: each
+/// mounted writable over the read-only project. With `create`, missing
+/// ones are created as directories first; a dry run leaves them out.
+///
+/// A path that is, or passes through, a symbolic link is refused: the
+/// engine would follow it, and could mount something outside the project.
+pub fn writable(
+    project: &Path,
+    paths: &[(String, String)],
+    create: bool,
+) -> anyhow::Result<Vec<InnerMount>> {
+    let mut out = Vec::new();
+    for (rel, profile) in paths {
+        let mut host = project.to_owned();
+        let mut missing = false;
+        for part in Path::new(rel).components() {
+            host.push(part);
+            match fs::symlink_metadata(&host) {
+                Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+                    "writable path {rel:?} (profile {profile}) goes through the symbolic link \
+                     {}; podbay won't mount through it",
+                    host.display()
+                ),
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                Err(e) => anyhow::bail!("{}: {e}", host.display()),
+            }
+        }
+        let host = project.join(rel);
+        if missing {
+            if !create {
+                continue;
+            }
+            fs::create_dir_all(&host)
+                .map_err(|e| anyhow::anyhow!("creating {}: {e}", host.display()))?;
+        }
+        out.push(InnerMount {
+            source: host,
+            target: format!("{WORKSPACE}/{rel}"),
+            readonly: false,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +290,41 @@ mod tests {
         let g = guard(p, true);
         assert!(!g.protects(), "{:?}", g.mounts);
         assert_eq!(g.warnings.len(), 2, "{:?}", g.warnings);
+    }
+
+    #[test]
+    fn writable_paths_are_mounted_and_created_but_never_through_links() {
+        let dir = crate::tempdir::tempdir().unwrap();
+        let p = dir.path();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("Cargo.lock"), "").unwrap();
+        let list = |names: &[&str]| -> Vec<(String, String)> {
+            names
+                .iter()
+                .map(|n| (n.to_string(), "p".to_string()))
+                .collect()
+        };
+        // A dry run leaves out what doesn't exist yet.
+        let m = writable(p, &list(&["src", "target/debug", "Cargo.lock"]), false).unwrap();
+        let t: Vec<&str> = m.iter().map(|m| m.target.as_str()).collect();
+        assert_eq!(
+            t,
+            [
+                format!("{WORKSPACE}/src"),
+                format!("{WORKSPACE}/Cargo.lock")
+            ]
+        );
+        assert!(m.iter().all(|m| !m.readonly));
+        assert!(!p.join("target").exists());
+        let m = writable(p, &list(&["target/debug"]), true).unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(p.join("target/debug").is_dir());
+
+        std::os::unix::fs::symlink("/etc", p.join("escape")).unwrap();
+        for bad in ["escape", "escape/ssl"] {
+            let err = writable(p, &list(&[bad]), true).unwrap_err().to_string();
+            assert!(err.contains("symbolic link"), "{bad}: {err}");
+        }
+        assert!(!Path::new("/etc/ssl/target").exists());
     }
 }

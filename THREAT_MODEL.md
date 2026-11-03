@@ -161,11 +161,14 @@ run git; it does not stop anything.
   after a report is printed are not covered.
 - **Read-write directory mounts** from profiles are not inspected.
 - **Large trees.** The scan stops after 500,000 entries and says so.
-- **Not covered at all**: anything else in the working tree that you later
-  run on the host, such as `Makefile`, `package.json` scripts, test
-  fixtures, binaries or a `.cargo/config.toml`. Treat the project's working
-  tree as untrusted output, and review the diff before building or running
-  it outside podbay. Once the report is clean, `git diff` and `git status`
+- **Not covered by the report**: anything else in the working tree that you
+  later run on the host, such as `Makefile`, `package.json` scripts, test
+  fixtures, binaries or a `.cargo/config.toml`. `writable` in a profile
+  keeps the session out of all of these by making the project read-only
+  except the paths it lists (mounted writable over the read-only project,
+  and never through a symbolic link). Without it, treat the project's
+  working tree as untrusted output, and review the diff before building or
+  running it outside podbay. Once the report is clean, `git diff` and `git status`
   on the host are safe ways to review it.
 - **Git's own parsers.** Repository data (objects, packs, refs, the index)
   written by the container is read by host git. Bugs in git's handling of
@@ -299,8 +302,10 @@ run git; it does not stop anything.
     podbay's filter altogether, which podbay also prints.
   - Syscalls the filter allows can still have kernel bugs. The filter
     limits which kernel code is reachable, not whether it is correct.
-  - No Landlock policy yet, so within the container, file access is
-    limited only by ownership and the read-only root filesystem.
+  - No Landlock policy: within the container, file access is limited by
+    ownership, the read-only root filesystem and the mounts. Landlock would
+    duplicate those, and can't make single files inside a writable tree
+    read-only, which is what's left; `writable` does that with mounts.
 - **The terminal.** With `--tty`, the container writes directly to your
   terminal. Escape sequences can change the window title, write to the
   clipboard (OSC 52) on terminals that allow it, or hit bugs in the

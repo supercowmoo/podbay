@@ -215,3 +215,32 @@ fn example_profiles_resolve() {
         assert!(shown.contains(expected), "missing {expected:?}\n{shown}");
     }
 }
+
+#[test]
+fn doctor_reports_broken_profiles() {
+    let env = Env::new();
+    fs::create_dir_all(env.profiles()).unwrap();
+    fs::write(env.profiles().join("good.toml"), "shell = \"zsh\"\n").unwrap();
+    fs::write(env.profiles().join("bad.toml"), "[[mount]]\n").unwrap();
+    let output = env
+        .podbay()
+        .args(["doctor", "--backend", "docker"])
+        .run_fails();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("FAIL  profile: bad: invalid profile"), "{out}");
+    assert!(out.contains("      missing field `host`"), "{out}");
+    assert!(out.contains("ok    seccomp:"), "{out}");
+    assert!(
+        out.ends_with("Sessions won't work until the failures above are fixed.\n"),
+        "{out}"
+    );
+
+    fs::remove_file(env.profiles().join("bad.toml")).unwrap();
+    let output = env
+        .podbay()
+        .args(["doctor", "--backend", "docker"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("profiles: 1 load: good"), "{out}");
+}

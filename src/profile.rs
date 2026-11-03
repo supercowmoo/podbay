@@ -74,6 +74,8 @@ struct ProfileFile {
     /// session; unset leaves it to profiles below, and podbay's default
     /// is yes.
     protect_git: Option<bool>,
+    /// Paths in the project the session may write; the rest is read-only.
+    writable: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -133,6 +135,7 @@ impl ProfileFile {
             "image",
             "env_from_host",
             "protect_git",
+            "writable",
         ])?;
         let mounts = t
             .tables("mount")?
@@ -221,6 +224,7 @@ impl ProfileFile {
             image: t.string("image")?,
             env_from_host: t.strings("env_from_host")?,
             protect_git: t.bool("protect_git")?,
+            writable: t.strings("writable")?,
         })
     }
 }
@@ -301,6 +305,9 @@ pub struct ResolvedProfile {
     /// `protect_git` as the last profile that set it chose, and that
     /// profile; unset means protected.
     pub protect_git: Option<(bool, String)>,
+    /// Project paths the session may write, each with the profile that
+    /// listed it. Empty: all of the project.
+    pub writable: Vec<(String, String)>,
     /// Non-fatal problems, such as a mount whose host path is missing.
     pub warnings: Vec<String>,
     /// Settings one profile replaced from another it doesn't extend, as
@@ -464,6 +471,35 @@ fn validate_env_name(name: &str) -> Result<()> {
         bail!("{name} is reserved for podbay");
     }
     Ok(())
+}
+
+/// A `writable` entry: a path inside the project, relative, without `..`,
+/// and not inside `.git`, whose writable parts git protection decides.
+/// Returned without `./` or a trailing `/`.
+fn validate_writable(path: &str) -> Result<String> {
+    let trimmed = path.trim_start_matches("./").trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        bail!("writable path {path:?} is the whole project; leave writable out instead");
+    }
+    if trimmed.starts_with('/') {
+        bail!("writable path {path:?} must be relative to the project");
+    }
+    if trimmed
+        .split('/')
+        .any(|seg| seg == ".." || seg == "." || seg.is_empty())
+    {
+        bail!("writable path {path:?} must be a plain path inside the project");
+    }
+    if trimmed.contains([',', ':', '\n']) {
+        bail!("writable path {path:?} must not contain ',', ':' or newlines");
+    }
+    if trimmed.starts_with(".git/") {
+        bail!(
+            "writable path {path:?} is inside .git; list \".git\" itself, and use protect_git \
+             for hooks and config"
+        );
+    }
+    Ok(trimmed.to_owned())
 }
 
 /// Paths in the project that provisioning watches: relative, and never
@@ -754,6 +790,13 @@ fn apply(paths: &Paths, name: &str, profile: ProfileFile, ctx: &mut Resolution) 
             bail!("{key} is in [env] here and in env_from_host in {from}; use one of them");
         }
         out.env.insert(key, value);
+    }
+
+    for rel in profile.writable {
+        let rel = validate_writable(&rel)?;
+        if !out.writable.iter().any(|(r, _)| *r == rel) {
+            out.writable.push((rel, name.to_owned()));
+        }
     }
 
     for key in profile.env_from_host {
@@ -1256,6 +1299,33 @@ mod tests {
         assert!(err.contains("SYS_EVERYTHING"), "{err}");
         f.profile("lim", "[limits]\ncpus = 0\n");
         assert!(resolve(&f.paths, "lim").is_err());
+    }
+
+    #[test]
+    fn writable_paths() {
+        assert_eq!(validate_writable("./src/").unwrap(), "src");
+        assert_eq!(validate_writable("target/debug").unwrap(), "target/debug");
+        assert_eq!(validate_writable(".git").unwrap(), ".git");
+        for bad in [
+            "",
+            ".",
+            "./",
+            "/abs",
+            "../up",
+            "a/../b",
+            "a//b",
+            "a,b",
+            "a:b",
+            ".git/hooks",
+        ] {
+            assert!(validate_writable(bad).is_err(), "{bad:?} accepted");
+        }
+        let f = Fixture::new();
+        f.profile("a", "writable = [\"src\", \"tests/\"]\n")
+            .profile("b", "writable = [\"./src\", \"target\"]\n");
+        let r = resolve_all(&f.paths, &["a".into(), "b".into()]).unwrap();
+        let got: Vec<&str> = r.writable.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(got, ["src", "tests", "target"]);
     }
 
     #[test]
