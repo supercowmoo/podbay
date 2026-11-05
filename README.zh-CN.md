@@ -3,7 +3,7 @@
 
 [English](README.md) · **简体中文**
 
-<!-- source: README.md sha256:1b60ec55c9c7aa0d31ad9c5e99a7cbd4ef4486d2e32fb8a1b2bc904df6f90f30 -->
+<!-- source: README.md sha256:79225a1a1107091e76a857091661c2bb3d214f7c86612f9d5d4a12d7208337de -->
 
 > 本文译自 [README.md](README.md)。两者不一致时以英文版为准。podbay 的命令输出是英文的，
 > 下面的代码块与英文版逐字相同，便于你对照终端里看到的内容。中国大陆的网络环境另见
@@ -16,10 +16,9 @@
 
 - 只读挂载的 dotfiles，包括你的 shell 配置
 - 命名卷（volume），保存需要比容器活得更久的状态
-- 你自己的工具链管理器（rustup、uv、nvm、nix、mise 等），由 profile 调用，像平时一样安装到卷里
+- 你自己的工具和工具链管理器（rustup、uv、nvm、nix、mise 等），由你编写的、以 root 身份运行的构建脚本固化进派生镜像
 - 你想要的 shell、环境变量和 PATH 条目
 - 你喜欢的镜像，比如 `alpine`、`ubuntu` 或某个编程助手自己的镜像，原样使用；也可以用 podbay 自带的小型 Debian 基础镜像
-- 可选的、以 root 身份运行并固化进派生镜像的构建脚本
 - 网络访问：无网络、只允许通过 HTTPS 访问你列出的主机，或完全放开
 - 你转发的端口，让宿主机能访问会话里的服务
 
@@ -105,13 +104,35 @@ profile 提供。其他任何镜像也都可以用，见[镜像](#images)。除�
 profile 是 `~/.config/podbay/profiles/` 下的 TOML 文件，每个 profile 一个文件，以它的名字命名（见
 [podbay 在哪里查找](#where-profiles-live)）。下面是一个 Rust profile 和一个编程助手 profile，分开写，以后可以各自替换。
 
-语言 profile 调用 rustup，就像你在自己机器上做的那样：一个固定的版本，并核对官方公布的校验和。之后 rustup
-会按项目的 `rust-toolchain.toml` 安装所需的工具链，装进一个比容器活得更久的卷里。（它就是
-[`examples/profiles/rust.toml`](examples/profiles/rust.toml)，去掉了允许会话访问 crates.io 的那几行。）
+程序放在镜像里，会话无法改动；它们需要跨会话保留的内容放在卷里。profile 的 `extension` 指定一个放在它旁边的构建脚本，它在构建镜像时以 root 身份运行。
+
+语言 profile 的脚本安装 rustup，就像你在自己机器上做的那样：一个固定的版本，并核对官方公布的校验和。之后 profile 让 rustup 按项目的
+`rust-toolchain.toml` 安装所需的工具链。工具链是“程序放在镜像里”的唯一例外，因为每个项目选择自己的工具链，所以它们放进一个比容器活得更久的卷里。（它们就是
+[`examples/profiles/rust.sh`](examples/profiles/rust.sh) 和 [`rust.toml`](examples/profiles/rust.toml)，去掉了注释和允许会话访问 crates.io 的那几行。）
+
+```sh
+#!/bin/sh
+# ~/.config/podbay/profiles/rust.sh
+set -eu
+
+rustup=1.29.2
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu sum=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
+  aarch64) target=aarch64-unknown-linux-gnu sum=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
+  *) echo "no rustup build for $(uname -m)" >&2; exit 1 ;;
+esac
+curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$rustup/$target/rustup-init"
+echo "$sum  /tmp/rustup-init" | sha256sum -c -
+chmod +x /tmp/rustup-init
+CARGO_HOME=/opt/rustup RUSTUP_HOME=/tmp/rustup-home /tmp/rustup-init -y --no-modify-path --default-toolchain none
+rm -rf /tmp/rustup-init /tmp/rustup-home
+chmod -R a+rX /opt/rustup
+```
 
 ```toml
 # ~/.config/podbay/profiles/rust.toml
-path = ["/home/dev/.cargo/bin"]
+extension = "rust.sh"
+path = ["/opt/rustup/bin", "/home/dev/.cargo/bin"]
 
 [env]
 RUSTUP_HOME = "/home/dev/.rustup"
@@ -129,30 +150,37 @@ provision = true
 
 [provision]
 command = """
-rustup=1.29.2
-case "$(uname -m)" in
-  x86_64) target=x86_64-unknown-linux-gnu sum=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
-  aarch64) target=aarch64-unknown-linux-gnu sum=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
-  *) echo "no rustup build for $(uname -m)" >&2; exit 1 ;;
-esac
-if ! command -v rustup >/dev/null; then
-  curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$rustup/$target/rustup-init"
-  echo "$sum  /tmp/rustup-init" | sha256sum -c -
-  chmod +x /tmp/rustup-init
-  /tmp/rustup-init -y --no-modify-path
-fi
+rustup default >/dev/null 2>&1 || rustup default stable
 rustup show active-toolchain || rustup toolchain install
 if [ -f Cargo.lock ]; then cargo fetch --locked; fi
 """
 watch = ["rust-toolchain.toml", "rust-toolchain", "Cargo.lock"]
 ```
 
-助手 profile 安装一个终端编程助手（这里用 opencode），并让会话只能访问它的 API：
+助手 profile 用同样的方式安装一个终端编程助手（这里用 opencode），并让会话只能访问它的 API。脚本安装到 `/home/dev` 之外，因为
+`/home/dev` 的内容会被复制到每个会话可写的 home 中：
+
+```sh
+#!/bin/sh
+# ~/.config/podbay/profiles/opencode.sh
+set -eu
+
+export HOME=/opt/opencode
+mkdir -p "$HOME"
+curl -fsSL -o /tmp/opencode-install https://opencode.ai/v2/install
+bash /tmp/opencode-install --version 2.2.5 --no-modify-path
+rm -f /tmp/opencode-install
+chmod -R a+rX "$HOME"
+```
 
 ```toml
 # ~/.config/podbay/profiles/opencode.toml
+extension = "opencode.sh"
 network = ["api.anthropic.com"]   # its model provider, and nothing else
-path = ["/home/dev/.opencode/bin"]
+path = ["/opt/opencode/.opencode/bin"]
+
+[env]
+OPENCODE_DISABLE_AUTOUPDATE = "1"   # the image is read-only in a session
 
 # Its login, settings and history, kept between sessions.
 [[volume]]
@@ -162,15 +190,6 @@ container = "/home/dev/.config/opencode"
 [[volume]]
 name = "data"
 container = "/home/dev/.local/share/opencode"
-
-# The agent itself.
-[[volume]]
-name = "bin"
-container = "/home/dev/.opencode"
-provision = true
-
-[provision]
-command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/v2/install | bash"
 ```
 
 把它们叠加起来并启动助手：
@@ -179,8 +198,8 @@ command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/v2
 podbay run -p rust -p opencode ~/src/my-rust-app -- opencode
 ```
 
-会话开始前，podbay 会在一个有网络的单独容器里运行这两个 `[provision]` 命令（见[预置](#provisioning)）。会话本身只能访问
-profile 列出的主机。
+第一次运行会把这两个脚本构建进镜像。会话开始前，podbay 会在一个有网络的单独容器里运行 `rust.toml` 的 `[provision]`
+命令（见[预置](#provisioning)）。会话本身只能访问 profile 列出的主机。
 
 以后要切换只需改一个词，前提是有一个同样写法的 `python.toml` 或 `claude.toml`：
 
@@ -191,12 +210,12 @@ podbay run -p rust -p claude ~/src/my-rust-app    # same language, another agent
 
 助手在这两种组合下都保留登录状态和历史记录，因为卷属于声明它的 profile（`podbay-opencode-config`），而不属于某个组合。
 
-[`examples/`](examples/) 里有可以直接复制的 profile：`rust.toml`，以及用于
+[`examples/`](examples/) 里有可以直接复制的 profile，各自带有构建脚本：`rust.toml`，以及用于
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 `dsh.toml`，模型来自
 OpenRouter，它的网页界面会转发到你的浏览器：
 
 ```
-cp examples/profiles/*.toml ~/.config/podbay/profiles/
+cp examples/profiles/* ~/.config/podbay/profiles/
 mkdir -p ~/.config/podbay/dsh && cp examples/dsh/cordis.patch.yml ~/.config/podbay/dsh/
 export OPENROUTER_API_KEY=...
 podbay run -p rust -p dsh ~/src/my-rust-app -- dsh web --no-open
@@ -344,7 +363,7 @@ memory = "16g"
 使用 `extends` 以及叠加 profile 时，靠前的先应用。后面 profile 的挂载或卷会替换继承来的、位于同一容器路径的那个；`[env]`
 键和 `shell` 覆盖继承来的值；它的 `path` 条目放在继承来的条目前面。`[provision]` 命令和 `watch` 列表、`cap_add`
 以及 `[seccomp] allow` 列表会合并；`engine_default` 一直继承，直到某个 profile 设置它。`[limits]` 的键逐个覆盖；`network`
-的主机列表累加，而 `"none"` 或 `"full"` 会替换之前的值。`ports` 列表也累加，`image` 只能选定一个。卷保留声明它的 profile
+的主机列表累加，`"none"` 或 `"full"` 会替换之前的值，而在 `"none"` 或 `"full"` 之后的主机列表又会替换它们，所以顺序很重要。`ports` 列表也累加，`image` 只能选定一个。卷保留声明它的 profile
 的名字，所以每个继承 `base` 的 profile 都共享 `base` 的卷。
 
 **API 密钥及其他机密**按名字从你自己的环境中获取：
@@ -371,7 +390,7 @@ podbay 的输出、`--dry-run` 或进程列表里，podbay 也不会把它写到
 home 目录都会被清空。凡是你的宿主机会运行的东西，挂载时都保持只读：一个可读写的 `~/.bashrc` 或 `~/.cargo`
 会让会话植入在你宿主机上运行的代码。引擎会以 root 身份创建缺失挂载点的父目录，podbay-init 会把它们交给 `dev`。
 
-**扩展（extension）** 以派生镜像的形式分层（`podbay-<profile>:<hash>`）。每个标签是脚本及其父镜像标签的哈希，所以修改一个脚本，或链条中它下面的任何脚本，只会重建改动的部分。脚本下载的内容不计入哈希，以同一标签重新构建的自定义基础镜像也不计入：运行
+**扩展（extension）** 是构建脚本，路径相对于 profile 目录，以派生镜像的形式分层（`podbay-<profile>:<hash>`）。程序应该放在这里：安装到 `/home/dev` 之外时，它们在会话中是只读的，而卷不是。每个标签是脚本及其父镜像标签的哈希，所以修改一个脚本，或链条中它下面的任何脚本，只会重建改动的部分。这也意味着 `rust,claude` 和 `python,claude` 各自构建自己的 `claude` 层，未固定版本的下载在两者之间可能不同。脚本下载的内容不计入哈希，以同一标签重新构建的自定义基础镜像也不计入：运行
 `podbay build --force` 来更新它们。扩展在构建时以 root 身份运行，这是根文件系统唯一可写的时候。它们放进 `/home/dev`
 的任何东西都会自动复制到 home 骨架中。
 
@@ -392,6 +411,7 @@ network = ["api.anthropic.com"]
 
 [env]
 DISABLE_AUTOUPDATER = "1"   # the image is read-only in a session
+CLAUDE_CONFIG_DIR = "/home/dev/.claude"   # keeps .claude.json in the volume too
 
 [[volume]]                   # login and settings, kept between sessions
 name = "claude"
@@ -452,7 +472,7 @@ network = ["api.anthropic.com", "*.githubusercontent.com", "registry.example.com
 ```
 
 `*.example.com` 覆盖 `example.com` 下的所有名字（不含 `example.com` 本身），不写端口时为 443。profile
-中的列表会加到它所继承的 profile 的列表上；`"none"` 或 `"full"` 会替换它们。`--offline` 和 `--online`（或
+中的列表会加到它所继承的 profile 的列表上；`"none"` 或 `"full"` 会替换它们，而在其后的列表又会替换 `"none"` 或 `"full"`。`--offline` 和 `--online`（或
 `--network none|full`）在单次运行中覆盖一切。
 
 会话除了回环之外仍然没有网络接口。podbay 在它旁边启动一个很小的中继容器，同样没有网络，会话共享中继的网络命名空间。中继在
@@ -513,7 +533,7 @@ podbay: forwarded ports:
 
 podbay 不替你选择工具链管理器。profile 指定一个安装工具的命令，以及工具存放的卷：
 
-[快速上手中的 `rust.toml`](#your-first-profiles) 是一个完整的例子：rustup 不存在时安装它，然后让 rustup
+[快速上手中的 `rust.toml`](#your-first-profiles) 是一个完整的例子：它的扩展把 rustup 放进镜像，然后它的命令让 rustup
 安装项目固定的工具链，就和你手动做的完全一样。podbay 从不读取项目来决定安装什么；命令由 profile 指定，工具照它平常的方式工作。
 
 该命令在会话之前，以 `sh -e` 在一个单独的短期容器中运行。这个容器有网络，但只能看到安装所需的东西：只读的项目、标记了
@@ -526,7 +546,7 @@ podbay 不替你选择工具链管理器。profile 指定一个安装工具的�
 要刷新固定为 `latest` 的工具、删除卷之后，或工具来自你没有监视的文件时，自己运行 `podbay provision`。它安装到 `run`
 会使用的同一组卷中；传入 `--local-cache` 以对应 `run --local-cache`。
 
-工具链管理器本身可以来自预置命令（如 `rust.toml`），也可以来自固化进镜像的[扩展](#profiles)。mise
+工具链管理器本身应该放在固化进镜像的[扩展](#profiles)里（如 `rust.toml`），这样会话无法改动它。mise
 只是又一个选择：在扩展里安装它，给 `~/.local/share/mise` 一个卷，再用 `mise install` 作为命令。
 
 <a id="git-hooks-and-config"></a>
@@ -623,6 +643,8 @@ Podman 用后者来找到它自己的存储。
 预置卷由使用声明它的 profile 运行的每个项目共享，所以为一个项目安装的工具，下一个项目也能用。安装程序运行时有网络、能看到项目，而且项目通过它被监视的文件选择版本，所以恶意项目可能在共享卷里留下东西，之后被其他项目运行。对于你不信任的代码，`--local-cache`
 会给该项目一份自己的预置卷副本（`podbay-<profile>-<name>-<repo-key>`）。
 
+会话也可以写入这些卷，所以不依赖项目的程序（比如工具链管理器和编程助手）应该放在镜像里。
+
 <!-- zh-only -->
 <a id="zh-cn-notes"></a>
 ## 中国大陆用户须知
@@ -671,7 +693,7 @@ podbay 构建 podbay-init 和中继用的 `rust` 镜像按摘要（`@sha256:…`
 
 ### 工具链镜像源
 
-预置命令访问的下载地址都由你的 profile 决定，可以换成国内的镜像源。以 `rust.toml` 为例，rustup 支持
+预置命令和扩展脚本访问的下载地址都由你决定，可以换成国内的镜像源。以 `rust.toml` 为例，rustup 支持
 `RUSTUP_DIST_SERVER` 和 `RUSTUP_UPDATE_ROOT`，写在 profile 的 `[env]` 里，预置容器和会话都会得到它们：
 
 ```toml
@@ -682,7 +704,7 @@ RUSTUP_UPDATE_ROOT = "https://<rustup 镜像源>/rustup"
 
 需要注意信任的转移：
 
-- 示例中的 `rustup-init` 下载后会与 profile 中写死的 SHA-256 核对，所以把它的下载地址换成镜像源是安全的，只要校验和不变。
+- 示例中的 `rustup-init` 下载后会与扩展脚本中写死的 SHA-256 核对，所以把它的下载地址换成镜像源是安全的，只要校验和不变。
 - rustup 通过镜像源安装的工具链，只与该镜像源自己提供的清单核对。换用镜像源意味着信任它，就像你在宿主机上换用它一样。
 - 会话里如果要访问 crates.io、PyPI、npm 等的镜像源，请把镜像源的主机名加进 `network` 允许列表，并按各工具自己的方式配置镜像源。
 

@@ -1,17 +1,14 @@
-# Rust, with the toolchain the project pins. Stack it with an agent:
-#   podbay run -p rust -p dsh ~/src/my-rust-app
-#
-# rustup is installed into a volume the first time (a pinned version,
-# checked against its published SHA-256), then installs whatever
-# rust-toolchain.toml asks for, verifying what it downloads. Dependencies
-# are fetched before the session too, with --locked, so builds work without
-# network and use exactly what Cargo.lock lists.
+# Add to base image
+extension = "rust.sh"
 
-path = ["/home/dev/.cargo/bin"]
+# The image comes first, so nothing in a volume can stand in for rustup.
+# The volume's bin holds what you `cargo install`.
+path = ["/opt/rustup/bin", "/home/dev/.cargo/bin"]
 
-# Only for adding new dependencies during a session; drop these lines to
-# keep the session fully offline.
-network = ["index.crates.io", "static.crates.io"]
+# crates.io for dependencies; static.rust-lang.org so `rustup update` and
+# `rustup component add` work mid-session. Drop to keep the session offline:
+# provisioning installs the toolchain and fetches Cargo.lock's crates anyway.
+network = ["index.crates.io", "static.crates.io", "static.rust-lang.org"]
 
 [env]
 RUSTUP_HOME = "/home/dev/.rustup"
@@ -28,20 +25,15 @@ container = "/home/dev/.cargo"
 provision = true
 
 [provision]
+# rustup lives in the read-only image, so it can't update itself: update it
+# by rebuilding. Minimal profile plus clippy and rustfmt skips ~900 MB of
+# offline docs per toolchain. Both settings are kept in the rustup volume.
 command = """
-rustup=1.29.2
-case "$(uname -m)" in
-  x86_64) target=x86_64-unknown-linux-gnu sum=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
-  aarch64) target=aarch64-unknown-linux-gnu sum=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
-  *) echo "no rustup build for $(uname -m)" >&2; exit 1 ;;
-esac
-if ! command -v rustup >/dev/null; then
-  curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$rustup/$target/rustup-init"
-  echo "$sum  /tmp/rustup-init" | sha256sum -c -
-  chmod +x /tmp/rustup-init
-  /tmp/rustup-init -y --no-modify-path
-fi
+rustup set auto-self-update disable
+rustup set profile minimal
+rustup default >/dev/null 2>&1 || rustup default stable
 rustup show active-toolchain || rustup toolchain install
+rustup component add clippy rustfmt
 if [ -f Cargo.lock ]; then cargo fetch --locked; fi
 """
 watch = ["rust-toolchain.toml", "rust-toolchain", "Cargo.lock"]

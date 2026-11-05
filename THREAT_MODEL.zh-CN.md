@@ -3,7 +3,7 @@
 
 [English](THREAT_MODEL.md) · **简体中文**
 
-<!-- source: THREAT_MODEL.md sha256:94af46ed4df2704ef8f6ee891f673920a6b003e7d4fc972653e3a85cd795aff4 -->
+<!-- source: THREAT_MODEL.md sha256:8d588b44186ed96b06b634d9fe47d4dbd754695b6972188ca78406aa1d4f2554 -->
 
 > 本文译自 [THREAT_MODEL.md](THREAT_MODEL.md)。两者不一致时以英文版为准。
 
@@ -185,6 +185,7 @@ podbay 在等待引擎时会忽略 Ctrl-C，就像 `system(3)` 那样。中断�
 
 - **预置卷**，工具链安装在其中。恶意项目可以安装或替换工具，之后使用同一 profile 的项目会运行它们。对不可信的代码请使用
   `--local-cache`。它为该项目提供一份自己的预置卷副本（`podbay-<profile>-<name>-<repo-key>`）。
+  由扩展安装到 `/home/dev` 之外的程序不受此影响，因为它们位于只读的根文件系统上；示例 profile 把工具链管理器和编程助手放在那里，只把项目选择的工具链放在卷中。
 - **profile 卷**由使用该 profile（以及继承它的每个 profile）运行的每个项目共享。恶意项目可以在那里篡改编程助手的配置或窃取它的凭据，并影响下一个使用同一
   profile 运行的项目。为不可信的工作单独准备一个 profile。
 - **镜像**只从你的配置目录构建，所以项目无法改变它们。

@@ -18,12 +18,7 @@ translation was done by an agent and not checked by a Chinese reader.
 
 ## How the maintainer works
 
-- **Never push, and never open pull requests.** Hand over the work as a
-  plain diff against the current `origin/master` (`git diff`, including
-  new files via `git add -N`), saved as a downloadable file, plus a commit
-  message in its own file. The maintainer applies, commits and pushes.
-- One diff per round, applied on its own. If a new diff replaces an
-  earlier one that wasn't pushed, say so.
+- Agents may commit when asked. Only the maintainer pushes.
 - Before building on a push, check CI passed on it.
 - Commit messages: a short subject line, then prose paragraphs wrapped at
   72 columns: what changed and why, then what was tested and how, and

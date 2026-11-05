@@ -11,12 +11,11 @@ everything else is something you declared:
 
 - dotfiles mounted read-only, including your shell config
 - named volumes for state that should outlive the container
-- your own toolchain managers (rustup, uv, nvm, nix, mise, ...), which you
-  invoke from a profile and which install into volumes as they normally would
+- your own tools and toolchain managers (rustup, uv, nvm, nix, mise, ...),
+  baked into a derived image by a root build script you write
 - the shell you want, environment variables and PATH entries
 - the image you like, such as `alpine`, `ubuntu` or an agent's own image,
   unmodified, or podbay's small Debian base
-- optional root build scripts baked into a derived image
 - network access: none, HTTPS to the hosts you list, or everything
 - ports you forward, so the host can reach a server in the session
 
@@ -130,16 +129,43 @@ named after it (see [where podbay looks](#where-profiles-live)). Here is a
 Rust profile and a coding-agent profile, kept separate so you can swap
 either one later.
 
-The language profile invokes rustup, the same way you would on your own
-machine: a pinned version, checked against its published checksum. rustup
-then installs whatever the project's `rust-toolchain.toml` asks for, into a
-volume that outlives the container. (It's
-[`examples/profiles/rust.toml`](examples/profiles/rust.toml), minus the
-lines that let the session reach crates.io.)
+Programs go in the image, where a session can't change them, and what they
+keep between sessions goes in volumes. A profile's `extension` names a build
+script, kept next to it, that runs as root when the image is built.
+
+The language profile's script installs rustup, the same way you would on
+your own machine: a pinned version, checked against its published checksum.
+The profile then lets rustup install whatever the project's
+`rust-toolchain.toml` asks for. Toolchains are the one exception to keeping
+programs in the image, since each project chooses its own, so they go in a
+volume that outlives the container. (These are
+[`examples/profiles/rust.sh`](examples/profiles/rust.sh) and
+[`rust.toml`](examples/profiles/rust.toml), minus comments and the lines that
+let the session reach crates.io.)
+
+```sh
+#!/bin/sh
+# ~/.config/podbay/profiles/rust.sh
+set -eu
+
+rustup=1.29.2
+case "$(uname -m)" in
+  x86_64) target=x86_64-unknown-linux-gnu sum=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
+  aarch64) target=aarch64-unknown-linux-gnu sum=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
+  *) echo "no rustup build for $(uname -m)" >&2; exit 1 ;;
+esac
+curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$rustup/$target/rustup-init"
+echo "$sum  /tmp/rustup-init" | sha256sum -c -
+chmod +x /tmp/rustup-init
+CARGO_HOME=/opt/rustup RUSTUP_HOME=/tmp/rustup-home /tmp/rustup-init -y --no-modify-path --default-toolchain none
+rm -rf /tmp/rustup-init /tmp/rustup-home
+chmod -R a+rX /opt/rustup
+```
 
 ```toml
 # ~/.config/podbay/profiles/rust.toml
-path = ["/home/dev/.cargo/bin"]
+extension = "rust.sh"
+path = ["/opt/rustup/bin", "/home/dev/.cargo/bin"]
 
 [env]
 RUSTUP_HOME = "/home/dev/.rustup"
@@ -157,31 +183,39 @@ provision = true
 
 [provision]
 command = """
-rustup=1.29.2
-case "$(uname -m)" in
-  x86_64) target=x86_64-unknown-linux-gnu sum=5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 ;;
-  aarch64) target=aarch64-unknown-linux-gnu sum=a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 ;;
-  *) echo "no rustup build for $(uname -m)" >&2; exit 1 ;;
-esac
-if ! command -v rustup >/dev/null; then
-  curl -fsSL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/$rustup/$target/rustup-init"
-  echo "$sum  /tmp/rustup-init" | sha256sum -c -
-  chmod +x /tmp/rustup-init
-  /tmp/rustup-init -y --no-modify-path
-fi
+rustup default >/dev/null 2>&1 || rustup default stable
 rustup show active-toolchain || rustup toolchain install
 if [ -f Cargo.lock ]; then cargo fetch --locked; fi
 """
 watch = ["rust-toolchain.toml", "rust-toolchain", "Cargo.lock"]
 ```
 
-The agent profile installs a terminal coding agent (opencode here) and lets
-the session reach its API and nothing else:
+The agent profile installs a terminal coding agent (opencode here) the same
+way, and lets the session reach its API and nothing else. The script installs
+outside `/home/dev`, whose contents are copied into every session's writable
+home:
+
+```sh
+#!/bin/sh
+# ~/.config/podbay/profiles/opencode.sh
+set -eu
+
+export HOME=/opt/opencode
+mkdir -p "$HOME"
+curl -fsSL -o /tmp/opencode-install https://opencode.ai/v2/install
+bash /tmp/opencode-install --version 2.2.5 --no-modify-path
+rm -f /tmp/opencode-install
+chmod -R a+rX "$HOME"
+```
 
 ```toml
 # ~/.config/podbay/profiles/opencode.toml
+extension = "opencode.sh"
 network = ["api.anthropic.com"]   # its model provider, and nothing else
-path = ["/home/dev/.opencode/bin"]
+path = ["/opt/opencode/.opencode/bin"]
+
+[env]
+OPENCODE_DISABLE_AUTOUPDATE = "1"   # the image is read-only in a session
 
 # Its login, settings and history, kept between sessions.
 [[volume]]
@@ -191,15 +225,6 @@ container = "/home/dev/.config/opencode"
 [[volume]]
 name = "data"
 container = "/home/dev/.local/share/opencode"
-
-# The agent itself.
-[[volume]]
-name = "bin"
-container = "/home/dev/.opencode"
-provision = true
-
-[provision]
-command = "test -x ~/.opencode/bin/opencode || curl -fsSL https://opencode.ai/v2/install | bash"
 ```
 
 Stack them and start the agent:
@@ -208,10 +233,10 @@ Stack them and start the agent:
 podbay run -p rust -p opencode ~/src/my-rust-app -- opencode
 ```
 
-Before the session starts, podbay runs both `[provision]` commands in a
-separate container that has network access (see
-[Provisioning](#provisioning)). The session itself gets only the hosts the
-profiles list.
+The first run builds both scripts into the image. Before the session starts,
+podbay runs `rust.toml`'s `[provision]` command in a separate container that
+has network access (see [Provisioning](#provisioning)). The session itself
+gets only the hosts the profiles list.
 
 Switching later is one word, given a `python.toml` or `claude.toml`
 written the same way:
@@ -225,12 +250,12 @@ The agent keeps its login and history across both, because volumes belong
 to the profile that declares them (`podbay-opencode-config`), not to the
 combination.
 
-[`examples/`](examples/) has profiles ready to copy: `rust.toml`, and
+[`examples/`](examples/) has profiles ready to copy, each with its build script: `rust.toml`, and
 `dsh.toml` for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 with models from OpenRouter, its web UI forwarded to your browser:
 
 ```
-cp examples/profiles/*.toml ~/.config/podbay/profiles/
+cp examples/profiles/* ~/.config/podbay/profiles/
 mkdir -p ~/.config/podbay/dsh && cp examples/dsh/cordis.patch.yml ~/.config/podbay/dsh/
 export OPENROUTER_API_KEY=...
 podbay run -p rust -p dsh ~/src/my-rust-app -- dsh web --no-open
@@ -387,7 +412,8 @@ and `shell` override inherited ones, and its `path` entries go in front of
 inherited ones. `[provision]` commands and `watch` lists, `cap_add` and
 `[seccomp] allow` lists are combined, and `engine_default` is inherited
 until a profile sets it. `[limits]` keys override one at a time, and `network`
-host lists add up while `"none"` or `"full"` replaces what came before.
+host lists add up, `"none"` or `"full"` replaces what came before, and a
+host list after `"none"` or `"full"` replaces that in turn, so order matters.
 `ports` lists add up too, and only one `image` can be chosen. Volumes keep the name of the profile that
 declared them, so every profile extending `base` shares `base`'s volumes.
 
@@ -425,9 +451,14 @@ read-write `~/.bashrc` or `~/.cargo` lets the session plant code that runs
 on your host. The engine creates a missing mount point's parent
 directories as root, and podbay-init gives them to `dev`.
 
-**Extensions** are layered as derived images (`podbay-<profile>:<hash>`).
+**Extensions** are build scripts, named relative to the profiles directory,
+and layered as derived images (`podbay-<profile>:<hash>`). They're where
+programs belong: installed outside `/home/dev`, they're read-only in sessions,
+which a volume isn't.
 Each tag is a hash of the script and its parent image's tag, so editing a
 script, or any script below it in the chain, rebuilds exactly what changed.
+That also means `rust,claude` and `python,claude` each build their own
+`claude` layer, and an unpinned download can differ between them.
 What a script downloads isn't part of the hash, and neither is a custom base
 rebuilt under the same tag: run `podbay build --force` to pick those up.
 Extensions run as root at build time, the only time the root filesystem is
@@ -452,6 +483,7 @@ network = ["api.anthropic.com"]
 
 [env]
 DISABLE_AUTOUPDATER = "1"   # the image is read-only in a session
+CLAUDE_CONFIG_DIR = "/home/dev/.claude"   # keeps .claude.json in the volume too
 
 [[volume]]                   # login and settings, kept between sessions
 name = "claude"
@@ -550,7 +582,8 @@ network = ["api.anthropic.com", "*.githubusercontent.com", "registry.example.com
 
 `*.example.com` covers every name below `example.com` (not `example.com`
 itself), and the port is 443 unless you give one. A list in a profile adds to
-the lists of the profiles it extends; `"none"` or `"full"` replaces them.
+the lists of the profiles it extends; `"none"` or `"full"` replaces them, and
+a list after `"none"` or `"full"` replaces that.
 `--offline` and `--online` (or `--network none|full`) override everything
 for one run.
 
@@ -635,8 +668,8 @@ podbay doesn't pick a toolchain manager for you. A profile names a command
 that installs tools, and volumes for them to live in:
 
 [`rust.toml` in Quick start](#your-first-profiles) is a full example: it
-installs rustup if it's missing, then lets rustup install the toolchain the
-project pins, exactly as you would by hand. podbay never reads the project to
+its extension puts rustup in the image, then its command lets rustup install
+the toolchain the project pins, exactly as you would by hand. podbay never reads the project to
 decide what to install; the profile names the command, and the tool behaves
 as it normally does.
 
@@ -661,9 +694,9 @@ removing a volume, or when tools come from files you don't watch. It
 installs into the same volumes `run` would; pass `--local-cache` to match
 `run --local-cache`.
 
-A toolchain manager itself can come from the provisioning command, as in
-`rust.toml`, or from an [extension](#profiles) baked into the image. mise is just
-one more option: install it in an extension, give it a volume for
+A toolchain manager itself belongs in an [extension](#profiles) baked into
+the image, as in `rust.toml`, so a session can't change it. mise is just one
+more option: install it in an extension, give it a volume for
 `~/.local/share/mise`, and use `mise install` as the command.
 
 ## Git hooks and config
@@ -780,6 +813,10 @@ chooses versions through its watched files, so a malicious project could
 leave something behind in a shared volume that other projects then run. For
 code you don't trust, `--local-cache` gives that project its own copies of
 the provision volumes (`podbay-<profile>-<name>-<repo-key>`).
+
+Sessions can write to these volumes too, which is why programs that don't
+depend on the project, such as toolchain managers and coding agents, belong in
+the image.
 
 ## Development
 

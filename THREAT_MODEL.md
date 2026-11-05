@@ -326,6 +326,10 @@ run git; it does not stop anything.
   profile then run. Use `--local-cache` for untrusted code. It gives
   that project its own copies of the provision volumes
   (`podbay-<profile>-<name>-<repo-key>`).
+  Programs installed by an extension outside `/home/dev` aren't exposed this
+  way, since they're on the read-only root; the example profiles keep
+  toolchain managers and agents there, and only project-chosen toolchains in
+  volumes.
 - **Profile volumes** are shared by every project run with that profile (and
   every profile that extends it). A malicious project can tamper with an
   agent's config or steal its credentials there, and that affects the next

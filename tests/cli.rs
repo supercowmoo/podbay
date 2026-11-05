@@ -205,7 +205,8 @@ fn example_profiles_resolve() {
     for expected in [
         "chain: rust > dsh",
         "podbay-rust-cargo -> /home/dev/.cargo  (provision, from rust)",
-        "podbay-dsh-tools -> /home/dev/.dsh-tools  (provision, from dsh)",
+        "(extension from rust)",
+        "(extension from dsh)",
         "podbay-dsh-home -> /home/dev/.dsh  (from dsh)",
         "~/.config/podbay/dsh/cordis.patch.yml -> /home/dev/.dsh/cordis.patch.yml  (ro, from dsh)",
         "OPENROUTER_API_KEY  (from dsh)",
