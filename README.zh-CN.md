@@ -3,7 +3,7 @@
 
 [English](README.md) · **简体中文**
 
-<!-- source: README.md sha256:f34f9caaad75598b2be7107d32dddbbbc8849af89509352f7a1a80f5618204cb -->
+<!-- source: README.md sha256:1b60ec55c9c7aa0d31ad9c5e99a7cbd4ef4486d2e32fb8a1b2bc904df6f90f30 -->
 
 > 本文译自 [README.md](README.md)。两者不一致时以英文版为准。podbay 的命令输出是英文的，
 > 下面的代码块与英文版逐字相同，便于你对照终端里看到的内容。中国大陆的网络环境另见
@@ -95,6 +95,9 @@ podbay run ~/src/some-project
 
 第一次运行会构建自带的基础镜像：Debian slim，带 git、curl、build-essential 和 bash。没有语言工具链，也没有编程助手：这些由
 profile 提供。其他任何镜像也都可以用，见[镜像](#images)。除非你给它网络，否则会话没有网络。
+
+基础镜像不固定在某个 Debian 发布日期上：每次构建时，它都从当前的 `debian:trixie-slim` 开始，安装 Debian
+当前的软件包，包括安全更新。它构建一次之后就会复用，所以要更新它以及构建在它之上的所有扩展，请运行 `podbay build --force`。
 
 <a id="your-first-profiles"></a>
 ### 你的第一批 profile
@@ -409,7 +412,7 @@ container = "/home/dev/.claude"
 在任何镜像上，会话都与在自带镜像上一样被锁定：没有 capability、`no-new-privileges`（所以镜像里的 `sudo`
 无效）、只读根文件系统、podbay 的 seccomp 过滤器和网络策略。Docker-in-Docker 以及某些镜像期望从自己的沙箱获得的功能都不可用。
 
-标签可以被移到不同的内容上；要精确固定运行的内容，请加上摘要（digest），就像 podbay 对自己的镜像所做的那样：
+标签可以被移到不同的内容上；要精确固定运行的内容，请加上摘要（digest），就像 podbay 对用来构建 podbay-init 和中继的镜像所做的那样（自带基础镜像特意跟随标签，以保持打上补丁）：
 `image = "alpine:3.22@sha256:2e0b81d6…"`（可从 `docker buildx imagetools inspect` 或 `skopeo inspect` 获得）。
 
 一组叠加的 profile 只有一个镜像。两个叠加的 profile 指定不同镜像会报错，除非其中一个继承另一个。扩展构建在选定的镜像之上，所以镜像里需要有
@@ -646,9 +649,9 @@ Docker 写在 `/etc/docker/daemon.json`，然后重启 Docker：
 { "registry-mirrors": ["https://<你的镜像加速器地址>"] }
 ```
 
-podbay 的这些镜像都按摘要（`@sha256:…`）固定，引擎会核对拉到的内容，所以加速器无法替换成别的镜像。你在 profile 里按标签引用的镜像则不同：加速器给什么就是什么，请像[镜像](#images)一节说的那样加上摘要。
+podbay 构建 podbay-init 和中继用的 `rust` 镜像按摘要（`@sha256:…`）固定，引擎会核对拉到的内容，所以加速器无法替换成别的镜像。`debian:trixie-slim` 则按标签拉取，以便每次构建都是最新的：加速器给什么就是什么，你在 profile 里按标签引用的镜像也一样。对后者，请像[镜像](#images)一节说的那样加上摘要。
 
-第一次构建基础镜像时，软件包来自 `snapshot.debian.org`，这个站点在哪里都可能比较慢。apt 仍会校验 Debian 的签名；慢只影响第一次构建和 `podbay build --force`。
+构建基础镜像时，软件包来自 `deb.debian.org`，在某些地方可能比较慢；慢只影响基础镜像的构建（第一次运行和 `podbay build --force`）。扩展脚本里的 `apt-get` 可以先把软件源换成国内的 Debian 镜像源。apt 无论从哪里下载都会校验 Debian 的签名。
 
 ### 宿主机上的代理
 

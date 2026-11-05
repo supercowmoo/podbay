@@ -73,7 +73,9 @@ rate-limits pulls (`429 Too Many Requests`); that's not a podbay failure.
   over a dependency.
 - **Pin everything:** crate versions exactly (`=x.y.z`, built with
   `--locked`), images by digest, CI actions by commit, and downloads in
-  examples by version and checksum.
+  examples by version and checksum. The one exception is the bundled base
+  (`base/Containerfile`), which tracks `debian:trixie-slim` and Debian's
+  live archive so every build is patched; keep it that way.
 - **The project is untrusted.** Nothing read from the mounted project may
   choose profiles, mounts, network, capabilities or anything that runs as
   root. Only the user's config directory can.

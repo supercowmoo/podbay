@@ -5,6 +5,7 @@
 //! new tag. What those inputs fetch is not hashed: the `FROM` images by tag,
 //! the packages `apt-get` installs, and a custom base rebuilt under the same
 //! tag. `podbay build --force` rebuilds against the latest of all of them.
+//! The bundled base is always built that way, since it tracks Debian.
 
 use std::fs;
 
@@ -276,15 +277,25 @@ fn build(backend: &dyn Backend, layer: &Layer, force: bool) -> Result<()> {
             fs::write(ctx.path().join("podbay-path.sh"), PATH_SNIPPET)?;
         }
     }
-    let refresh = Refresh {
-        no_cache: force,
+    eprintln!("podbay: building {}", layer.tag);
+    backend.build_image(&layer.tag, ctx.path(), refresh(&layer.source, force))
+}
+
+/// How fresh a build of `source` must be.
+///
+/// The bundled base tracks Debian rather than pinning it, so every build of
+/// it is a full refresh: a cached `apt-get upgrade` step or an old local
+/// `debian:trixie-slim` would quietly bring back the packages a rebuild is
+/// meant to replace. Other layers refresh only with `force`.
+fn refresh(source: &LayerSource, force: bool) -> Refresh {
+    let bundled = matches!(source, LayerSource::Bundled);
+    Refresh {
+        no_cache: force || bundled,
         // Only these start from a registry image; the others start from a
         // podbay layer. An adapted image was pulled above, and may exist
         // only locally.
-        pull: force && matches!(layer.source, LayerSource::Bundled | LayerSource::Relay),
-    };
-    eprintln!("podbay: building {}", layer.tag);
-    backend.build_image(&layer.tag, ctx.path(), refresh)
+        pull: bundled || (force && matches!(source, LayerSource::Relay)),
+    }
 }
 
 fn extension_containerfile(parent: &str, profile: &str) -> String {
@@ -567,6 +578,25 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn bundled_base_always_builds_fresh() {
+        // Tracking Debian only works if no build of the base reuses a
+        // cached upgrade step or an old local debian image.
+        let stack = layers(&BaseImage::Bundled, &[], IMAGE_DEV_UID, IMAGE_DEV_UID).unwrap();
+        let backend = FakeBackend::default();
+        ensure(&backend, &stack, false, false).unwrap();
+        let built = backend.built.borrow();
+        assert!(built[0].0.starts_with("podbay-base:"), "{}", built[0].0);
+        let full = Refresh {
+            no_cache: true,
+            pull: true,
+        };
+        assert_eq!(built[0].2, full);
+        // Layers above start from it, a local image, so there's nothing to
+        // pull; the engine's cache already misses when their parent changed.
+        assert!(built[1..].iter().all(|b| b.2 == Refresh::default()));
     }
 
     #[test]

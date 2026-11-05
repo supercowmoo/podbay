@@ -45,7 +45,11 @@ The following are trusted: you, your podbay config directory
 (`~/.config/podbay`, including profiles and extension scripts), the podbay
 binary, the container engine, the kernel, and the image sessions start
 from: the bundled base's upstream sources, or whoever publishes an image a
-profile names. podbay adds its own init and users file to any image, and
+profile names. The bundled base follows the `debian:trixie-slim` tag and
+Debian's live archive rather than a digest and snapshot, so it picks up
+security updates on every build; that makes Docker Hub's tag trusted too,
+where a digest would let the engine check the image itself. Its packages
+are still checked against Debian's signatures. podbay adds its own init and users file to any image, and
 the session's hardening doesn't depend on the image, but a malicious image
 can still ship malicious tools for the session to run.
 

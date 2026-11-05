@@ -3,7 +3,7 @@
 
 [English](THREAT_MODEL.md) · **简体中文**
 
-<!-- source: THREAT_MODEL.md sha256:4ed4be9cfefa817db27fa5557aad456bf9e1229abe49d2ba92ede41624d27e2b -->
+<!-- source: THREAT_MODEL.md sha256:94af46ed4df2704ef8f6ee891f673920a6b003e7d4fc972653e3a85cd795aff4 -->
 
 > 本文译自 [THREAT_MODEL.md](THREAT_MODEL.md)。两者不一致时以英文版为准。
 
@@ -35,7 +35,9 @@
 root（它可能找到办法在那里提权），并且完全清楚 podbay 的工作方式。
 
 以下是受信任的：你、你的 podbay 配置目录（`~/.config/podbay`，包括 profile 和扩展脚本）、podbay
-二进制文件、容器引擎、内核，以及会话启动所用的镜像：自带基础镜像的上游来源，或 profile 所指定镜像的发布者。podbay
+二进制文件、容器引擎、内核，以及会话启动所用的镜像：自带基础镜像的上游来源，或 profile 所指定镜像的发布者。自带基础镜像跟随
+`debian:trixie-slim` 标签和 Debian 的实时软件源，而不是摘要和快照，所以每次构建都会拿到安全更新；这也意味着 Docker Hub
+上的这个标签同样受信任，而用摘要的话引擎可以自己核对镜像。它的软件包仍会按 Debian 的签名校验。podbay
 会给任何镜像加上自己的 init 和用户文件，会话的加固也不依赖镜像，但恶意镜像仍然可以带着恶意工具，供会话运行。
 
 <a id="trust-boundaries"></a>

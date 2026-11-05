@@ -117,6 +117,12 @@ build-essential and bash. No language toolchains and no agents: profiles
 bring those. Any other image works too; see [Images](#images). The session
 has no network unless you give it some.
 
+The base isn't pinned to a Debian release date: every time it's built, it
+starts from the current `debian:trixie-slim` and installs Debian's current
+packages, security updates included. It's built once and then reused, so
+run `podbay build --force` to bring it, and every extension built on it, up
+to date.
+
 ### Your first profiles
 
 Profiles are TOML files in `~/.config/podbay/profiles/`, one per profile,
@@ -477,7 +483,8 @@ Docker-in-Docker and other features some images expect from their own
 sandbox aren't available.
 
 A tag can be moved to different content; to pin exactly what runs, add the
-digest, as podbay does for its own images:
+digest, as podbay does for the images it builds podbay-init and the relay
+with (the bundled base follows its tag on purpose, to stay patched):
 `image = "alpine:3.22@sha256:2e0b81d6…"` (from `docker buildx imagetools
 inspect` or `skopeo inspect`).
 
